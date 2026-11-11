@@ -47,8 +47,11 @@ export async function dev(opts: { appDir: string }): Promise<number> {
   const cfg = loadConfig(appDir, py.status === 0 ? "python3" : "python");
 
   // Resolve the dev interpreter: the app venv (uv sync) or env override.
-  if (spawnSync("uv", ["sync"], { cwd: appDir, stdio: "inherit" }).status !== 0)
-    throw new Error("uv sync failed — is uv installed and pyproject.toml valid?");
+  const sync = spawnSync("uv", ["sync"], { cwd: appDir, stdio: "inherit" });
+  if (sync.error)
+    throw new Error(`could not run uv: ${sync.error.message} — is uv on PATH?`);
+  if (sync.status !== 0)
+    throw new Error("uv sync failed — is pyproject.toml valid?");
 
   const srcDir = join(appDir, cfg.source);
   const stateDir = join(appDir, ".pylair");
@@ -83,6 +86,24 @@ export async function dev(opts: { appDir: string }): Promise<number> {
     PYLAIR_RESTART_TRIGGER: trigger,
     PYLAIR_DEV: "1",
   };
+  // tauri.conf.json maps resources/* paths that only exist after
+  // `pylair build` stages them; `tauri dev` validates them eagerly and
+  // fails the build on any missing one. Create empty dirs for dev —
+  // `pylair build` replaces them with real staging anyway.
+  try {
+    const tconf = JSON.parse(
+      readFileSync(join(appDir, "src-tauri", "tauri.conf.json"), "utf-8"),
+    );
+    const res = tconf?.bundle?.resources;
+    const keys: string[] = Array.isArray(res) ? res : Object.keys(res ?? {});
+    for (const rel of keys) {
+      const p = join(appDir, "src-tauri", rel);
+      if (!existsSync(p)) mkdirSync(p, { recursive: true });
+    }
+  } catch {
+    // Conf unreadable — `tauri dev` will surface the real error itself.
+  }
+
   console.log("pylair: watching python source; starting tauri dev");
   const child = spawn("npx", ["tauri", "dev"], {
     cwd: appDir,
