@@ -10,7 +10,7 @@
     "stage": "pnpm fetch:python && pnpm prepare:env",
     "tauri": "tauri",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "bundle": "tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.4"
