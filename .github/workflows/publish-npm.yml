@@ -55,8 +55,10 @@ jobs:
 
       - name: Dry-run pack (always)
         run: |
+          # --tag next here too so the log prints the real tag, not the
+          # misleading default 'latest'.
           for p in packages/client packages/cli packages/create-pylair; do
-            (cd "$p" && npm publish --access public --dry-run)
+            (cd "$p" && npm publish --access public --tag next --dry-run)
           done
 
       - name: Publish to npm
