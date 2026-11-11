@@ -76,7 +76,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            bundles: "appimage,deb"
+          - os: windows-latest
+            bundles: "nsis"
+          - os: macos-latest
+            bundles: "app,dmg"
     defaults:
       run:
         working-directory: spikes/m0-packaging
@@ -109,7 +115,7 @@ jobs:
         if: runner.os != 'Windows'
         run: ./scripts/verify-bundled.sh src-tauri/resources
       - name: Build installers
-        run: pnpm tauri build
+        run: pnpm tauri build --bundles ${{ matrix.bundles }}
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -139,8 +145,10 @@ jobs:
         run: |
           $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
           Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
-          $app = "$env:LOCALAPPDATA\m0-packaging-spike"
-          if (-not (Test-Path $app)) { $app = "$env:ProgramFiles\m0-packaging-spike" }
-          $py = Get-ChildItem $app -Recurse -Filter 'python.exe' | Select-Object -First 1
+          # Locate the bundled interpreter wherever NSIS put the install dir.
+          $py = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
+                -Recurse -Filter 'python.exe' -Depth 4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -like '*m0-packaging-spike*' } | Select-Object -First 1
+          if (-not $py) { Write-Error 'installed bundled python.exe not found'; exit 1 }
           $resroot = Split-Path (Split-Path $py.FullName -Parent) -Parent
           ./scripts/verify-bundled.ps1 -Root $resroot
