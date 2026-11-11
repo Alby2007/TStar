@@ -9,9 +9,26 @@ milestones. The name is a placeholder; naming lives in `product.json`.
 
 ## Status
 
-Early scaffold. Milestones and order: `M0` packaging spike → `M1`
-supervisor/protocol → `M2` typed bridge → `M3` streaming/cancellation →
-`M4` CLI/scaffolder → `M5` Ollama integration → `M6` reference app + RC.
+Release candidate. `pylair` and `pylair-ollama` are on PyPI,
+`tauri-plugin-pylair` is on crates.io; npm packages follow.
+
+Install RCs with **exact pins**, not `--pre`:
+
+```sh
+pip install pylair==0.1.0rc1 pylair-ollama==0.1.0rc2
+```
+
+`--pre` opts *every* package in the install into prereleases — it can
+pull your dependencies into unstable versions and break for reasons
+unrelated to this project. Exact pins avoid that.
+
+Each package versions independently across registries — the numbers
+won't match (`pylair` and the crate are at `0.1.0-rc.1`, `pylair-ollama`
+at `0.1.0-rc.2`). Check each registry for its latest RC.
+
+Milestones: `M0` packaging spike → `M1` supervisor/protocol → `M2` typed
+bridge → `M3` streaming/cancellation → `M4` CLI/scaffolder → `M5` Ollama
+integration → `M6` reference app + RC.
 
 ## Layout
 
