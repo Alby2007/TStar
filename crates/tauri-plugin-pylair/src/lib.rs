@@ -240,6 +240,40 @@ pub mod events {
 /// Managed state holding the supervisor handle.
 pub struct PyRuntime(pub Handle);
 
+/// Which webviews may receive runtime events, and which webview owns each
+/// streaming task. Nothing is broadcast to all windows: P1-8 — an app with
+/// two webviews must not leak one window's streams into the other.
+#[derive(Default)]
+pub struct WindowRegistry {
+    subscribed: std::collections::HashSet<String>,
+}
+
+impl WindowRegistry {
+    /// Mark a webview as an event subscriber (every bridge command does this
+    /// for the invoking window; exposed for tests and explicit opt-in).
+    pub fn subscribe(&mut self, label: &str) {
+        self.subscribed.insert(label.to_string());
+    }
+
+    /// Delivery targets for runtime-wide events (state, stderr, exposes).
+    /// Stream chunks are addressed to their owning window directly.
+    fn broadcast_targets(&self) -> Vec<String> {
+        self.subscribed.iter().cloned().collect()
+    }
+
+    /// Forget dead windows (an emit_to that failed to deliver).
+    fn drop_label(&mut self, label: &str) {
+        self.subscribed.remove(label);
+    }
+}
+
+/// Managed as `Arc` so spawned stream tasks can own a handle.
+pub type Registry = std::sync::Arc<std::sync::Mutex<WindowRegistry>>;
+
+fn subscribed<R: Runtime>(window: &tauri::WebviewWindow<R>, reg: &Registry) {
+    reg.lock().unwrap().subscribe(window.label());
+}
+
 /// Plugin builder — the app supplies where Python lives, eagerly or lazily.
 /// `new` takes a fixed spec; `new_with` defers it to setup time, which is how
 /// apps resolve the bundled interpreter under `resource_dir` at release while
@@ -292,18 +326,29 @@ impl<R: Runtime> Builder<R> {
                 let (handle, actor) = spawn_supervisor(spec, self.config.clone(), ev_tx);
                 tauri::async_runtime::spawn(actor);
                 app.manage(PyRuntime(handle));
+                app.manage(Registry::new(Default::default()));
 
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     while let Some(ev) = ev_rx.recv().await {
-                        let _ = match ev {
-                            RuntimeEvent::StateChanged { from, to, detail } => app_handle.emit(
+                        let payload = match ev {
+                            RuntimeEvent::StateChanged { from, to, detail } => Some((
                                 events::STATE,
                                 json!({"from": fmt_state(from), "to": fmt_state(to), "detail": detail}),
-                            ),
-                            RuntimeEvent::Stderr(line) => app_handle.emit(events::STDERR, line),
-                            RuntimeEvent::Exposes(x) => app_handle.emit(events::EXPOSES, x),
+                            )),
+                            RuntimeEvent::Stderr(line) => Some((events::STDERR, json!(line))),
+                            RuntimeEvent::Exposes(x) => Some((events::EXPOSES, x)),
                         };
+                        let Some((event, payload)) = payload else { continue };
+                        // Runtime-wide events go to subscribed webviews only.
+                        let reg = app_handle.state::<Registry>();
+                        let labels = reg.lock().unwrap().broadcast_targets();
+                        for label in labels {
+                            if app_handle.emit_to(&label, event, payload.clone()).is_err() {
+                                // Window is gone — stop addressing it.
+                                reg.lock().unwrap().drop_label(&label);
+                            }
+                        }
                     }
                 });
                 Ok(())
@@ -344,6 +389,17 @@ impl<R: Runtime> Builder<R> {
     }
 }
 
+/// Exact-origin check for wrap mode (P1-8): two URLs share an origin iff
+/// scheme, host and effective port are equal — parse, never prefix-match.
+/// `http://127.0.0.1:5000.evil.com` (fails to parse as the expected host)
+/// and `http://127.0.0.1@evil.com` (userinfo tricks) are NOT the app origin.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (tauri::Url::parse(a), tauri::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
 fn fmt_state(s: State) -> &'static str {
     match s {
         State::Starting => "starting",
@@ -356,24 +412,32 @@ fn fmt_state(s: State) -> &'static str {
 }
 
 #[tauri::command]
-async fn python_call(
+async fn python_call<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
     fn_name: String,
     input: Value,
 ) -> Result<Value, ErrorObj> {
+    subscribed(&window, &reg);
     rt.0.call(&fn_name, input).await
 }
 
 /// Start a streaming call. Returns the task id; chunks and the terminal
-/// arrive on the `pylair://stream` event.
+/// arrive on the `pylair://stream` event, addressed to the owning webview.
 #[tauri::command]
 async fn python_call_stream<R: Runtime>(
     app: tauri::AppHandle<R>,
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
     fn_name: String,
     input: Value,
 ) -> Result<u64, ErrorObj> {
+    subscribed(&window, &reg);
+    let label = window.label().to_string();
     let (task, mut items) = rt.0.call_stream(&fn_name, input).await?;
+    let reg_state: Registry = app.state::<Registry>().inner().clone();
     tauri::async_runtime::spawn(async move {
         while let Some(item) = items.recv().await {
             let payload = match item {
@@ -387,18 +451,24 @@ async fn python_call_stream<R: Runtime>(
                     json!({"task": task, "done": true, "error": e})
                 }
             };
-            let _ = app.emit(events::STREAM, payload);
+            // Scoped to the webview that started the stream (P1-8).
+            if app.emit_to(&label, events::STREAM, payload).is_err() {
+                reg_state.lock().unwrap().drop_label(&label);
+            }
         }
     });
     Ok(task)
 }
 
 #[tauri::command]
-async fn python_grant_credit(
+async fn python_grant_credit<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
     task: u64,
     n: u64,
 ) -> Result<(), ErrorObj> {
+    subscribed(&window, &reg);
     rt.0.grant_credit(task, n).await
 }
 
@@ -424,23 +494,44 @@ fn python_selftest_report<R: Runtime>(
 }
 
 #[tauri::command]
-async fn python_cancel(rt: tauri::State<'_, PyRuntime>, task: u64) -> Result<bool, ErrorObj> {
+async fn python_cancel<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
+    rt: tauri::State<'_, PyRuntime>,
+    task: u64,
+) -> Result<bool, ErrorObj> {
+    subscribed(&window, &reg);
     rt.0.cancel(task).await
 }
 
 /// Operator-initiated recovery: respawn the runtime out of the Failed state.
 #[tauri::command]
-async fn python_retry(rt: tauri::State<'_, PyRuntime>) -> Result<(), ErrorObj> {
+async fn python_retry<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
+    rt: tauri::State<'_, PyRuntime>,
+) -> Result<(), ErrorObj> {
+    subscribed(&window, &reg);
     rt.0.retry().await
 }
 
 #[tauri::command]
-fn python_state(rt: tauri::State<'_, PyRuntime>) -> &'static str {
+fn python_state<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
+    rt: tauri::State<'_, PyRuntime>,
+) -> &'static str {
+    subscribed(&window, &reg);
     fmt_state(rt.0.state())
 }
 
 #[tauri::command]
-async fn python_shutdown(rt: tauri::State<'_, PyRuntime>) -> Result<(), ErrorObj> {
+async fn python_shutdown<R: Runtime>(
+    window: tauri::WebviewWindow<R>,
+    reg: tauri::State<'_, Registry>,
+    rt: tauri::State<'_, PyRuntime>,
+) -> Result<(), ErrorObj> {
+    subscribed(&window, &reg);
     rt.0.shutdown().await;
     Ok(())
 }
@@ -520,5 +611,32 @@ mod tests {
         let mut spec = SpawnSpec::default();
         scrub_appdir(&mut spec, fake_env(&[("LD_LIBRARY_PATH", "/x")]));
         assert!(spec.env.is_empty() && spec.env_remove.is_empty());
+    }
+
+    #[test]
+    fn origin_match_is_exact() {
+        let app = "http://127.0.0.1:5000/";
+        assert!(same_origin(app, "http://127.0.0.1:5000/path?q=1"));
+        // Bypass attempts: evil subdomains and userinfo tricks.
+        assert!(!same_origin(app, "http://127.0.0.1:5000.evil.com/"));
+        assert!(!same_origin(app, "http://127.0.0.1@evil.com/"));
+        assert!(!same_origin(app, "https://127.0.0.1:5000/")); // scheme differs
+        assert!(!same_origin(app, "http://127.0.0.1:5001/")); // port differs
+        assert!(!same_origin(app, "http://localhost:5000/")); // host differs
+        assert!(!same_origin(app, "not a url"));
+        // Opaque origins never match anything.
+        assert!(!same_origin("about:blank", "about:blank"));
+        // Default-port normalization: explicit :443 == https default.
+        assert!(same_origin("https://a.example:443/", "https://a.example/"));
+    }
+
+    #[test]
+    fn window_registry_routes_to_owners_and_subscribers() {
+        let mut reg = WindowRegistry::default();
+        reg.subscribe("main");
+        reg.subscribe("panel");
+        assert_eq!(reg.broadcast_targets().len(), 2);
+        reg.drop_label("panel");
+        assert_eq!(reg.broadcast_targets(), vec!["main".to_string()]);
     }
 }
