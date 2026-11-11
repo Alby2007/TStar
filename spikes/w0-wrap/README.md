@@ -31,9 +31,26 @@ long-starting HTTP server?
 
 ## Verified so far (macOS, arm64)
 
-- launcher standalone: hello frame on the wire fd, server logs + READY on
-  stderr, ready-probe pass, killpg reaps the whole server tree — no leaks.
+Deps pinned: **gradio 5.49.1, streamlit 1.51.0** (+ fastapi/uvicorn/
+python-multipart) in the spike-local `.venv`.
+
+- launcher standalone: hello frame on the wire fd (saved before the fd-1
+  redirect), server logs + `READY <url>` on stderr, ready-probe pass.
+- Hung-server proof (the W1 HTTP-probe rationale): server answers the
+  first request then holds connections open forever — pongs still pass
+  (they come from the launcher, not the server), but 3 failed health
+  probes → launcher exits 5 for supervisor restart.
+- `kill_tree`: whole process group reaped including a SIGTERM-ignoring
+  grandchild (`test_kill_tree.py`) — escalation enumerates group
+  members, not just the leader.
+- Design finding: the server must share the launcher's process group
+  (no setsid) or a supervisor-side killpg can't reach it.
+- `os._exit` after kill_tree — daemon stdin reader holds the buffer lock
+  at shutdown; sys.exit deadlocks.
 - `cargo check` clean for the Tauri spike against the real plugin.
+- IPC-leak probe wired into the fastapi page (page POSTs the Tauri
+  surface it sees to /ipc-probe → stderr + /tmp/w0-ipc.json); real
+  webview run still pending — see CHECKLIST.md.
 
 ## Compatibility matrix
 
