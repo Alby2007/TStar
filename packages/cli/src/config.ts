@@ -5,7 +5,8 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 export interface PylairConfig {
   /** Python module holding the @expose functions (e.g. "app.backend"). */
@@ -86,4 +87,24 @@ export function loadTauriConfig(appDir: string): TauriConfig {
     identifier: raw.identifier ?? "com.example.app",
     version: raw.version ?? "0.1.0",
   };
+}
+
+/**
+ * The directory that must be on PYTHONPATH for `cfg.appModule` to import:
+ * the PARENT of the source dir ("backend.app" lives at <root>/backend/app.py).
+ * Single definition shared by dev, the build import check, and (mirrored in
+ * Rust) the release spawn spec.
+ */
+export function importRoot(base: string, source: string): string {
+  return join(base, dirname(source));
+}
+
+/** Absolute path of the app's installed Tauri CLI entry (JS), so it can be run
+ * with `node` directly — no `npx`/`npx.cmd` shell shim, same on every OS. */
+export function tauriCliEntry(appDir: string): string {
+  try {
+    return createRequire(join(appDir, "package.json")).resolve("@tauri-apps/cli/tauri.js");
+  } catch {
+    throw new Error("@tauri-apps/cli is not installed in the app (run `pnpm install`).");
+  }
 }

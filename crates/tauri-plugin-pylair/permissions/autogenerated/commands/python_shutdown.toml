@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-python-shutdown"
+description = "Enables the python_shutdown command without any pre-configured scope."
+commands.allow = ["python_shutdown"]
+
+[[permission]]
+identifier = "deny-python-shutdown"
+description = "Denies the python_shutdown command without any pre-configured scope."
+commands.deny = ["python_shutdown"]

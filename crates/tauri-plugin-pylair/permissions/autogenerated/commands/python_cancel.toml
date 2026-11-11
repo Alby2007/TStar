@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-python-cancel"
+description = "Enables the python_cancel command without any pre-configured scope."
+commands.allow = ["python_cancel"]
+
+[[permission]]
+identifier = "deny-python-cancel"
+description = "Denies the python_cancel command without any pre-configured scope."
+commands.deny = ["python_cancel"]

@@ -52,7 +52,9 @@ class OllamaStatus:
 
 
 def _err(e: Exception) -> OllamaError:
-    if isinstance(e, httpx.ConnectError):
+    # A closed loopback port surfaces as ConnectError on Unix but can be a
+    # ConnectTimeout on Windows (with an empty message) — same meaning.
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
         return OllamaError(
             "Ollama is not running — start it with `ollama serve` "
             "(or install it from https://ollama.com)"
@@ -63,7 +65,7 @@ def _err(e: Exception) -> OllamaError:
         except (json.JSONDecodeError, ValueError, AttributeError):
             detail = e.response.text
         return OllamaError(f"Ollama error {e.response.status_code}: {detail}")
-    return OllamaError(f"Ollama request failed: {e}")
+    return OllamaError(f"Ollama request failed: {e or type(e).__name__}")
 
 
 async def status(host: str | None = None, timeout: float = 2.0) -> OllamaStatus:

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-python-state"
+description = "Enables the python_state command without any pre-configured scope."
+commands.allow = ["python_state"]
+
+[[permission]]
+identifier = "deny-python-state"
+description = "Denies the python_state command without any pre-configured scope."
+commands.deny = ["python_state"]

@@ -28,9 +28,12 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
         "bin/python3"
     });
     let sep = if cfg!(windows) { ";" } else { ":" };
+    // Import root = PARENT of the source dir: "backend.app" resolves from
+    // resources/, not resources/backend/ (mirrors cli `importRoot`).
+    let import_root = resources.join(Path::new(source_dir).parent().unwrap_or(Path::new("")));
     let pythonpath = format!(
         "{}{}{}",
-        resources.join(source_dir).display(),
+        import_root.display(),
         sep,
         resources.join("site-packages").display()
     );
@@ -213,7 +216,13 @@ impl<R: Runtime> Builder<R> {
     }
 
     pub fn build(self) -> tauri::plugin::TauriPlugin<R> {
-        tauri::plugin::Builder::<R>::new("pylair")
+        let mut plugin = tauri::plugin::Builder::<R>::new("pylair");
+        // Installed-webview self-test: the client sees this flag and runs its
+        // checks through the real bridge, then calls python_selftest_report.
+        if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_some() {
+            plugin = plugin.js_init_script("window.__PYLAIR_SELF_TEST__ = true;".to_string());
+        }
+        plugin
             .setup(move |app, _api| {
                 let spec = self.lazy.as_ref().map(|f| f(app)).unwrap_or_else(|| self.spec.clone());
                 let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(256);
@@ -252,6 +261,7 @@ impl<R: Runtime> Builder<R> {
                 python_retry,
                 python_state,
                 python_shutdown,
+                python_selftest_report,
             ])
             .build()
     }
@@ -313,6 +323,27 @@ async fn python_grant_credit(
     n: u64,
 ) -> Result<(), ErrorObj> {
     rt.0.grant_credit(task, n).await
+}
+
+/// End of the installed-webview self-test: print the verdict and exit with
+/// it. Inert unless PYLAIR_SELF_TEST_WEBVIEW is set, so shipping the
+/// permission in a release app grants nothing.
+#[tauri::command]
+fn python_selftest_report<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    result: Value,
+) -> Result<(), ErrorObj> {
+    if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_none() {
+        return Err(ErrorObj {
+            code: protocol::INVALID_REQUEST,
+            message: "webview self-test not enabled".into(),
+            data: None,
+        });
+    }
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    println!("webview-self-test: {result}");
+    app.exit(if ok { 0 } else { 5 });
+    Ok(())
 }
 
 #[tauri::command]

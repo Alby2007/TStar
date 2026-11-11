@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { importRoot, loadConfig } from "./config.js";
 import { emit } from "./codegen.js";
 import { loadManifest } from "./manifest.js";
 
@@ -79,7 +79,7 @@ export async function dev(opts: { appDir: string }): Promise<number> {
     ...process.env,
     PYLAIR_APP_MODULE: cfg.appModule,
     PYLAIR_PYTHON: venvPython(appDir),
-    PYLAIR_PYTHONPATH: srcDir,
+    PYLAIR_PYTHONPATH: importRoot(appDir, cfg.source),
     PYLAIR_RESTART_TRIGGER: trigger,
     PYLAIR_DEV: "1",
   };

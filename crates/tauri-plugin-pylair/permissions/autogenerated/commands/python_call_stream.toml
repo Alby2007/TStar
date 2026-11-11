@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-python-call-stream"
+description = "Enables the python_call_stream command without any pre-configured scope."
+commands.allow = ["python_call_stream"]
+
+[[permission]]
+identifier = "deny-python-call-stream"
+description = "Denies the python_call_stream command without any pre-configured scope."
+commands.deny = ["python_call_stream"]

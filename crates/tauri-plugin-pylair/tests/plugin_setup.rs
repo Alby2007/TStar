@@ -2,7 +2,14 @@
 //! entered. A bare `tokio::spawn` there panicked every real app at launch
 //! ("there is no reactor running"). This drives setup through Tauri's mock
 //! runtime from a plain `#[test]` (deliberately not `#[tokio::test]`), so a
-//! setup-context bug fails on every OS without needing a display.
+//! setup-context bug fails without needing a display.
+//!
+//! Not built on Windows: a test exe linking tauri's webview stack aborts at
+//! load with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139, missing common-controls
+//! manifest that a real app embeds via tauri-build). The bug itself is
+//! OS-independent (tokio reactor context), so macOS + Linux cover it, and
+//! Windows is covered by the acceptance job's real GUI self-test.
+#![cfg(not(windows))]
 
 use tauri::test::{mock_context, noop_assets, MockRuntime};
 use tauri::Manager;

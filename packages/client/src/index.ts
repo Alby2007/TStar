@@ -55,6 +55,7 @@ const EVT = {
 } as const;
 
 const CMD = {
+  selftestReport: "plugin:pylair|python_selftest_report",
   call: "plugin:pylair|python_call",
   callStream: "plugin:pylair|python_call_stream",
   grantCredit: "plugin:pylair|python_grant_credit",
@@ -158,10 +159,49 @@ interface ActiveTask {
 const tasks = new Map<number, ActiveTask>();
 let streamListener: Promise<() => void> | null = null;
 
+/**
+ * Events for a task id nobody has registered yet. The Rust forwarder starts
+ * emitting as soon as Python replies, which can beat the `invoke` response
+ * that carries the task id back to JS. Every task here was started by this
+ * client, so an unknown id is an in-flight invoke: hold its events and
+ * replay them on registration. Entries expire so a cancelled/abandoned
+ * invoke cannot leak.
+ */
+const EARLY_TTL_MS = 30_000;
+const early = new Map<number, { events: StreamEvent[]; timer: ReturnType<typeof setTimeout> }>();
+
+function holdEarly(ev: StreamEvent): void {
+  let e = early.get(ev.task);
+  if (!e) {
+    const timer = setTimeout(() => early.delete(ev.task), EARLY_TTL_MS);
+    (timer as { unref?: () => void }).unref?.();
+    e = { events: [], timer };
+    early.set(ev.task, e);
+  }
+  e.events.push(ev);
+}
+
+/** Register a task and replay anything that arrived before it existed. */
+function register(task: number, t: ActiveTask): void {
+  tasks.set(task, t);
+  const e = early.get(task);
+  if (!e) return;
+  early.delete(task);
+  clearTimeout(e.timer);
+  for (const ev of e.events) {
+    t.onItem(ev);
+    if (ev.done) break;
+  }
+}
+
 async function ensureStreamListener(): Promise<void> {
-  streamListener ??= (await ipc()).listen<StreamEvent>(EVT.stream, (ev) => {
-    tasks.get(ev.task)?.onItem(ev);
-  });
+  streamListener ??= (async () =>
+    (await ipc()).listen<StreamEvent>(EVT.stream, (ev) => {
+      const t = tasks.get(ev.task);
+      if (t) t.onItem(ev);
+      else holdEarly(ev);
+    }))();
+  await streamListener;
 }
 
 function wireAbort(signal: AbortSignal | undefined, task: number): void {
@@ -193,7 +233,7 @@ export async function call<T = unknown>(
   });
   wireAbort(opts.signal, task);
   return new Promise<T>((resolve, reject) => {
-    tasks.set(task, {
+    register(task, {
       onItem: (ev) => {
         if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
         tasks.delete(task);
@@ -224,7 +264,7 @@ export async function* stream<T = unknown>(
   let wake: (() => void) | null = null;
   let pendingCredit = 0;
 
-  tasks.set(task, {
+  register(task, {
     onItem: (ev) => {
       queue.push(ev);
       wake?.();
@@ -289,6 +329,82 @@ export async function onExposes<T = unknown>(cb: (manifest: T) => void): Promise
   return (await ipc()).listen<T>(EVT.exposes, cb);
 }
 
+// ---- installed-webview self-test --------------------------------------------
+
+export interface SelfTestSpec {
+  /** Function returning a number: add(a, b). */
+  add: string;
+  /** Async generator yielding 0..n-1 slowly. */
+  count: string;
+}
+
+/**
+ * When the host runs the app with PYLAIR_SELF_TEST_WEBVIEW, the plugin sets
+ * `window.__PYLAIR_SELF_TEST__`. Call this once at startup: it drives the
+ * REAL bridge (ACL permissions, event routing, wire transform) — a typed
+ * call, an ordered stream, cancellation, shutdown — then reports the verdict
+ * so the host process exits 0/5. A no-op in normal runs.
+ */
+export async function maybeSelfTest(
+  spec: SelfTestSpec = { add: "add", count: "count" },
+): Promise<void> {
+  if (!(globalThis as { __PYLAIR_SELF_TEST__?: boolean }).__PYLAIR_SELF_TEST__) return;
+  const checks: Record<string, string> = {};
+  let ok = true;
+  const run = async (name: string, f: () => Promise<void>) => {
+    try {
+      await f();
+      checks[name] = "ok";
+    } catch (e) {
+      ok = false;
+      checks[name] = `FAIL: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  };
+  const within = <T,>(p: Promise<T>, ms: number, what: string) =>
+    Promise.race([
+      p,
+      new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`${what} timed out`)), ms)),
+    ]);
+
+  await run("call", async () => {
+    const v = await within(call<number>(spec.add, { a: 2, b: 3 }), 30_000, "call");
+    if (v !== 5) throw new Error(`add(2,3) returned ${String(v)}`);
+  });
+  await run("stream-order", async () => {
+    const got: number[] = [];
+    await within(
+      (async () => {
+        for await (const n of stream<number>(spec.count, { n: 5 })) got.push(n);
+      })(),
+      30_000,
+      "stream",
+    );
+    if (got.join(",") !== "0,1,2,3,4") throw new Error(`stream gave [${got.join(",")}]`);
+  });
+  await run("cancel", async () => {
+    const ac = new AbortController();
+    let seen = 0;
+    let code: number | undefined;
+    await within(
+      (async () => {
+        try {
+          for await (const _ of stream<number>(spec.count, { n: 1000 }, { signal: ac.signal })) {
+            if (++seen === 1) ac.abort();
+          }
+        } catch (e) {
+          if (e instanceof PythonError) code = e.code;
+          else throw e;
+        }
+      })(),
+      30_000,
+      "cancel",
+    );
+    if (code !== -32010) throw new Error(`expected TASK_CANCELLED, got ${String(code)} after ${seen} chunks`);
+    if (seen >= 100) throw new Error(`producer kept running (${seen} chunks)`);
+  });
+  await (await ipc()).invoke(CMD.selftestReport, { result: { ok, checks } });
+}
+
 /**
  * Namespace-style convenience surface; `python.<fn>` typed wrappers are
  * generated by `pylair codegen` in M2 on top of call/stream.
@@ -308,6 +424,8 @@ export const python = {
 /** For tests: reset all listeners/tasks between cases. */
 export function _resetForTests(): void {
   tasks.clear();
+  for (const e of early.values()) clearTimeout(e.timer);
+  early.clear();
   streamListener = null;
   _bridge = null;
   _defaultBridge = null;

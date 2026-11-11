@@ -280,7 +280,14 @@ jobs:
             echo "── appimage layout"
             cd /tmp && cp /app.AppImage . && chmod +x app.AppImage
             ./app.AppImage --appimage-extract >/dev/null
-            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a ./squashfs-root/usr/bin/app-under-test'
+            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a ./squashfs-root/usr/bin/app-under-test
+            # Webview self-test: the generated frontend drives the REAL
+            # bridge (Tauri ACL, event routing): typed call, ordered stream,
+            # cancellation. Exit code 0 only if all pass.
+            echo "── webview self-test: deb"
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/app-under-test
+            echo "── webview self-test: appimage"
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/usr/bin/app-under-test'
       - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
         working-directory: app-under-test
@@ -288,6 +295,8 @@ jobs:
           APP=$(find src-tauri/target/release/bundle/macos -name '*.app' | head -1)
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/app-under-test" --self-test
           env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/app-under-test"
+          # Webview self-test through the real bridge, run from outside the checkout.
+          cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/app-under-test/$APP/Contents/MacOS/app-under-test"
       - name: Self-test installed app (Windows)
         if: runner.os == 'Windows'
         working-directory: app-under-test
@@ -301,3 +310,8 @@ jobs:
           if (-not $exe) { Write-Error 'installed app-under-test.exe not found'; exit 1 }
           & $exe.FullName --self-test
           if ($LASTEXITCODE -ne 0) { Write-Error "self-test exit $LASTEXITCODE"; exit 1 }
+          # Webview self-test through the real bridge (ACL, events, cancel).
+          $env:PYLAIR_SELF_TEST_WEBVIEW = '1'
+          $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:TEMP -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Error 'webview self-test timed out'; exit 1 }
+          if ($p.ExitCode -ne 0) { Write-Error "webview self-test exit $($p.ExitCode)"; exit 1 }

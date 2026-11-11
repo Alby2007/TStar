@@ -24,10 +24,10 @@ pub fn run() {
         )
         .setup(move |app| {
             if gui_test {
-                let app = app.clone();
+                let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let code = self_test_gui(&app, APP_MODULE, SOURCE_DIR).await;
-                    app.exit(code);
+                    let code = self_test_gui(&handle, APP_MODULE, SOURCE_DIR).await;
+                    handle.exit(code);
                 });
             }
             Ok(())

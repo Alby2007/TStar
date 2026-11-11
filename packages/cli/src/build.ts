@@ -17,9 +17,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { get } from "node:https";
-import { arch, platform } from "node:os";
+import { arch, platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { loadConfig, loadTauriConfig } from "./config.js";
+import { importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
 import { DEFAULT_PRUNE, prune } from "./prune.js";
 
 const PBS_TAG = "20251120";
@@ -150,6 +150,7 @@ function stageEnv(resources: string, python: string, appDir: string, reqs: strin
 
 function run(cmd: string, args: string[], cwd: string) {
   const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
+  if (r.error) throw new Error(`${cmd} ${args.join(" ")} failed to start: ${r.error.message}`);
   if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")} exited ${r.status}`);
 }
 
@@ -197,14 +198,18 @@ export async function build(opts: BuildOptions): Promise<void> {
   // Over-pruning must fail at build time, not on the user's machine:
   // import the app module with the staged tree exactly as the bundle sees it.
   const sep = isWin ? ";" : ":";
+  // The import root is the PARENT of the staged source dir ("backend.app"
+  // resolves from resources/, not resources/backend/). Run from an unrelated
+  // cwd so the project checkout can't satisfy the import by accident.
   const check = spawnSync(
     bundled,
     ["-c", `import ${cfg.appModule}; print("staged import ok")`],
     {
       encoding: "utf-8",
+      cwd: tmpdir(),
       env: {
         ...process.env,
-        PYTHONPATH: `${join(resources, cfg.source)}${sep}${join(resources, "site-packages")}`,
+        PYTHONPATH: `${importRoot(resources, cfg.source)}${sep}${join(resources, "site-packages")}`,
         PYTHONNOUSERSITE: "1",
       },
     },
@@ -223,7 +228,7 @@ export async function build(opts: BuildOptions): Promise<void> {
     process.env.APPLE_CERTIFICATE ||
     process.env.WINDOWS_CERTIFICATE_THUMBPRINT
   );
-  run("npx", ["tauri", "build", ...(opts.tauriArgs ?? [])], appDir);
+  run(process.execPath, [tauriCliEntry(appDir), "build", ...(opts.tauriArgs ?? [])], appDir);
   if (!hasSigning) {
     console.warn(`
 ╔══════════════════════════════════════════════════════════════════╗

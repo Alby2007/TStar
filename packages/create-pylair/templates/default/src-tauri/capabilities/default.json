@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "default window capabilities",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "pylair:default", "pylair:allow-python-selftest-report"]
 }

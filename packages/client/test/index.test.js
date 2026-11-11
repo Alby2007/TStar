@@ -184,3 +184,78 @@ test("python namespace exposes the API surface", () => {
     assert.equal(typeof python[k], "function", `python.${k}`);
   }
 });
+
+/** Bridge whose invoke emits stream events BEFORE it resolves — what the
+ *  Rust side can do: the forwarder task emits as soon as Python replies,
+ *  racing the invoke response that carries the task id. */
+function earlyBridge(eventsFor) {
+  const b = fakeBridge();
+  const inner = b.invoke.bind(b);
+  b.invoke = async (cmd, args) => {
+    const task = await inner(cmd, args);
+    if (cmd === "plugin:pylair|python_call_stream") {
+      for (const ev of eventsFor(task)) b.emit("pylair://stream", ev);
+    }
+    return task;
+  };
+  return b;
+}
+
+test("call resolves when the terminal arrives before invoke resolves", async () => {
+  const b = earlyBridge((t) => [streamDone(t, 42)]);
+  setBridge(b);
+  const r = await Promise.race([
+    call("fast"),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("call stayed pending")), 500)),
+  ]);
+  assert.equal(r, 42);
+});
+
+test("call rejects when an early terminal is an error", async () => {
+  const b = earlyBridge((t) => [streamErr(t, -32000, "early boom")]);
+  setBridge(b);
+  await assert.rejects(
+    Promise.race([
+      call("fast"),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("call stayed pending")), 500)),
+    ]),
+    (e) => e instanceof PythonError && e.code === -32000,
+  );
+});
+
+test("stream keeps early chunks and the early terminal, in order", async () => {
+  const b = earlyBridge((t) => [streamChunk(t, 0, "a"), streamChunk(t, 1, "b"), streamDone(t, null)]);
+  setBridge(b);
+  const got = [];
+  const run = (async () => {
+    for await (const v of stream("fast")) got.push(v);
+  })();
+  await Promise.race([
+    run,
+    new Promise((_, rej) => setTimeout(() => rej(new Error("stream stayed pending")), 500)),
+  ]);
+  assert.deepEqual(got, ["a", "b"]);
+});
+
+test("listener is installed before the first invoke returns", async () => {
+  // A bridge whose listen() resolves late: events emitted by an invoke that
+  // starts after listen() was *requested* must still be delivered.
+  const b = fakeBridge();
+  const realListen = b.listen.bind(b);
+  b.listen = async (ev, cb) => {
+    await new Promise((r) => setTimeout(r, 20));
+    return realListen(ev, cb);
+  };
+  const inner = b.invoke.bind(b);
+  b.invoke = async (cmd, args) => {
+    const task = await inner(cmd, args);
+    if (cmd === "plugin:pylair|python_call_stream") b.emit("pylair://stream", streamDone(task, "ok"));
+    return task;
+  };
+  setBridge(b);
+  const r = await Promise.race([
+    call("fast"),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("call stayed pending")), 500)),
+  ]);
+  assert.equal(r, "ok");
+});
