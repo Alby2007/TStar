@@ -2,6 +2,7 @@
   "name": "create-pylair",
   "version": "0.0.0",
   "description": "Scaffold a new Pylair project (npx create-pylair my-app)",
+  "license": "MIT OR Apache-2.0",
   "type": "module",
   "bin": {
     "create-pylair": "./dist/index.js"

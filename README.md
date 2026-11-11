@@ -43,3 +43,17 @@ cd python/pylair && uv sync   # Python env (fetches managed CPython)
 Docs: [security](docs/security.md), [protocol](docs/protocol-v1.md),
 [cancellation](docs/cancellation.md), [codegen](docs/codegen.md),
 [decisions](docs/decisions/), [ideas](docs/ideas.md).
+
+## License
+
+Dual-licensed under MIT or Apache-2.0 — pick whichever fits your project.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+Installers produced by `pylair build` are **unsigned** unless you configure
+code signing — expect Gatekeeper (macOS) and SmartScreen (Windows)
+warnings on unsigned builds. See [docs/build.md](docs/build.md).
+
+Pylair builds on [Tauri](https://tauri.app) but is not affiliated with or
+endorsed by the Tauri project. Apps it produces bundle third-party
+software (a standalone CPython build and your Python dependencies);
+their licenses ship inside each bundle under `THIRD-PARTY-NOTICES`.

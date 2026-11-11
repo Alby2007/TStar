@@ -1,11 +1,12 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { matchGlob } from "../dist/glob.js";
+import { stageNotices } from "../dist/build.js";
 import { DEFAULT_PRUNE, prune } from "../dist/prune.js";
 import { loadConfig } from "../dist/config.js";
 
@@ -107,5 +108,60 @@ describe("loadConfig", () => {
 
   test("errors without pyproject", () => {
     assert.throws(() => loadConfig("/nonexistent", "python3"), /no pyproject.toml/);
+  });
+});
+
+describe("stageNotices", () => {
+  test("collects pylair, interpreter and wheel licenses", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-notices-"));
+    const res = join(dir, "resources");
+    // interpreter tree: licenses/ dir + a top-level LICENSE.txt
+    mkdirSync(join(res, "python", "licenses"), { recursive: true });
+    writeFileSync(join(res, "python", "licenses", "openssl.txt"), "Apache-2.0 openssl text");
+    writeFileSync(join(res, "python", "LICENSE.txt"), "PSF-2.0 text");
+    // wheels: one with a licenses dir, one with METADATA only
+    mkdirSync(join(res, "site-packages", "httpx-0.28.1.dist-info", "licenses"), {
+      recursive: true,
+    });
+    writeFileSync(
+      join(res, "site-packages", "httpx-0.28.1.dist-info", "licenses", "LICENSE.md"),
+      "BSD-3 httpx text",
+    );
+    mkdirSync(join(res, "site-packages", "foo-1.0.dist-info"), { recursive: true });
+    writeFileSync(
+      join(res, "site-packages", "foo-1.0.dist-info", "METADATA"),
+      "Metadata-Version: 2.4\nName: foo\nLicense-Expression: MIT\n",
+    );
+    // pylair's own license files
+    const pd = join(dir, "pylair-pkg");
+    mkdirSync(pd, { recursive: true });
+    writeFileSync(join(pd, "LICENSE-MIT"), "mit");
+    writeFileSync(join(pd, "LICENSE-APACHE"), "apache");
+
+    stageNotices(res, pd);
+
+    const out = join(res, "THIRD-PARTY-NOTICES");
+    assert.ok(existsSync(join(out, "pylair", "LICENSE-MIT")));
+    assert.ok(existsSync(join(out, "python", "licenses", "openssl.txt")));
+    assert.ok(existsSync(join(out, "python", "LICENSE.txt")));
+    assert.ok(existsSync(join(out, "httpx", "licenses", "LICENSE.md")));
+    assert.match(
+      String(readFileSync(join(out, "foo", "METADATA-LICENSE.txt"))),
+      /License-Expression: MIT/,
+    );
+    const idx = String(readFileSync(join(out, "INDEX.txt")));
+    for (const name of ["pylair", "python", "httpx", "foo"])
+      assert.match(idx, new RegExp(`${name}/`));
+    rmSync(dir, { recursive: true });
+  });
+
+  test("writes a placeholder NOTICE when the interpreter has no licenses", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-notices-"));
+    const res = join(dir, "resources");
+    mkdirSync(join(res, "python", "bin"), { recursive: true });
+    mkdirSync(join(dir, "pd"), { recursive: true });
+    stageNotices(res, join(dir, "pd"));
+    assert.ok(existsSync(join(res, "THIRD-PARTY-NOTICES", "python", "NOTICE.txt")));
+    rmSync(dir, { recursive: true });
   });
 });

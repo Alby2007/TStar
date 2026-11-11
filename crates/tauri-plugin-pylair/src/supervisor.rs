@@ -252,6 +252,28 @@ enum Command {
 /// Below the Python lag monitor's 1s threshold this would flap on jitter.
 const LOOP_STALL_WARN: Duration = Duration::from_secs(1);
 
+/// What a pong's `loop_stale_ms` means for the runtime. Pure so the
+/// verdict boundaries are unit-testable without a clock or a process:
+/// a configured kill wins over the warning, and with no kill configured
+/// a stalled loop is only ever a diagnostic (P1-7: model loads can block
+/// the loop for minutes on a healthy app).
+#[derive(Debug, PartialEq, Eq)]
+enum PongVerdict {
+    Ready,
+    StallWarn,
+    StallKill,
+}
+
+fn classify_pong(stale: Duration, kill: Option<Duration>) -> PongVerdict {
+    if kill.is_some_and(|l| stale >= l) {
+        PongVerdict::StallKill
+    } else if stale >= LOOP_STALL_WARN {
+        PongVerdict::StallWarn
+    } else {
+        PongVerdict::Ready
+    }
+}
+
 enum PendingKind {
     Call(oneshot::Sender<Result<Value, ErrorObj>>),
     Stream(StreamSink),
@@ -718,23 +740,22 @@ impl Supervisor {
                                     pongs_outstanding = 0;
                                     // Transport is alive. Is the loop SERVING?
                                     let stale = Duration::from_millis(p["loop_stale_ms"].as_u64().unwrap_or(0));
-                                    if self.config.loop_stall_kill.is_some_and(|l| stale >= l) {
-                                        self.set_state(State::Unresponsive,
-                                            format!("event loop blocked for {stale:?}"));
-                                        fail_all(&mut pending, proto::RUNTIME_WEDGED,
-                                            &format!("the runtime's event loop has been blocked for {stale:?} \
-                                                      (blocking code inside an async def?)")).await;
-                                        kill_and_reap(&mut io).await;
-                                        return ExitCause::Crashed(format!("event loop blocked for {stale:?}"));
-                                    }
-                                    if stale >= LOOP_STALL_WARN {
+                                    match classify_pong(stale, self.config.loop_stall_kill) {
+                                        PongVerdict::StallKill => {
+                                            self.set_state(State::Unresponsive,
+                                                format!("event loop blocked for {stale:?}"));
+                                            fail_all(&mut pending, proto::RUNTIME_WEDGED,
+                                                &format!("the runtime's event loop has been blocked for {stale:?} \
+                                                          (blocking code inside an async def?)")).await;
+                                            kill_and_reap(&mut io).await;
+                                            return ExitCause::Crashed(format!("event loop blocked for {stale:?}"));
+                                        }
                                         // Diagnostic only (P1-7): the loop
                                         // cannot serve calls right now, but a
                                         // long stall is not proof of a wedge.
-                                        self.set_state(State::Unresponsive,
-                                            format!("event loop blocked for {stale:?} (diagnostic)"));
-                                    } else {
-                                        self.set_state(State::Ready, "pong received");
+                                        PongVerdict::StallWarn => self.set_state(State::Unresponsive,
+                                            format!("event loop blocked for {stale:?} (diagnostic)")),
+                                        PongVerdict::Ready => self.set_state(State::Ready, "pong received"),
                                     }
                                 }
                                 "stream.chunk" => {
@@ -1272,5 +1293,35 @@ fn assign_to_job_object(pid: Option<u32>) -> Option<JobHandle> {
         }
         CloseHandle(proc);
         Some(JobHandle(job))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pong_classification_boundaries() {
+        use PongVerdict::*;
+        let kill = Some(Duration::from_secs(300));
+        // Below the warn threshold: Ready even with a kill configured.
+        assert_eq!(classify_pong(Duration::ZERO, kill), Ready);
+        assert_eq!(
+            classify_pong(LOOP_STALL_WARN - Duration::from_millis(1), kill),
+            Ready
+        );
+        // Warn band: from threshold up to (but not including) kill.
+        assert_eq!(classify_pong(LOOP_STALL_WARN, kill), StallWarn);
+        assert_eq!(classify_pong(Duration::from_secs(299), kill), StallWarn);
+        // At/over the configured kill: StallKill.
+        assert_eq!(classify_pong(Duration::from_secs(300), kill), StallKill);
+        // No kill configured: any stall is only a diagnostic, forever.
+        assert_eq!(classify_pong(Duration::from_secs(3600), None), StallWarn);
+        assert_eq!(classify_pong(Duration::MAX, None), StallWarn);
+        // A kill configured below the warn threshold still wins (config is king).
+        assert_eq!(
+            classify_pong(Duration::from_millis(500), Some(Duration::from_millis(500))),
+            StallKill
+        );
     }
 }

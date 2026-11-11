@@ -2,6 +2,7 @@
   "name": "pylair-cli",
   "version": "0.0.0",
   "description": "Pylair CLI: dev, build, doctor, codegen",
+  "license": "MIT OR Apache-2.0",
   "type": "module",
   "bin": {
     "pylair": "./dist/cli.js"
