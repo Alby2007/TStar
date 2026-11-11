@@ -1,8 +1,4 @@
-# Fetched/staged artifacts (reproduced by `pnpm prepare`)
+# Fetched/staged artifacts (reproduced by `pnpm stage` per-OS — never commit)
 src-tauri/resources/
 src-tauri/target/
 src-tauri/gen/
-
-# Generated icon set (reproduced by `pnpm tauri icon`)
-src-tauri/icons/
-icon-source.png
