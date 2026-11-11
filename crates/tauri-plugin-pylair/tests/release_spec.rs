@@ -40,3 +40,14 @@ fn release_pythonpath_resolves_app_module_from_unrelated_cwd() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "7");
 }
+
+#[test]
+fn release_spec_strips_inherited_python_config() {
+    // An AppImage's AppRun exports PYTHONHOME at the AppDir; inheriting it
+    // broke the bundled interpreter's stdlib lookup (found by the Linux
+    // acceptance run). The release spec must remove it from the child env.
+    let spec = release_spawn_spec(std::path::Path::new("/r"), "backend.app", "backend");
+    for k in ["PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE"] {
+        assert!(spec.env_remove.iter().any(|x| x == k), "{k} not stripped");
+    }
+}

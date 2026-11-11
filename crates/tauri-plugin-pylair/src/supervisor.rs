@@ -56,6 +56,9 @@ pub struct SpawnSpec {
     /// e.g. `["-m", "pylair", "my_app"]`
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Variables stripped from the INHERITED environment before `env` is
+    /// applied (e.g. a launcher's PYTHONHOME must not reach a bundled Python).
+    pub env_remove: Vec<String>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -65,6 +68,7 @@ impl SpawnSpec {
             program: python,
             args: vec!["-m".into(), "pylair".into(), app_module.into()],
             env: vec![],
+            env_remove: vec![],
             cwd: None,
         }
     }
@@ -802,6 +806,9 @@ async fn spawn_child(
         .kill_on_drop(true);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
+    }
+    for k in &spec.env_remove {
+        cmd.env_remove(k);
     }
     cmd.envs(spec.env.iter().cloned());
     #[cfg(unix)]

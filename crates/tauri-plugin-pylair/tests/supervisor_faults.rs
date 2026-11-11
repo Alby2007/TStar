@@ -114,6 +114,7 @@ fn real_runtime_spec() -> SpawnSpec {
                 .into_owned(),
         )],
         cwd: Some(root.join("python/pylair/tests")),
+        ..Default::default()
     }
 }
 
@@ -144,6 +145,7 @@ fn spec(script: &str) -> SpawnSpec {
         args: vec!["-c".into(), script.into()],
         env: vec![],
         cwd: None,
+        ..Default::default()
     }
 }
 

@@ -41,6 +41,20 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
     spec.env.push(("PYTHONPATH".into(), pythonpath));
     spec.env.push(("PYTHONUTF8".into(), "1".into()));
     spec.env.push(("PYTHONNOUSERSITE".into(), "1".into()));
+    // The packaged interpreter must not inherit Python configuration from
+    // whatever launched the app: an AppImage's AppRun exports PYTHONHOME
+    // (pointing at the AppDir), which breaks the bundled stdlib lookup.
+    spec.env_remove.extend(
+        [
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONEXECUTABLE",
+            "PYTHONUSERBASE",
+            "PYTHONINSPECT",
+            "PYTHONPLATLIBDIR",
+        ]
+        .map(String::from),
+    );
     spec
 }
 
@@ -52,15 +66,20 @@ pub fn app_spawn_spec<R: Runtime>(
     app_module: &str,
     source_dir: &str,
 ) -> SpawnSpec {
-    if let Ok(module) = std::env::var("PYLAIR_APP_MODULE") {
-        let program = std::env::var("PYLAIR_PYTHON").unwrap_or_else(|_| "python3".into());
-        let mut spec = SpawnSpec::pylair(PathBuf::from(program), &module);
-        if let Ok(pp) = std::env::var("PYLAIR_PYTHONPATH") {
-            spec.env.push(("PYTHONPATH".into(), pp));
+    // Development overrides are honored in debug builds only: a packaged app
+    // must never let the launching environment redirect which interpreter or
+    // module it runs.
+    if cfg!(debug_assertions) {
+        if let Ok(module) = std::env::var("PYLAIR_APP_MODULE") {
+            let program = std::env::var("PYLAIR_PYTHON").unwrap_or_else(|_| "python3".into());
+            let mut spec = SpawnSpec::pylair(PathBuf::from(program), &module);
+            if let Ok(pp) = std::env::var("PYLAIR_PYTHONPATH") {
+                spec.env.push(("PYTHONPATH".into(), pp));
+            }
+            // NB: PYLAIR_RESTART_TRIGGER is read by the supervisor from its own
+            // env (inherited from `pylair dev`) — not forwarded to the child.
+            return spec;
         }
-        // NB: PYLAIR_RESTART_TRIGGER is read by the supervisor from its own
-        // env (inherited from `pylair dev`) — not forwarded to the child.
-        return spec;
     }
     let res = app.path().resource_dir().expect("resource_dir");
     release_spawn_spec(&res, app_module, source_dir)
