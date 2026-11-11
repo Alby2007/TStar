@@ -12,12 +12,17 @@ pyproject.toml [tool.pylair] + src-tauri/tauri.conf.json
         │
         ▼
 1. fetch python-build-standalone CPython for the HOST triple
-2. uv pip install --target src-tauri/resources/site-packages -r requirements.txt
-   (using the bundled interpreter — wheels always match the target)
+   (SHA256-verified against the release's SHA256SUMS; tarball cached in
+   .pylair/cache/ between builds)
+2. uv export --frozen from uv.lock → uv pip install --target
+   src-tauri/resources/site-packages using the bundled interpreter —
+   the SAME locked, hashed set `pylair dev` syncs (requirements.txt is
+   the no-lockfile fallback, with a drift warning)
 3. copy the app source dir into src-tauri/resources/
 4. prune the staged tree (default deny-list + app additions)
-5. npx tauri build
-6. warn loudly if no signing credentials are configured
+5. import-check the app module with the staged tree
+6. npx tauri build
+7. warn loudly if no signing credentials are configured
 ```
 
 ## Configuration — one file
@@ -48,9 +53,20 @@ Default deny-list (globs relative to `src-tauri/resources/`):
 | `python/include`, `*.a`, `lib/pkgconfig` | C headers / static libs — build-time only |
 | `python/lib/python*/test`, `idlelib`, `tkinter`, `turtledemo` | stdlib test suite, IDLE, tk |
 | `pydoc_data`, `ensurepip`, `venv`, `share` | docs topics, pip bootstrap, man pages |
-| `site-packages/pip*`, `setuptools`, `pkg_resources`, `_distutils_hack` | packaging toolchain — not needed at runtime |
-| `site-packages/*/tests`, `*/test`, `*/testing` | per-package test suites (numpy's is ~25 MB) |
+| `site-packages/pip*`, `_distutils_hack` | pip is dead weight post-install |
+| `site-packages/*/tests`, `*/test` | per-package test suites (numpy's is ~25 MB) |
 | `**/*.pyc`, `**/__pycache__` | regenerated caches |
+
+Deliberately **not** pruned:
+- `*/testing` — `numpy.testing`, `pandas.testing`, `torch.testing` are
+  imported at runtime by downstream code.
+- `pkg_resources` / `setuptools` — still imported at runtime by many libs.
+- `LICENSE.txt` and other license files — the PSF license *requires* them
+  to ship with redistributed interpreters.
+
+After pruning, the build imports the app module with the staged tree
+(`PYTHONNOUSERSITE=1`) and fails if it breaks — over-pruning shows up at
+build time, not on the user's machine.
 
 Apps extend it via `prune = [...]`. If an app genuinely ships a package
 named `tests` or needs pip at runtime (e.g. a plugin installer), that entry
@@ -84,7 +100,7 @@ files (secrets don't belong in VCS):
 | `APPLE_SIGNING_IDENTITY` | macOS | Developer ID Application cert |
 | `APPLE_CERTIFICATE` + `APPLE_CERTIFICATE_PASSWORD` | macOS | base64 p12 for CI |
 | `APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID` or `APPLE_API_KEY`/`APPLE_API_ISSUER`/`APPLE_API_KEY_PATH` | macOS | notarization |
-| `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | all | updater signatures |
+| `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | all | **updater** signatures only — does NOT sign the app and does not silence the unsigned warning |
 | `WINDOWS_CERTIFICATE_THUMBPRINT` | Windows | cert in the machine store |
 | `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` + `AZURE_CODE_SIGNING_*` | Windows | Azure Trusted Signing (CI-friendly, no dongle) |
 

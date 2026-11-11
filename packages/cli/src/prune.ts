@@ -21,17 +21,17 @@ export const DEFAULT_PRUNE = [
   "python/share",
   "python/*.a",
   "python/lib/**/*.a",
-  // interpreter license/doc stubs
-  "python/LICENSE.txt",
+  // NOTE: license files are NOT pruned — the PSF license requires
+  // LICENSE.txt to ship with redistributed interpreters.
   // site-packages dead weight
   "site-packages/pip",
   "site-packages/pip-*",
   "site-packages/_distutils_hack",
-  "site-packages/pkg_resources",
-  "site-packages/setuptools",
   "site-packages/*/tests",
   "site-packages/*/test",
-  "site-packages/*/testing",
+  // NOT "*/testing": numpy.testing / pandas.testing / torch.testing are
+  // imported at runtime by downstream code; pruning them breaks apps.
+  // NOT pkg_resources/setuptools: still imported at runtime by many libs.
   "site-packages/**/*.pyc",
   "site-packages/**/__pycache__",
   "site-packages/**/*.dist-info/RECORD.jws",

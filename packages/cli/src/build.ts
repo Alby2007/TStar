@@ -4,6 +4,7 @@
  *   source → prune → tauri build → unsigned warning.
  */
 
+import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   cpSync,
@@ -11,7 +12,9 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { get } from "node:https";
 import { arch, platform } from "node:os";
@@ -53,7 +56,11 @@ function download(url: string, to: string): Promise<void> {
   });
 }
 
-async function fetchPython(resources: string, versionClass: string): Promise<string> {
+async function fetchPython(
+  resources: string,
+  cacheDir: string,
+  versionClass: string,
+): Promise<string> {
   const ver = PBS_VERSIONS[versionClass];
   if (!ver)
     throw new Error(
@@ -61,28 +68,71 @@ async function fetchPython(resources: string, versionClass: string): Promise<str
     );
   const triple = hostTriple();
   const asset = `cpython-${ver}+${PBS_TAG}-${triple}-install_only_stripped.tar.gz`;
-  const url = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${asset}`;
-  const dest = join(resources, "python");
-  const tmp = join(resources, ".python.tar.gz");
+  const base = `https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}`;
   mkdirSync(resources, { recursive: true });
+  mkdirSync(cacheDir, { recursive: true });
+  const tarball = join(cacheDir, asset);
+
+  if (!existsSync(tarball)) {
+    console.log(`fetching ${asset}`);
+    await download(`${base}/${asset}`, tarball);
+  } else {
+    console.log(`using cached ${asset}`);
+  }
+
+  // The interpreter ships to end users — verify against the release's
+  // published SHA256SUMS before it ever reaches the bundle.
+  const sumsTmp = join(cacheDir, "SHA256SUMS");
+  if (!existsSync(sumsTmp)) await download(`${base}/SHA256SUMS`, sumsTmp);
+  const want = readFileSync(sumsTmp, "utf-8")
+    .split("\n")
+    .find((l) => l.trim().endsWith(` ${asset}`) || l.trim().endsWith(`*${asset}`))
+    ?.trim()
+    .split(/\s+/)[0];
+  if (!want) throw new Error(`no SHA256 for ${asset} in ${PBS_TAG} SHA256SUMS`);
+  const got = createHash("sha256").update(readFileSync(tarball)).digest("hex");
+  if (got !== want)
+    throw new Error(`SHA256 mismatch for ${asset}: got ${got}, want ${want} — refusing to bundle`);
+
+  const dest = join(resources, "python");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
-  console.log(`fetching ${asset}`);
-  await download(url, tmp);
-  execFileSync("tar", ["-xzf", tmp, "-C", dest, "--strip-components=1"], { stdio: "inherit" });
-  rmSync(tmp);
+  execFileSync("tar", ["-xzf", tarball, "-C", dest, "--strip-components=1"], { stdio: "inherit" });
   const py = join(dest, isWin ? "python.exe" : "bin/python3");
   if (!existsSync(py)) throw new Error(`expected interpreter at ${py}`);
   return py;
 }
 
-function stageEnv(resources: string, python: string, reqs: string) {
+function stageEnv(resources: string, python: string, appDir: string, reqs: string, cacheDir: string) {
   const target = join(resources, "site-packages");
   rmSync(target, { recursive: true, force: true });
+  // dev uses `uv sync` (uv.lock) — build must install the SAME locked set,
+  // hashed, or dev/prod parity is a fiction. requirements.txt is the
+  // fallback for projects that don't lock.
+  const lock = join(appDir, "uv.lock");
+  let reqsFile = reqs;
+  let exported: string | undefined;
+  if (existsSync(lock)) {
+    exported = join(cacheDir, "requirements.exported.txt");
+    execFileSync(
+      "uv",
+      ["export", "--frozen", "--format", "requirements-txt", "-o", exported],
+      { cwd: appDir, stdio: "inherit" },
+    );
+    reqsFile = exported;
+  } else if (!existsSync(reqs)) {
+    console.log(`no uv.lock and no ${reqs} — bundling stdlib only`);
+    return;
+  } else {
+    console.warn(
+      "warning: no uv.lock — building from requirements.txt; " +
+        "the bundled env may drift from `pylair dev`'s env",
+    );
+  }
   execFileSync(
     "uv",
-    ["pip", "install", "--python", python, "--target", target, "-r", reqs],
-    { stdio: "inherit" },
+    ["pip", "install", "--python", python, "--target", target, "-r", reqsFile],
+    { cwd: appDir, stdio: "inherit" },
   );
 }
 
@@ -115,13 +165,12 @@ export async function build(opts: BuildOptions): Promise<void> {
   );
   console.log("note: pylair builds native bundles only — run this on each target OS");
 
+  const cacheDir = join(appDir, ".pylair", "cache");
   const bundled = opts.skipFetch
     ? join(resources, "python", isWin ? "python.exe" : "bin/python3")
-    : await fetchPython(resources, cfg.pythonVersion);
+    : await fetchPython(resources, cacheDir, cfg.pythonVersion);
 
-  const reqs = join(appDir, cfg.requirements);
-  if (existsSync(reqs)) stageEnv(resources, bundled, reqs);
-  else console.log(`no ${cfg.requirements} — app will bundle stdlib only`);
+  stageEnv(resources, bundled, appDir, join(appDir, cfg.requirements), cacheDir);
 
   // Stage app source so resources/ mirrors the installed layout.
   const srcDir = join(appDir, cfg.source);
@@ -133,12 +182,34 @@ export async function build(opts: BuildOptions): Promise<void> {
   const mib = (res.bytesFreed / 2 ** 20).toFixed(1);
   console.log(`pruned ${res.removed} paths (${mib} MiB) from staged resources`);
 
+  // Over-pruning must fail at build time, not on the user's machine:
+  // import the app module with the staged tree exactly as the bundle sees it.
+  const sep = isWin ? ";" : ":";
+  const check = spawnSync(
+    bundled,
+    ["-c", `import ${cfg.appModule}; print("staged import ok")`],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PYTHONPATH: `${join(resources, cfg.source)}${sep}${join(resources, "site-packages")}`,
+        PYTHONNOUSERSITE: "1",
+      },
+    },
+  );
+  if (check.status !== 0)
+    throw new Error(
+      `staged bundle failed the import check (${cfg.appModule}) — ` +
+        `pruning or missing deps? ${check.stderr?.trim()}`,
+    );
+
   // ── tauri build ────────────────────────────────────────────────────
+  // NOTE: TAURI_SIGNING_PRIVATE_KEY signs *updater* artifacts, not the app —
+  // it must NOT silence the unsigned warning.
   const hasSigning = !!(
     process.env.APPLE_SIGNING_IDENTITY ||
-    process.env.TAURI_SIGNING_PRIVATE_KEY ||
-    process.env.WINDOWS_CERTIFICATE_THUMBPRINT ||
-    process.env.SMAC_CODE_SIGNING_IDENTITY
+    process.env.APPLE_CERTIFICATE ||
+    process.env.WINDOWS_CERTIFICATE_THUMBPRINT
   );
   run("npx", ["tauri", "build", ...(opts.tauriArgs ?? [])], appDir);
   if (!hasSigning) {

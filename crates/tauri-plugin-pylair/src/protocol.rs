@@ -28,6 +28,9 @@ pub const RUNTIME_WEDGED: i64 = -32012;
 pub const RUNTIME_UNAVAILABLE: i64 = -32030;
 pub const RUNTIME_CRASHED: i64 = -32031;
 pub const PROTOCOL_VIOLATION: i64 = -32032;
+/// In-flight call killed by a dev-mode hot reload — not a crash; the UI
+/// can present it as "restarting" rather than an error.
+pub const RUNTIME_RESTARTED: i64 = -32033;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorObj {

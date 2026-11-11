@@ -230,37 +230,37 @@ jobs:
       - name: pylair build (stages interpreter, env, prunes, tauri build)
         working-directory: app-under-test
         run: pnpm exec pylair build --bundles ${{ matrix.bundles }}
-      - name: Verify bundled payload (Linux, clean container)
+      - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
         working-directory: app-under-test
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
           dpkg -x "$DEB" /tmp/approot
-          RES=/tmp/approot/usr/lib/app-under-test
           for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
-          docker run --rm -v "$RES:/r:ro" ubuntu:22.04 bash -c '
-            PYTHONPATH=/r/site-packages:/r/backend PYTHONNOUSERSITE=1 \
-              /r/python/bin/python3 -c "import backend.app as a; print(a.hello())"'
-      - name: Verify bundled payload (macOS)
+          # Bare ubuntu:22.04 has NO python — the binary is a GUI binary so it
+          # needs its linked system libs, but --self-test exits before the
+          # Tauri loop/GTK init. It must spawn the bundled interpreter.
+          docker run --rm -v /tmp/approot:/r:ro ubuntu:22.04 bash -c '
+            set -e; export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates >/dev/null
+            /r/usr/bin/app-under-test --self-test'
+      - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
         working-directory: app-under-test
         run: |
           APP=$(find src-tauri/target/release/bundle/macos -name '*.app' | head -1)
-          RES="$APP/Contents/Resources"
-          PYTHONPATH="$RES/site-packages:$RES/backend" PYTHONNOUSERSITE=1 \
-            "$RES/python/bin/python3" -c "import backend.app as a; print(a.hello())"
-      - name: Verify bundled payload (Windows)
+          env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/app-under-test" --self-test
+      - name: Self-test installed app (Windows)
         if: runner.os == 'Windows'
         working-directory: app-under-test
         shell: pwsh
         run: |
           $i = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
           Start-Process -FilePath $i.FullName -ArgumentList '/S' -Wait
-          $py = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles" `
-                -Recurse -Filter 'python.exe' -Depth 4 -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -like '*app-under-test*' } | Select-Object -First 1
-          if (-not $py) { Write-Error 'installed python.exe not found'; exit 1 }
-          $res = Split-Path (Split-Path $py.FullName -Parent) -Parent
-          $env:PYTHONPATH = "$res/site-packages;$res/backend"
-          $env:PYTHONNOUSERSITE = '1'
-          & $py.FullName -c "import backend.app as a; print(a.hello())"
+          $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles" `
+                -Recurse -Filter 'app-under-test.exe' -Depth 3 -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+          if (-not $exe) { Write-Error 'installed app-under-test.exe not found'; exit 1 }
+          & $exe.FullName --self-test
+          if ($LASTEXITCODE -ne 0) { Write-Error "self-test exit $LASTEXITCODE"; exit 1 }

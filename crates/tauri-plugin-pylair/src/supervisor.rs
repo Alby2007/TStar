@@ -702,7 +702,7 @@ impl Supervisor {
                     if m != trigger_mtime {
                         let _ = self.events.try_send(RuntimeEvent::Stderr(
                             "pylair: source changed — restarting python runtime".into()));
-                        fail_all(&mut pending, proto::RUNTIME_CRASHED,
+                        fail_all(&mut pending, proto::RUNTIME_RESTARTED,
                             "python restarted (source change)").await;
                         kill_and_reap(&mut io).await;
                         return ExitCause::DevRestart;

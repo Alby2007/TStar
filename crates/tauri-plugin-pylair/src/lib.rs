@@ -15,7 +15,53 @@ pub use supervisor::{
 };
 
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager, Runtime};
+
+/// The interpreter spec for a packaged app, given the directory holding
+/// `python/`, `site-packages/` and the app's source dir. Kept here (not in
+/// app code) so path/env fixes reach every app via a plugin update.
+pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) -> SpawnSpec {
+    let python = resources.join("python").join(if cfg!(windows) {
+        "python.exe"
+    } else {
+        "bin/python3"
+    });
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let pythonpath = format!(
+        "{}{}{}",
+        resources.join(source_dir).display(),
+        sep,
+        resources.join("site-packages").display()
+    );
+    let mut spec = SpawnSpec::pylair(python, app_module);
+    spec.env.push(("PYTHONPATH".into(), pythonpath));
+    spec.env.push(("PYTHONUTF8".into(), "1".into()));
+    spec.env.push(("PYTHONNOUSERSITE".into(), "1".into()));
+    spec
+}
+
+/// Dev-or-release spec: `pylair dev` exports PYLAIR_APP_MODULE / PYLAIR_PYTHON
+/// / PYLAIR_PYTHONPATH / PYLAIR_RESTART_TRIGGER → the project venv; a packaged
+/// build resolves `resource_dir`. Apps use this as the plugin's spec fn.
+pub fn app_spawn_spec<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    app_module: &str,
+    source_dir: &str,
+) -> SpawnSpec {
+    if let Ok(module) = std::env::var("PYLAIR_APP_MODULE") {
+        let program = std::env::var("PYLAIR_PYTHON").unwrap_or_else(|_| "python3".into());
+        let mut spec = SpawnSpec::pylair(PathBuf::from(program), &module);
+        if let Ok(pp) = std::env::var("PYLAIR_PYTHONPATH") {
+            spec.env.push(("PYTHONPATH".into(), pp));
+        }
+        // NB: PYLAIR_RESTART_TRIGGER is read by the supervisor from its own
+        // env (inherited from `pylair dev`) — not forwarded to the child.
+        return spec;
+    }
+    let res = app.path().resource_dir().expect("resource_dir");
+    release_spawn_spec(&res, app_module, source_dir)
+}
 
 /// Frontend event names (kept in one place — the client SDK mirrors them).
 pub mod events {
