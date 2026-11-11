@@ -777,9 +777,9 @@ async fn monitor_child(
     mut child: Child,
     mut kill_rx: mpsc::Receiver<()>,
     exit_tx: oneshot::Sender<io::Result<std::process::ExitStatus>>,
-    // Holding this handle keeps the Job Object alive; closing it (drop at
-    // task end) after the child exits is harmless.
-    _job: Option<windows_sys::Win32::Foundation::HANDLE>,
+    // Holding this keeps the Job Object alive; it closes when the monitor
+    // task ends (after the child exits), which also kills any survivors.
+    _job: Option<JobHandle>,
 ) {
     tokio::select! {
         status = child.wait() => { let _ = exit_tx.send(status); }
@@ -804,15 +804,32 @@ async fn kill_tree(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+/// windows-sys HANDLE is *mut c_void, which is !Send — wrap it so it can be
+/// held by the monitor task (keeps the Job Object alive for the child's life).
 #[cfg(windows)]
-fn assign_to_job_object(pid: Option<u32>) -> Option<windows_sys::Win32::Foundation::HANDLE> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn assign_to_job_object(pid: Option<u32>) -> Option<JobHandle> {
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::*;
     use windows_sys::Win32::System::Threading::*;
 
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job == 0 {
+        if job.is_null() {
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -832,14 +849,14 @@ fn assign_to_job_object(pid: Option<u32>) -> Option<windows_sys::Win32::Foundati
             return None;
         };
         let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-        if proc == 0 || AssignProcessToJobObject(job, proc) == 0 {
-            if proc != 0 {
+        if proc.is_null() || AssignProcessToJobObject(job, proc) == 0 {
+            if !proc.is_null() {
                 CloseHandle(proc);
             }
             CloseHandle(job);
             return None;
         }
         CloseHandle(proc);
-        Some(job as HANDLE) // kept alive by caller for the child's lifetime
+        Some(JobHandle(job))
     }
 }
