@@ -16,7 +16,11 @@ on:
 
 jobs:
   publish:
-    runs-on: ubuntu-22.04
+    # macOS: the dry-run verify step COMPILES the packaged crate — on Linux
+    # that needs GTK/webkit system packages; on macOS it works with system
+    # frameworks alone. The uploaded tarball is identical either way, and
+    # ci.yml already compiles the crate on all three OSes.
+    runs-on: macos-latest
     permissions:
       contents: write # commit the version bump + tag on real publishes
     env:
