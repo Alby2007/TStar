@@ -55,3 +55,8 @@ host → "Ollama is not running", API error → "Ollama error N: <detail>".
 - `ollama serve` auto-start: `status()` reports it; the app decides.
 - Embeddings/images/tool-call structured output: the wire shapes are
   there when an app needs them; this package stays small.
+
+Pylair builds on [Tauri](https://tauri.app) but is not affiliated with or
+endorsed by the Tauri project.
+
+License: MIT OR Apache-2.0.

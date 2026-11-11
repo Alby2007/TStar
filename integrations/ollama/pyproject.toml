@@ -3,6 +3,7 @@ name = "pylair-ollama"
 version = "0.0.0"
 description = "Optional Ollama integration for Pylair apps: detect, status, stream completions through the normal bridge"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["httpx>=0.28"]
 
