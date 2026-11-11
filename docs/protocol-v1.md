@@ -56,6 +56,14 @@ hang or OOM the host.
 - A peer that goes silent mid-frame is just slow; no read timeout on
   frames. Startup has its own deadline (§4) and steady-state liveness is
   covered by ping/pong (§5).
+- **Wire JSON encoding** (`_json.py`, docs/codegen.md): beyond plain JSON
+  types the runtime encodes `bytes`/`bytearray` as `{"$b64": "<base64>"}`
+  (decoded symmetrically on input), `@dataclass` as its field dict,
+  `datetime`/`date`/`time` as ISO 8601 strings, `Enum` as its value, and
+  `set` as a list. Incoming params are coerced back by annotation — a
+  dataclass-annotated parameter receives an instance, not a dict.
+  Anything unserializable raises `TypeError` at encode time, surfacing
+  as `INTERNAL` on the calling task.
 
 ## 3. Message shapes
 
@@ -145,10 +153,12 @@ host-side only, never emitted by the runtime).
 
 1. Host spawns the process, state `starting`.
 2. Runtime's **first stdout frame must be `hello`**:
-   `{protocol: 1, runtime_version, python_version, exposes: [{name, kind, signature}]}`
+   `{protocol: 1, runtime_version, python_version, exposes: [{name, kind, signature, doc}]}`
    - `kind`: `"sync" | "async" | "generator" | "isolated"`
-   - `signature`: JSON-schema-ish arg/return shape (full schema export is
-     M2's codegen input; v1 records names + kinds for the allowlist).
+   - `signature`: `{params: [{name, kind, required, schema}], returns: schema}`
+     where `schema` is the annotation map defined in docs/codegen.md (the
+     same schema `tauri-plus codegen` consumes). `doc` is the function's
+     docstring or null — used for generated JSDoc.
 3. `HELLO_TIMEOUT = 15s`. No hello → kill → `crashed` → backoff →
    `restarting`.
 4. `protocol` mismatch → `failed` immediately (no restart — retrying
@@ -250,7 +260,7 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 
 ## 11. What this does not cover (yet)
 
-- Type/schema details of `exposes[].signature` — M2 codegen doc.
+- Type/schema details of `exposes[].signature` — docs/codegen.md.
 - Cancellation *guarantees* per execution mode — `docs/cancellation.md`.
 - Bulk binary transport (temp-file handles) — `docs/ideas.md`; base64
   in JSON is the v1 answer.

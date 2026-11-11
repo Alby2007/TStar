@@ -13,10 +13,11 @@ so a `print()` inside an isolated function can never corrupt the result.
 from __future__ import annotations
 
 import importlib
-import json
 import os
 import sys
 import traceback
+
+from tauri_plus import _json
 
 
 def main() -> int:
@@ -39,8 +40,8 @@ def main() -> int:
         module = importlib.import_module(module_name)
         fn = getattr(module, fn_name)
         raw = sys.stdin.buffer.read()
-        input = json.loads(raw) if raw else {}
-        result = fn(**input)
+        input = _json.loads(raw) if raw else {}
+        result = fn(**_json.coerce_kwargs(fn, input))
         payload = {"result": result}
     except BaseException as e:  # noqa: BLE001 - boundary: report everything
         payload = {
@@ -53,7 +54,7 @@ def main() -> int:
             }
         }
 
-    os.write(out_fd, json.dumps(payload).encode())
+    os.write(out_fd, _json.dumps(payload).encode())
     return 0
 
 

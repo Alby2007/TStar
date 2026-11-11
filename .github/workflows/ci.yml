@@ -24,6 +24,11 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          # cli codegen tests spawn `python -m tauri_plus.codegen`;
+          # tauri_plus needs 3.12+ (PEP 695 syntax)
+          python-version: "3.12"
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm typecheck

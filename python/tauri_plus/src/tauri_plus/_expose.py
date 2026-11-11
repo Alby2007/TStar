@@ -35,19 +35,9 @@ def _kind_of(fn: Callable[..., Any], isolated: bool) -> str:
 
 
 def _signature_of(fn: Callable[..., Any], worker: dict | None) -> dict[str, Any]:
-    # Full JSON-schema export lands with M2 codegen; v1 records enough for
-    # the allowlist + meta passthrough.
-    sig: dict[str, Any] = {
-        "params": [
-            {
-                "name": p.name,
-                "kind": str(p.kind),
-                "has_default": p.default is not inspect.Parameter.empty,
-            }
-            for p in inspect.signature(fn).parameters.values()
-        ],
-        "returns": "generator" if inspect.isasyncgenfunction(fn) else "value",
-    }
+    from tauri_plus._schema import callable_schema
+
+    sig: dict[str, Any] = callable_schema(fn)
     if worker is not None:
         sig["meta"] = {"worker": worker}
     return sig
@@ -108,6 +98,11 @@ def exposed_functions() -> dict[str, ExposedFn]:
 def exposes_manifest() -> list[dict]:
     """The `exposes` list sent in the hello handshake."""
     return [
-        {"name": name, "kind": ex.kind, "signature": ex.signature}
+        {
+            "name": name,
+            "kind": ex.kind,
+            "signature": ex.signature,
+            "doc": inspect.getdoc(ex.fn),
+        }
         for name, ex in sorted(_registry.items())
     ]

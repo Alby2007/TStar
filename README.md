@@ -40,5 +40,6 @@ cargo build             # Rust workspace
 cd python/tauri_plus && uv sync   # Python env (fetches managed CPython)
 ```
 
-Docs: [security](docs/security.md), [cancellation](docs/cancellation.md),
+Docs: [security](docs/security.md), [protocol](docs/protocol-v1.md),
+[cancellation](docs/cancellation.md), [codegen](docs/codegen.md),
 [decisions](docs/decisions/), [ideas](docs/ideas.md).

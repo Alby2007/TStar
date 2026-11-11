@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import sys
@@ -11,6 +10,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from tauri_plus import _json
 from tauri_plus import _protocol as proto
 
 ISOLATED_GRACE_S = 3.0
@@ -73,7 +73,7 @@ class TaskRegistry:
 
     async def _run_async(self, task: Task, fn: Callable[..., Any], input: dict) -> None:
         try:
-            result = await fn(**input)
+            result = await fn(**_json.coerce_kwargs(fn, input))
             self._finish(task, proto.response(task.call_id, result))
         except asyncio.CancelledError:
             self._finish(
@@ -93,7 +93,9 @@ class TaskRegistry:
     async def _run_sync(self, task: Task, fn: Callable[..., Any], input: dict) -> None:
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, lambda: fn(**input))
+            result = await loop.run_in_executor(
+                None, lambda: fn(**_json.coerce_kwargs(fn, input))
+            )
             self._finish(task, proto.response(task.call_id, result))
         except asyncio.CancelledError:
             # Inline sync can't be interrupted — the executor thread keeps
@@ -116,7 +118,7 @@ class TaskRegistry:
     async def _pump_stream(
         self, task: Task, fn: Callable[..., Any], input: dict
     ) -> None:
-        agen: AsyncGenerator = fn(**input)
+        agen: AsyncGenerator = fn(**_json.coerce_kwargs(fn, input))
         try:
             while True:
                 # Pull-based flow control: only advance while we hold credit.
@@ -173,7 +175,7 @@ class TaskRegistry:
                 fn_name,
                 **kwargs,
             )
-            out, _ = await task.worker.communicate(json.dumps(input).encode())
+            out, _ = await task.worker.communicate(_json.dumps(input).encode())
             if task.worker.returncode != 0:
                 tail = out.decode(errors="replace")[-2000:]
                 self._finish(
@@ -186,7 +188,7 @@ class TaskRegistry:
                     ),
                 )
                 return
-            payload = json.loads(out)
+            payload = _json.loads(out)
             if "error" in payload:
                 self._finish(
                     task,

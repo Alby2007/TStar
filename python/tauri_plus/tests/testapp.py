@@ -4,11 +4,26 @@ Exercises every execution mode plus the stdout-hygiene guarantees.
 """
 
 import asyncio
+import enum
 import os
 import sys
 import time
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 
 from tauri_plus import expose
+
+
+@dataclass
+class Point:
+    x: float
+    y: float
+    label: str = ""
+
+
+class Color(str, enum.Enum):
+    RED = "red"
+    BLUE = "blue"
 
 
 @expose
@@ -98,6 +113,28 @@ def orphan_maker(pidfile: str) -> str:
         f.write(str(proc.pid))
     time.sleep(600)
     return "never"
+
+
+@expose
+def move(p: Point, dx: float = 0.0) -> Point:
+    """Translate a point; dataclass in, dataclass out."""
+    return Point(x=p.x + dx, y=p.y, label=p.label)
+
+
+@expose
+def pick(c: Color, fallback: str | None = None) -> str:
+    return c.value if c is not None else (fallback or "none")
+
+
+@expose
+def roundtrip(data: bytes) -> bytes:
+    return data[::-1]
+
+
+@expose
+async def numbers(n: int) -> AsyncGenerator[int, None]:
+    for i in range(n):
+        yield i
 
 
 @expose

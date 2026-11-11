@@ -16,6 +16,7 @@ import threading
 import traceback
 from typing import Any
 
+from tauri_plus import _json
 from tauri_plus import _protocol as proto
 from tauri_plus._expose import exposed_functions, exposes_manifest
 from tauri_plus._tasks import TaskRegistry
@@ -60,7 +61,7 @@ class Server:
                     loop.call_soon_threadsafe(self._in.put_nowait, _EOF)
                     return
                 try:
-                    msg = json.loads(body)
+                    msg = _json.loads(body)
                 except json.JSONDecodeError:
                     msg = {
                         "__parse_error__": True,

@@ -9,10 +9,11 @@ binary mode — CRLF translation would corrupt length prefixes.
 
 from __future__ import annotations
 
-import json
 import os
 import struct
 import sys
+
+from tauri_plus import _json
 
 MAX_FRAME = int(os.environ.get("TAURI_PLUS_MAX_FRAME", str(16 * 1024 * 1024)))
 _LEN = struct.Struct(">I")
@@ -36,7 +37,7 @@ class FrameChannel:
         return self._read_exactly(n)
 
     def write_frame(self, obj: dict) -> None:
-        body = json.dumps(obj, separators=(",", ":")).encode()
+        body = _json.dumps(obj).encode()
         self._w.write(_LEN.pack(len(body)) + body)
 
     def _read_exactly(self, n: int) -> bytes | None:
