@@ -43,6 +43,11 @@ jobs:
           toolchain: "1.92.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          # e2e tests spawn the real runtime; tauri_plus needs 3.12+
+          # (PEP 695 syntax). Matches the bundled-runtime version class.
+          python-version: "3.12"
       - name: Linux Tauri dependencies
         if: runner.os == 'Linux'
         run: |

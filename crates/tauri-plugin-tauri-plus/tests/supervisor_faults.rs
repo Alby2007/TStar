@@ -112,8 +112,10 @@ fn python() -> PathBuf {
     for cand in ["python3", "python"] {
         // Check exit status, not just spawn: on Windows `python3` can be the
         // Microsoft Store alias — it launches but does not run Python.
+        // Require >=3.12: the runtime uses PEP 695 syntax.
         let ok = std::process::Command::new(cand)
-            .arg("--version")
+            .arg("-c")
+            .arg("import sys;sys.exit(0 if sys.version_info>=(3,12) else 1)")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -121,7 +123,7 @@ fn python() -> PathBuf {
             return cand.into();
         }
     }
-    panic!("no python interpreter found for supervisor tests");
+    panic!("no python >=3.12 found for supervisor tests");
 }
 
 fn spec(script: &str) -> SpawnSpec {
