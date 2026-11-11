@@ -62,7 +62,14 @@ def crash() -> None:
     os._exit(3)
 
 
-# ---- exercised by the packaged webview self-test (acceptance job) ----
+# ---- exercised by the packaged self-tests (acceptance job) ----
+# `hello` is the plugin's headless/GUI self-test call; `add`/`count` are
+# driven through the webview by PYLAIR_SELF_TEST_WEBVIEW.
+
+
+@expose
+def hello(name: str = "world") -> str:
+    return f"hello, {name} — from python"
 
 
 @expose
