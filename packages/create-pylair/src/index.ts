@@ -103,11 +103,12 @@ function main(argv: string[]): number {
 
 next:
   cd ${name}
-  pnpm install        # or npm install
+  npm install         # or pnpm install
   uv sync             # python env (https://docs.astral.sh/uv/)
-  pylair dev          # supervised dev: python hot reload + vite
-  pylair build        # native installer with bundled python
-  pylair doctor       # diagnose environment any time
+  npm run pylair dev  # supervised dev: python hot reload + vite
+                      # (pnpm users: pnpm pylair dev / pnpm pylair build)
+  npm run pylair build   # native installer with bundled python
+  npm run pylair doctor  # diagnose environment any time
 `);
   return 0;
 }
