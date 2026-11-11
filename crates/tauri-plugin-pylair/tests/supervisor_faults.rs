@@ -767,3 +767,36 @@ async fn blocked_loop_warns_but_does_not_kill_by_default() {
     let out = h.call("add", json!({"a": 1, "b": 2})).await.unwrap();
     assert_eq!(out, json!(3));
 }
+
+/// P1-8: there is no stdout READY-string to spoof — readiness is the framed
+/// `hello` notification, and stdout hygiene sends user prints to stderr.
+/// A module that prints "READY" (and more) at import must still reach
+/// Ready, with the prints arriving as stderr events.
+#[tokio::test]
+async fn user_prints_neither_corrupt_nor_spoof_readiness() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut noisy = real_runtime_spec();
+    noisy.args[2] = "testapp_noisy".into();
+    let h = spawn_h(noisy, fast_config(), ev);
+    wait_state(&h, State::Ready).await; // framed hello, prints be damned
+    let out = timeout(T, h.call("add", json!({"a": 2, "b": 3})))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(out, json!(5));
+    sleep(Duration::from_millis(300)).await;
+    let mut lines = vec![];
+    while let Ok(e) = rx.try_recv() {
+        if let RuntimeEvent::Stderr(l) = e {
+            lines.push(l);
+        }
+    }
+    assert!(
+        lines.iter().any(|l| l.contains("import-time print")),
+        "print() must reach stderr events, got: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("add called: 2 + 3")),
+        "in-call print() must reach stderr events, got: {lines:?}"
+    );
+}
