@@ -16,9 +16,12 @@ $env:PYTHONNOUSERSITE = "1"
 $out = & $py (Join-Path $Root "backend\app.py") --self-test 2>&1 | Out-String
 Write-Output $out
 
-$normalized = $Root -replace '\\','/'
-if ($out -notmatch [regex]::Escape('"executable": "') -or ($out -notmatch [regex]::Escape($Root) -and $out -notmatch [regex]::Escape($normalized))) {
-    Write-Error "FAIL: executable path is not inside the bundle ($Root)"
+# JSON escapes backslashes, so sys.executable prints like "C:\\...\\python.exe".
+# Normalize both sides to forward slashes before comparing.
+$rootNorm = ($Root -replace '\\\\','/') -replace '\\','/'
+$outNorm  = ($out  -replace '\\\\','/') -replace '\\','/'
+if ($outNorm -notmatch [regex]::Escape('"executable": "' + $rootNorm)) {
+    Write-Error "FAIL: executable path is not inside the bundle ($rootNorm)"
     exit 1
 }
 if ($out -notmatch '"numpy":') {

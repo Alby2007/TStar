@@ -114,6 +114,10 @@ jobs:
       - name: Verify staged payload before bundling
         if: runner.os != 'Windows'
         run: ./scripts/verify-bundled.sh src-tauri/resources
+      - name: Verify staged payload before bundling (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify-bundled.ps1 -Root src-tauri/resources
       - name: Build installers
         run: pnpm tauri build --bundles ${{ matrix.bundles }}
       - name: Upload installer artifacts
@@ -125,13 +129,18 @@ jobs:
       - name: Clean-machine check (bare ubuntu:22.04 container, no Python)
         if: runner.os == 'Linux'
         run: |
-          APPIMAGE=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -1)
-          chmod +x "$APPIMAGE"
-          "$APPIMAGE" --appimage-extract
-          RESROOT=$(dirname "$(dirname "$(find squashfs-root -type f -path '*/python/bin/python3' | head -1)")")
-          echo "bundled resource root: $RESROOT"
+          # Extract the deb payload: no FUSE, no execution, deterministic —
+          # unlike running --appimage-extract on a shared runner.
+          DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
+          echo "installer: $DEB"
+          dpkg -x "$DEB" /tmp/debroot
+          RESROOT=/tmp/debroot/usr/lib/m0-packaging-spike
+          ls "$RESROOT"
+          # Bare ubuntu:22.04 has no Python and none of the app's GUI libs —
+          # if the payload runs here, it runs on a clean machine.
+          for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
           docker run --rm \
-            -v "$PWD/$RESROOT:/bundle:ro" \
+            -v "$RESROOT:/bundle:ro" \
             -v "$PWD/scripts/verify-bundled.sh:/verify.sh:ro" \
             ubuntu:22.04 bash /verify.sh /bundle
       - name: Clean-machine check (installed .app payload)
@@ -150,5 +159,6 @@ jobs:
                 -Recurse -Filter 'python.exe' -Depth 4 -ErrorAction SilentlyContinue |
                 Where-Object { $_.FullName -like '*m0-packaging-spike*' } | Select-Object -First 1
           if (-not $py) { Write-Error 'installed bundled python.exe not found'; exit 1 }
+          Write-Output "bundled interpreter: $($py.FullName)"
           $resroot = Split-Path (Split-Path $py.FullName -Parent) -Parent
           ./scripts/verify-bundled.ps1 -Root $resroot
