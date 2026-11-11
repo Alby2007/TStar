@@ -139,7 +139,9 @@ on a generator while it holds credit for that task.
 ## 4. Handshake and lifecycle
 
 Host-side states (emitted to the UI as events):
-`starting → ready → crashed → restarting → failed`.
+`starting → ready → crashed → restarting → failed`, plus `unresponsive`
+(liveness warning, §5) and `stopped` (clean terminal after `shutdown` —
+host-side only, never emitted by the runtime).
 
 1. Host spawns the process, state `starting`.
 2. Runtime's **first stdout frame must be `hello`**:
@@ -163,7 +165,8 @@ deadlock) never crashes, so it never restarts.
   `PING_TIMEOUT` (default 10s) — the reply is emitted by the event
   loop's frame handler, so it proves the loop is alive.
 - A missed deadline → state `unresponsive` (event emitted). The host
-  keeps pinging.
+  keeps pinging. `unresponsive` is entered **only after a real miss** —
+  an in-flight ping below its deadline does not flap the UI state.
 - `MAX_MISSES` consecutive misses (default 3) → treated as `crashed`:
   killed and the restart policy applies.
 - **Known limit:** a C extension holding the GIL starves the frame loop

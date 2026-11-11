@@ -124,6 +124,7 @@ enum Command {
         fn_name: String,
         input: Value,
         respond: oneshot::Sender<Result<Value, ErrorObj>>,
+        task_out: oneshot::Sender<u64>,
     },
     CallStream {
         fn_name: String,
@@ -139,6 +140,8 @@ enum Command {
         task: u64,
         n: u64,
     },
+    /// Operator-initiated restart out of the Failed state.
+    Retry,
     Shutdown,
 }
 
@@ -146,6 +149,14 @@ enum PendingKind {
     Call(oneshot::Sender<Result<Value, ErrorObj>>),
     Stream(mpsc::Sender<StreamItem>),
     Cancel { respond: oneshot::Sender<bool> },
+}
+
+/// An eagerly-dispatched call: the request is already on its way when this
+/// returns (unlike `call`, an async fn which is lazy until polled). `task`
+/// resolves to the runtime task id — needed for `cancel`.
+pub struct CallTask {
+    pub task: oneshot::Receiver<u64>,
+    pub result: oneshot::Receiver<Result<Value, ErrorObj>>,
 }
 
 /// Handle the app holds; clones freely.
@@ -165,17 +176,29 @@ impl Handle {
         self.state.clone()
     }
 
-    pub async fn call(&self, fn_name: &str, input: Value) -> Result<Value, ErrorObj> {
-        let (tx, rx) = oneshot::channel();
+    /// Dispatch a call immediately (non-async, try_send) and get its task id.
+    pub fn call_task(&self, fn_name: &str, input: Value) -> Result<CallTask, ErrorObj> {
+        let (rtx, rrx) = oneshot::channel();
+        let (ttx, trx) = oneshot::channel();
         self.cmd
-            .send(Command::Call {
+            .try_send(Command::Call {
                 fn_name: fn_name.into(),
                 input,
-                respond: tx,
+                respond: rtx,
+                task_out: ttx,
             })
-            .await
             .map_err(|_| stopped_err())?;
-        rx.await.map_err(|_| stopped_err())?
+        Ok(CallTask {
+            task: trx,
+            result: rrx,
+        })
+    }
+
+    /// Call a function and await its result. For cancellation, prefer
+    /// `call_task` — a pending `call` future carries no task id.
+    pub async fn call(&self, fn_name: &str, input: Value) -> Result<Value, ErrorObj> {
+        let ct = self.call_task(fn_name, input)?;
+        ct.result.await.map_err(|_| stopped_err())?
     }
 
     /// Start a streaming call; yields chunks until `StreamItem::End`.
@@ -197,6 +220,14 @@ impl Handle {
             .map_err(|_| stopped_err())?;
         let task = task_rx.await.map_err(|_| stopped_err())?;
         Ok((task, items_rx))
+    }
+
+    /// Retry after a Failed state — respawns the runtime fresh.
+    pub async fn retry(&self) -> Result<(), ErrorObj> {
+        self.cmd
+            .send(Command::Retry)
+            .await
+            .map_err(|_| stopped_err())
     }
 
     /// Ask the supervisor to cancel `task`. Resolves to the runtime's ack.
@@ -248,6 +279,7 @@ pub fn spawn(
             generation: 0,
             next_id: AtomicU64::new(1),
             next_task: AtomicU64::new(1),
+            ready_since: None,
         }
         .run(),
     );
@@ -266,6 +298,9 @@ struct Supervisor {
     generation: u64,
     next_id: AtomicU64,
     next_task: AtomicU64,
+    /// When the current generation reached Ready — a crash after a sustained
+    /// ready period is a fresh incident, not a boot loop.
+    ready_since: Option<Instant>,
 }
 
 /// Per-child IO plumbing, owned by the per-spawn scope.
@@ -298,8 +333,11 @@ impl std::fmt::Display for ChildReadErr {
 enum ExitCause {
     /// `shutdown` requested and honoured (or stdin-EOF exit) — stop cleanly.
     CleanShutdown,
-    /// Runtime exited or became unusable unexpectedly.
+    /// Runtime exited or became unusable unexpectedly — crash accounting applies.
     Crashed(String),
+    /// Unrecoverable without operator action (e.g. protocol version mismatch)
+    /// — straight to Failed, no restart loop.
+    Fatal(String),
 }
 
 impl Supervisor {
@@ -319,6 +357,7 @@ impl Supervisor {
         let mut crashes: VecDeque<Instant> = VecDeque::new();
         let mut backoff = self.config.backoff_base;
         loop {
+            self.ready_since = None;
             self.set_state(
                 State::Starting,
                 format!("spawning (gen {})", self.generation),
@@ -333,7 +372,27 @@ impl Supervisor {
                     self.set_state(State::Stopped, "shutdown");
                     return;
                 }
+                ExitCause::Fatal(reason) => {
+                    self.set_state(State::Failed, reason);
+                    if !self.park_failed().await {
+                        return;
+                    }
+                    // operator retried: fresh counters, spawn again
+                    crashes.clear();
+                    backoff = self.config.backoff_base;
+                    self.generation += 1;
+                }
                 ExitCause::Crashed(reason) => {
+                    // Surviving Ready for a whole breaker window counts as
+                    // healthy — the crash that follows is a fresh incident,
+                    // not evidence of a boot loop.
+                    if self
+                        .ready_since
+                        .is_some_and(|t| t.elapsed() >= self.config.breaker_window)
+                    {
+                        crashes.clear();
+                        backoff = self.config.backoff_base;
+                    }
                     let now = Instant::now();
                     while crashes
                         .front()
@@ -351,13 +410,43 @@ impl Supervisor {
                                 self.config.breaker_window
                             ),
                         );
-                        return; // circuit open — stays Failed until restart()
+                        if !self.park_failed().await {
+                            return;
+                        }
+                        crashes.clear();
+                        backoff = self.config.backoff_base;
+                        self.generation += 1;
+                        continue;
                     }
                     self.set_state(State::Restarting, reason);
                     sleep(jitter(backoff)).await;
                     backoff = (backoff * 2).min(self.config.backoff_cap);
                     self.generation += 1;
                 }
+            }
+        }
+    }
+
+    /// Failed is a parked state, not an exit — wait for Retry or Shutdown.
+    /// Incoming calls are failed fast so callers never hang.
+    async fn park_failed(&mut self) -> bool {
+        loop {
+            match self.cmd_rx.recv().await {
+                None | Some(Command::Shutdown) => {
+                    self.set_state(State::Stopped, "shutdown");
+                    return false;
+                }
+                Some(Command::Retry) => return true,
+                Some(Command::Call { respond, .. }) => {
+                    let _ = respond.send(Err(stopped_err()));
+                }
+                Some(Command::CallStream { items, .. }) => {
+                    let _ = items.try_send(StreamItem::End(Err(stopped_err())));
+                }
+                Some(Command::Cancel { respond, .. }) => {
+                    let _ = respond.send(false);
+                }
+                Some(Command::GrantCredit { .. }) => {}
             }
         }
     }
@@ -390,7 +479,8 @@ impl Supervisor {
         let version_ok = hello["protocol"].as_u64() == Some(proto::PROTOCOL_VERSION as u64);
         if !version_ok {
             kill_and_reap(&mut io).await;
-            return ExitCause::Crashed(format!(
+            // Not a crash — a deployment bug. Retrying can't fix it.
+            return ExitCause::Fatal(format!(
                 "protocol version mismatch: {:?}",
                 hello["protocol"]
             ));
@@ -398,6 +488,7 @@ impl Supervisor {
         let _ = self
             .events
             .try_send(RuntimeEvent::Exposes(hello["exposes"].clone()));
+        self.ready_since = Some(Instant::now());
         self.set_state(State::Ready, "handshake complete");
 
         // ---- serving ----
@@ -406,6 +497,7 @@ impl Supervisor {
         let mut call_of_task: HashMap<u64, u64> = HashMap::new(); // task -> call_id
         let mut pongs_outstanding: u32 = 0;
         let mut ping_seq: u64 = 0;
+        let mut stalled_calls: Vec<u64> = Vec::new();
         let mut ping_tick = interval(self.config.ping_interval);
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -450,10 +542,22 @@ impl Supervisor {
                                     let task = p["task"].as_u64().unwrap_or(0);
                                     if let Some(&call_id) = call_of_task.get(&task) {
                                         if let Some(PendingKind::Stream(tx)) = pending.get(&call_id) {
-                                            let _ = tx.try_send(StreamItem::Chunk {
+                                            let chunk = StreamItem::Chunk {
                                                 seq: p["seq"].as_u64().unwrap_or(0),
                                                 value: p["value"].clone(),
-                                            });
+                                            };
+                                            if tx.try_send(chunk).is_err() {
+                                                // Consumer channel full: don't silently
+                                                // drop — end the stream with an error.
+                                                let _ = self.events.try_send(RuntimeEvent::Stderr(
+                                                    format!("task {task}: stream consumer stalled")));
+                                                let _ = tx.try_send(StreamItem::End(Err(ErrorObj {
+                                                    code: proto::INTERNAL,
+                                                    message: "stream consumer stalled".into(),
+                                                    data: None,
+                                                })));
+                                                stalled_calls.push(call_id);
+                                            }
                                         }
                                     }
                                 }
@@ -484,12 +588,13 @@ impl Supervisor {
                         return ExitCause::CleanShutdown;
                     };
                     match cmd {
-                        Command::Call { fn_name, input, respond } => {
+                        Command::Call { fn_name, input, respond, task_out } => {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
                                 serde_json::json!({"fn": fn_name, "task": task, "input": input}));
                             if send_frame(&io, &body) {
+                                let _ = task_out.send(task);
                                 pending.insert(id, PendingKind::Call(respond));
                                 task_of_call.insert(id, task);
                                 call_of_task.insert(task, id);
@@ -531,12 +636,17 @@ impl Supervisor {
                                 serde_json::json!({"task": task, "n": n}));
                             send_frame(&io, &body);
                         }
+                        Command::Retry => {
+                            // Only meaningful from Failed — already serving.
+                        }
                         Command::Shutdown => {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
                             send_frame(&io, &body);
                             let _ = timeout(self.config.shutdown_grace, &mut io.exited).await;
-                            kill_and_reap(&mut io).await;
+                            // io.exited may already be consumed by the grace
+                            // wait — fire the kill signal without re-polling it.
+                            let _ = io.kill.try_send(());
                             fail_all(&mut pending, proto::RUNTIME_UNAVAILABLE, "shutdown").await;
                             return ExitCause::CleanShutdown;
                         }
@@ -544,8 +654,6 @@ impl Supervisor {
                 }
                 // --- liveness ping ---
                 _ = ping_tick.tick() => {
-                    ping_seq += 1;
-                    pongs_outstanding += 1;
                     if pongs_outstanding >= self.config.missed_pongs_to_kill {
                         self.set_state(State::Unresponsive,
                             format!("{} missed pongs — runtime wedged", pongs_outstanding));
@@ -555,8 +663,13 @@ impl Supervisor {
                         return ExitCause::Crashed(format!(
                             "wedged: {} missed pongs", pongs_outstanding));
                     }
-                    self.set_state(State::Unresponsive,
-                        format!("missed {} pong(s)", pongs_outstanding));
+                    if pongs_outstanding > 0 {
+                        // A ping went a full interval unanswered — a real miss.
+                        self.set_state(State::Unresponsive,
+                            format!("missed {} pong(s)", pongs_outstanding));
+                    }
+                    pongs_outstanding += 1;
+                    ping_seq += 1;
                     let body = proto::request(self.next_id.fetch_add(1, Ordering::Relaxed),
                         "ping", serde_json::json!({"seq": ping_seq}));
                     send_frame(&io, &body);
@@ -570,6 +683,12 @@ impl Supervisor {
                     };
                     fail_all(&mut pending, proto::RUNTIME_CRASHED, &detail).await;
                     return ExitCause::Crashed(detail);
+                }
+            }
+            for id in stalled_calls.drain(..) {
+                pending.remove(&id);
+                if let Some(t) = task_of_call.remove(&id) {
+                    call_of_task.remove(&t);
                 }
             }
         }
@@ -604,8 +723,11 @@ async fn fail_all(pending: &mut HashMap<u64, PendingKind>, code: i64, msg: &str)
     }
 }
 
+/// Signal the kill, then wait for the monitor to reap — the next spawn must
+/// not overlap a still-alive previous generation.
 async fn kill_and_reap(io: &mut ChildIo) {
     let _ = io.kill.try_send(());
+    let _ = timeout(Duration::from_secs(5), &mut io.exited).await;
 }
 
 fn jitter(d: Duration) -> Duration {

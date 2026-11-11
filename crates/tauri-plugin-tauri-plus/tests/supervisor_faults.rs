@@ -77,6 +77,34 @@ while True:
 /// Exits immediately — exercises restart + breaker.
 const FAKE_EXIT_NOW: &str = "import sys; sys.exit(1)";
 
+/// hello with the wrong protocol version — deployment bug, not a crash.
+const FAKE_BAD_VERSION: &str = r#"
+import sys, struct, json
+b = json.dumps({"jsonrpc":"2.0","method":"hello","params":{"protocol":99,"exposes":[]}}).encode()
+sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
+import time; time.sleep(600)
+"#;
+
+/// The REAL runtime: `python -m tauri_plus testapp` with the package and the
+/// test app found via PYTHONPATH + cwd — no install step needed.
+fn real_runtime_spec() -> SpawnSpec {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    SpawnSpec {
+        program: python(),
+        args: vec!["-m".into(), "tauri_plus".into(), "testapp".into()],
+        env: vec![(
+            "PYTHONPATH".into(),
+            root.join("python/tauri_plus/src")
+                .to_string_lossy()
+                .into_owned(),
+        )],
+        cwd: Some(root.join("python/tauri_plus/tests")),
+    }
+}
+
 fn python() -> PathBuf {
     if let Ok(p) = std::env::var("TAURI_PLUS_TEST_PYTHON") {
         return p.into();
@@ -221,6 +249,158 @@ async fn crash_loop_breaker_trips() {
     // calls fail fast with RUNTIME_UNAVAILABLE
     let err = h.call("x", Value::Null).await.unwrap_err();
     assert_eq!(err.code, proto::RUNTIME_UNAVAILABLE);
+}
+
+// ---- end-to-end: real Rust supervisor <-> real Python runtime ----
+// M1 exit criterion: the two sides are tested against each other, not only
+// against scripted fakes — protocol drift cannot hide here.
+
+#[tokio::test]
+async fn e2e_real_runtime_full_flow() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn(real_runtime_spec(), fast_config(), ev);
+
+    wait_state(&h, State::Ready).await;
+    eprintln!("e2e: ready");
+
+    // exposes manifest from the real testapp
+    let mut exposes = Value::Null;
+    while let Ok(e) = rx.try_recv() {
+        if let RuntimeEvent::Exposes(x) = e {
+            exposes = x;
+        }
+    }
+    let names: Vec<&str> = exposes
+        .as_array()
+        .expect("exposes is an array")
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    for f in ["add", "counter", "sleep_forever", "isolated_add"] {
+        assert!(names.contains(&f), "missing expose {f} in {names:?}");
+    }
+    eprintln!("e2e: exposes ok {names:?}");
+
+    // plain call
+    let out = timeout(T, h.call("add", json!({"a": 20, "b": 22})))
+        .await
+        .expect("call timed out")
+        .unwrap();
+    assert_eq!(out, json!(42));
+    eprintln!("e2e: call ok");
+
+    // streaming call: chunks then terminal
+    let (_task, mut items) = timeout(T, h.call_stream("counter", json!({"n": 3})))
+        .await
+        .expect("call_stream timed out")
+        .unwrap();
+    let mut seen = Vec::new();
+    while let Ok(Some(item)) = timeout(T, items.recv()).await {
+        match item {
+            tauri_plugin_tauri_plus::supervisor::StreamItem::Chunk { value, .. } => {
+                seen.push(value.as_i64().unwrap())
+            }
+            tauri_plugin_tauri_plus::supervisor::StreamItem::End(res) => {
+                assert!(res.is_ok());
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, vec![0, 1, 2]);
+    eprintln!("e2e: stream ok");
+
+    // cancel a never-ending async task — eager dispatch via call_task so the
+    // task id is known before we cancel it.
+    let ct = h.call_task("sleep_forever", json!({})).unwrap();
+    let task = timeout(T, ct.task)
+        .await
+        .expect("task id timed out")
+        .unwrap();
+    let cancelled = timeout(T, h.cancel(task))
+        .await
+        .expect("cancel timed out")
+        .unwrap();
+    assert!(cancelled);
+    let err = timeout(T, ct.result)
+        .await
+        .expect("result timed out")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, proto::TASK_CANCELLED);
+    eprintln!("e2e: cancel ok");
+
+    // stderr from the real runtime is drained (fd-1 hygiene lands there)
+    h.shutdown().await;
+    wait_state(&h, State::Stopped).await;
+    eprintln!("e2e: stopped");
+}
+
+#[tokio::test]
+async fn version_mismatch_goes_straight_to_failed() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn(spec(FAKE_BAD_VERSION), fast_config(), ev);
+    wait_state(&h, State::Failed).await;
+    // Fatal is not a crash: zero Restarting transitions must have occurred.
+    let mut restarts = 0;
+    while let Ok(e) = rx.try_recv() {
+        if let RuntimeEvent::StateChanged {
+            to: State::Restarting,
+            ..
+        } = e
+        {
+            restarts += 1;
+        }
+    }
+    assert_eq!(
+        restarts, 0,
+        "version mismatch must not enter the restart loop"
+    );
+}
+
+#[tokio::test]
+async fn retry_respawns_after_failed() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn(spec(FAKE_EXIT_NOW), fast_config(), ev);
+    wait_state(&h, State::Failed).await;
+    h.retry().await.unwrap();
+    // Retry must leave Failed: expect a Starting transition next.
+    let saw_starting = timeout(T, async {
+        while let Ok(Some(e)) = timeout(T, rx.recv()).await {
+            if let RuntimeEvent::StateChanged {
+                to: State::Starting,
+                ..
+            } = e
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw_starting, "retry never respawned the runtime");
+    // (the fake still fails -> back to Failed, which is fine)
+    wait_state(&h, State::Failed).await;
+}
+
+#[tokio::test]
+async fn healthy_runtime_never_flaps_unresponsive() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn(spec(FAKE_READY), fast_config(), ev);
+    wait_state(&h, State::Ready).await;
+    // sit through several ping intervals with a pinging runtime
+    sleep(Duration::from_millis(600)).await;
+    let mut flapped = false;
+    while let Ok(e) = rx.try_recv() {
+        if let RuntimeEvent::StateChanged {
+            to: State::Unresponsive,
+            ..
+        } = e
+        {
+            flapped = true;
+        }
+    }
+    assert!(!flapped, "healthy runtime flapped to Unresponsive");
 }
 
 #[tokio::test]

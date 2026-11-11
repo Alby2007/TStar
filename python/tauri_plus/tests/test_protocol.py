@@ -5,6 +5,7 @@ Frames are asserted at the wire level — including the stdout-hygiene and
 credit-flow guarantees.
 """
 
+import os
 import queue
 import struct
 import subprocess
@@ -155,6 +156,19 @@ def test_cancel_stream(runtime):
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
 
 
+def test_isolated_call(runtime):
+    runtime.recv()
+    runtime.send(call(1, "isolated_add", task=1, input={"a": 4, "b": 5}))
+    assert runtime.recv()["result"] == 9
+
+
+def test_isolated_print_does_not_corrupt_result(runtime):
+    runtime.recv()
+    runtime.send(call(1, "isolated_print", task=1, input={"text": "hi"}))
+    resp = runtime.recv()
+    assert resp["result"] == "hi", resp
+
+
 def test_isolated_call_and_cancel_kills_worker(runtime):
     runtime.recv()
     runtime.send(call(1, "isolated_sleep", task=1, input={"seconds": 60}))
@@ -167,6 +181,36 @@ def test_isolated_call_and_cancel_kills_worker(runtime):
     assert ack["result"]["cancelled"] is True
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
     assert elapsed < 10, "worker should be terminated promptly, not at 60s"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="process-group kill semantics are unix-specific"
+)
+def test_cancel_isolated_kills_sigterm_immune_grandchild(runtime, tmp_path):
+    """A grandchild ignoring SIGTERM must still die: group SIGKILL."""
+    runtime.recv()
+    pidfile = tmp_path / "grandchild.pid"
+    runtime.send(call(1, "orphan_maker", task=1, input={"pidfile": str(pidfile)}))
+    deadline = time.time() + 15
+    while not pidfile.exists():
+        assert time.time() < deadline, "grandchild never spawned"
+        time.sleep(0.1)
+    gpid = int(pidfile.read_text().strip())
+    os.kill(gpid, 0)  # alive
+
+    runtime.send(proto.request(2, "cancel", {"task": 1}))
+    terminal = runtime.recv_until(lambda m: m.get("id") == 1)
+    assert terminal["error"]["code"] == proto.TASK_CANCELLED
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(f"grandchild {gpid} survived the group kill")
 
 
 # ---- lifecycle --------------------------------------------------------------

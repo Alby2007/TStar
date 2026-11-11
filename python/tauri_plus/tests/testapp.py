@@ -5,6 +5,7 @@ Exercises every execution mode plus the stdout-hygiene guarantees.
 
 import asyncio
 import os
+import sys
 import time
 
 from tauri_plus import expose
@@ -64,6 +65,39 @@ def isolated_sleep(seconds: float) -> str:
 @expose(isolated=True)
 def isolated_add(a: int, b: int) -> int:
     return a + b
+
+
+@expose(isolated=True)
+def isolated_print(text: str) -> str:
+    # stdout hygiene inside the worker: print() must not corrupt the result.
+    print(f"worker print: {text}")
+    return text
+
+
+@expose(isolated=True)
+def orphan_maker(pidfile: str) -> str:
+    """Spawn a grandchild that IGNORES SIGTERM, then sleep.
+
+    Cancelling must kill the whole process group — the grandchild surviving
+    is the leaked-orphan failure mode.
+    """
+    import subprocess
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "time.sleep(600)\n"
+            ),
+        ]
+    )
+    with open(pidfile, "w") as f:
+        f.write(str(proc.pid))
+    time.sleep(600)
+    return "never"
 
 
 @expose

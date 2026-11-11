@@ -155,26 +155,24 @@ class TaskRegistry:
             await task.credit_event.wait()
 
     async def _run_isolated(self, task: Task, fn_name: str, input: dict) -> None:
-        module = os.environ["TAURI_PLUS_APP_MODULE"]
-        env = {**os.environ}
-        kwargs: dict[str, Any] = {
-            "stdin": asyncio.subprocess.PIPE,
-            "stdout": asyncio.subprocess.PIPE,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = 0  # taskkill /T handles the tree
-        else:
-            kwargs["start_new_session"] = True  # own process group -> killpg
-        task.worker = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "tauri_plus._worker",
-            module,
-            fn_name,
-            env=env,
-            **kwargs,
-        )
         try:
+            module = os.environ["TAURI_PLUS_APP_MODULE"]
+            kwargs: dict[str, Any] = {
+                "stdin": asyncio.subprocess.PIPE,
+                "stdout": asyncio.subprocess.PIPE,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0  # taskkill /T handles the tree
+            else:
+                kwargs["start_new_session"] = True  # own process group -> killpg
+            task.worker = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "tauri_plus._worker",
+                module,
+                fn_name,
+                **kwargs,
+            )
             out, _ = await task.worker.communicate(json.dumps(input).encode())
             if task.worker.returncode != 0:
                 tail = out.decode(errors="replace")[-2000:]
@@ -209,25 +207,48 @@ class TaskRegistry:
                     task.call_id, proto.TASK_CANCELLED, "task cancelled"
                 ),
             )
+        except BaseException as e:  # noqa: BLE001 - any failure gets a terminal
+            self._finish(
+                task,
+                proto.error_response(
+                    task.call_id,
+                    proto.INTERNAL,
+                    f"isolated call failed: {type(e).__name__}: {e}",
+                    {"type": type(e).__name__},
+                ),
+            )
 
     async def _kill_worker(self, task: Task) -> None:
         proc = task.worker
         if proc is None or proc.returncode is not None:
             return
-        try:
-            if sys.platform == "win32":
-                await asyncio.create_subprocess_exec(
-                    "taskkill", "/PID", str(proc.pid), "/T", "/F"
-                )
-            else:
-                os.killpg(proc.pid, signal.SIGTERM)
-            await asyncio.wait_for(proc.wait(), timeout=ISOLATED_GRACE_S)
-        except (TimeoutError, ProcessLookupError):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        if sys.platform == "win32":
+            # taskkill /T kills the whole tree — already covers grandchildren.
+            await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(proc.pid), "/T", "/F"
+            )
             await proc.wait()
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=ISOLATED_GRACE_S)
+        except TimeoutError:
+            pass
+        # No leaked grandchildren: SIGKILL the whole process group whether or
+        # not the leader already exited on SIGTERM — a grandchild ignoring
+        # SIGTERM must not survive.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
 
     # ---- cancel / credit / finish -----------------------------------------
 

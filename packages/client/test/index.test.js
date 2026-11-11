@@ -136,7 +136,17 @@ test("state() and onState() expose lifecycle", async () => {
 });
 
 test("python namespace exposes the API surface", () => {
-  for (const k of ["call", "stream", "cancel", "state", "shutdown", "onState", "onStderr", "onExposes"]) {
+  for (const k of [
+    "call",
+    "stream",
+    "cancel",
+    "retry",
+    "state",
+    "shutdown",
+    "onState",
+    "onStderr",
+    "onExposes",
+  ]) {
     assert.equal(typeof python[k], "function", `python.${k}`);
   }
 });

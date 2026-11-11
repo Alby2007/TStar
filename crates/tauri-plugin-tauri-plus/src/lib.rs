@@ -84,6 +84,7 @@ impl Builder {
                 python_call_stream,
                 python_grant_credit,
                 python_cancel,
+                python_retry,
                 python_state,
                 python_shutdown,
             ])
@@ -152,6 +153,12 @@ async fn python_grant_credit(
 #[tauri::command]
 async fn python_cancel(rt: tauri::State<'_, PyRuntime>, task: u64) -> Result<bool, ErrorObj> {
     rt.0.cancel(task).await
+}
+
+/// Operator-initiated recovery: respawn the runtime out of the Failed state.
+#[tauri::command]
+async fn python_retry(rt: tauri::State<'_, PyRuntime>) -> Result<(), ErrorObj> {
+    rt.0.retry().await
 }
 
 #[tauri::command]
