@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { importRoot, loadConfig } from "./config.js";
+import { importRoot, loadConfig, tauriCliEntry } from "./config.js";
 import { emit } from "./codegen.js";
 import { loadManifest } from "./manifest.js";
 
@@ -105,11 +105,12 @@ export async function dev(opts: { appDir: string }): Promise<number> {
   }
 
   console.log("pylair: watching python source; starting tauri dev");
-  const child = spawn("npx", ["tauri", "dev"], {
+  // Run the app's installed tauri CLI via node — no npx/npx.cmd shell
+  // shim (which also trips Node's DEP0190 shell+args warning on Windows).
+  const child = spawn(process.execPath, [tauriCliEntry(appDir), "dev"], {
     cwd: appDir,
     stdio: "inherit",
     env,
-    shell: isWin,
   });
   return new Promise((resolve) => {
     child.on("exit", (code) => resolve(code ?? 1));
