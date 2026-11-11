@@ -29,6 +29,9 @@ test("scaffolds a complete app skeleton", () => {
     "src-tauri/icons/icon.icns",
     "src/App.tsx",
     "index.html",
+    // npm strips .gitignore from tarballs — the template ships it as
+    // _gitignore and the scaffolder renames it. Pin the rename.
+    ".gitignore",
   ]) {
     assert.ok(existsSync(join(app, f)), `missing ${f}`);
   }

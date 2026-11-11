@@ -62,7 +62,10 @@ function copyTree(src: string, dst: string, subs: Record<string, string>) {
   for (const e of readdirSync(src, { withFileTypes: true })) {
     const s = join(src, e.name);
     const isTmpl = e.name.endsWith(".tmpl");
-    const d = join(dst, isTmpl ? e.name.slice(0, -5) : e.name);
+    // npm strips .gitignore from published tarballs — ship it as
+    // _gitignore (create-vite convention) and rename on scaffold.
+    const name = e.name === "_gitignore" ? ".gitignore" : e.name;
+    const d = join(dst, isTmpl ? name.slice(0, -5) : name);
     if (e.isDirectory()) {
       copyTree(s, d, subs);
     } else if (isTmpl || !BINARY.has(e.name.slice(e.name.lastIndexOf(".")))) {
