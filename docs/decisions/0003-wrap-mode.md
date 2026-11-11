@@ -1,0 +1,102 @@
+# 0003: Wrap mode — go/no-go after the W0 spike
+
+Decided 2026-11-11. Spike: `spikes/w0-wrap` (launcher + matrix in its
+README; manual checklist in CHECKLIST.md).
+
+## Question
+
+Can Pylair support **wrap mode** — displaying an existing Python web UI
+(FastAPI, Gradio, Streamlit) in a stock Tauri webview, served on
+127.0.0.1 by a supervised launcher — without forking the framework or
+the webview?
+
+## Evidence (macOS, all three frameworks)
+
+Everything below was observed live on macOS; the full matrix is in
+`spikes/w0-wrap/README.md`.
+
+**Works with no product code:**
+
+- Page load + streaming transports: FastAPI SSE, Gradio queue/websocket,
+  Streamlit `_stcore` websocket — all held and interactive.
+- Native file-picker uploads through the webview on all three.
+- Clipboard copy/paste.
+- Launch→ready ≈ 1–3 s per app.
+- kill -9 on the server → launcher respawns on a new port → READY →
+  webview re-navigates. Verified on all three frameworks.
+- App quit reaps the whole server tree (0 survivors) on all three.
+- **IPC isolation is a hard pass.** From the remote page `__TAURI__` is
+  undefined; `__TAURI_INTERNALS__.invoke` exists but every call —
+  `plugin:event|emit`, `plugin:pylair|python_call`,
+  `plugin:pylair|python_shutdown`, and a bogus baseline — is rejected.
+  Capabilities only ever scope to `URL: local`; remote origins get zero
+  usable IPC.
+
+**Known-fixable gaps (all wry handler registrations, not platform
+limits):**
+
+- `target="_blank"` / `link_button` external links are silently
+  swallowed — no `new_window_req_handler` is registered.
+- Downloads land in `~/Downloads` silently with no dialog; FastAPI/Gradio
+  additionally *navigate* to display the content, stranding the user
+  (no Back, no wired Cmd+R). Streamlit's `download_button` gives zero
+  feedback at all.
+- Any full-page navigation to an error/JSON response strands the user —
+  no navigation recovery exists in a bare webview.
+- Gradio had one transient health-probe miss during first paint — the
+  launcher's `GET /` probe is too heavy during hydration.
+
+**Framework behavior worth documenting:**
+
+- Streamlit kill -9 recovery: the page simply reloads with **no error
+  or reconnect UI** — and the session is gone. Filled inputs come back
+  empty; Streamlit sessions are in-memory. After a restart users see a
+  page reload that silently forgets their work. This is inherent to
+  Streamlit, not a defect we can fix.
+
+## Decision
+
+**Go.** Wrap mode ships as a supported configuration.
+
+Every "does it work at all" question came back yes on macOS, the
+security boundary (remote content cannot reach plugin IPC) held
+without any special-casing, and startup is 1–3 s. The gaps are all in
+wry handler registrations we must add in W1 — none are platform or
+framework limits.
+
+## UX decisions for W1
+
+1. **Downloads:** register `download_requested` and show a native
+   **Save As dialog by default**, with a config option to save straight
+   to `~/Downloads`. A silent save with no feedback is the worst option
+   (Streamlit demonstrates it). After saving, reveal the file or show a
+   notification.
+2. **External links:** register `new_window_req_handler` → open in the
+   **system browser**. Register `navigation_handler` to **lock in-place
+   navigation to the app origin** (exact loopback origin match — see
+   P1-8's structured READY message and origin validation).
+3. **Navigation recovery:** add **Back, Reload and Home** to the window
+   menu with keyboard shortcuts, so a full-page navigation can never
+   strand the user on a dead page.
+
+## W1 implementation notes carried forward
+
+- Health probe: do **not** treat a slow `GET /` during hydration as
+  unhealthy. Use TCP liveness or a framework-specific cheap path
+  (Streamlit: `/_stcore/health`), apply a grace period after startup,
+  and only kill on several consecutive failures.
+- Readiness/navigation: replace stderr-scraped readiness with a
+  structured `READY` message carrying the URL; validate the exact
+  loopback origin before navigating (P1-8).
+- The IPC probe becomes a permanent check in the acceptance job so a
+  future capability change that opens remote IPC fails CI.
+
+## Gates
+
+Done-gates for *declaring wrap mode done* (not for starting W1):
+
+- Windows and Linux interactive rows in the matrix (VM or CI-driven).
+- Health-probe tuning above, verified against a slow-hydrating app.
+
+Not gates: mic/camera prompts (no fixture exposes them yet — test when
+a real app needs it) and the session-loss caveat (documented, inherent).

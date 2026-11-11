@@ -2215,6 +2215,108 @@
           "type": "string",
           "const": "core:window:deny-unminimize",
           "markdownDescription": "Denies the unminimize command without any pre-configured scope."
+        },
+        {
+          "description": "Call exposed Python functions, stream results, cancel tasks, read runtime state.\n#### This default permission set includes:\n\n- `allow-python-call`\n- `allow-python-call-stream`\n- `allow-python-grant-credit`\n- `allow-python-cancel`\n- `allow-python-state`",
+          "type": "string",
+          "const": "pylair:default",
+          "markdownDescription": "Call exposed Python functions, stream results, cancel tasks, read runtime state.\n#### This default permission set includes:\n\n- `allow-python-call`\n- `allow-python-call-stream`\n- `allow-python-grant-credit`\n- `allow-python-cancel`\n- `allow-python-state`"
+        },
+        {
+          "description": "Enables the python_call command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-call",
+          "markdownDescription": "Enables the python_call command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_call_stream command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-call-stream",
+          "markdownDescription": "Enables the python_call_stream command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-cancel",
+          "markdownDescription": "Enables the python_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_grant_credit command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-grant-credit",
+          "markdownDescription": "Enables the python_grant_credit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_retry command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-retry",
+          "markdownDescription": "Enables the python_retry command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_selftest_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-selftest-report",
+          "markdownDescription": "Enables the python_selftest_report command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_shutdown command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-shutdown",
+          "markdownDescription": "Enables the python_shutdown command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the python_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:allow-python-state",
+          "markdownDescription": "Enables the python_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_call command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-call",
+          "markdownDescription": "Denies the python_call command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_call_stream command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-call-stream",
+          "markdownDescription": "Denies the python_call_stream command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-cancel",
+          "markdownDescription": "Denies the python_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_grant_credit command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-grant-credit",
+          "markdownDescription": "Denies the python_grant_credit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_retry command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-retry",
+          "markdownDescription": "Denies the python_retry command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_selftest_report command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-selftest-report",
+          "markdownDescription": "Denies the python_selftest_report command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_shutdown command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-shutdown",
+          "markdownDescription": "Denies the python_shutdown command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the python_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "pylair:deny-python-state",
+          "markdownDescription": "Denies the python_state command without any pre-configured scope."
         }
       ]
     },

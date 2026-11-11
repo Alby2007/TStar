@@ -99,7 +99,7 @@ loopback URL. Findings that matter beyond the spike:
 | clipboard copy/paste | pass | | | pass | | | pass | | |
 | external link → system browser | fail³ | | | fail³ | | | fail³ | | |
 | window close kills server tree | pass (0 survivors) | | | pass | | | pass (0 survivors) | | |
-| kill -9 → restarting page → recover | pass (re-nav, 3x) | | | pass (re-nav) | | | — | | |
+| kill -9 → restarting page → recover | pass (re-nav, 3x) | | | pass (re-nav) | | | pass⁴ | | |
 | IPC from remote page | pass (all REJECTED) | | | (same origin policy) | | | (same) | | |
 | launch→ready time | ~1-3s | | | ~2s | | | ~2s | | |
 | installer size / memory | | | | | | | | | |
@@ -114,6 +114,11 @@ loopback URL. Findings that matter beyond the spike:
   wry drops new-window requests without a registered
   new_window_req_handler. W1: handler → shell.open in system browser,
   plus navigation_handler blocking off-origin in-place nav.
+⁴ streamlit kill -9: server killed → launcher respawned on a new port →
+  the page simply reloaded, no error/reconnect UI shown. State is LOST:
+  the filled name input came back empty — Streamlit sessions are
+  in-memory, so every restart is a fresh session. Users see a page
+  reload that silently forgets their work.
 Also noted: a full-page navigation to an error/JSON response strands
 the user — no back button, Cmd+R not wired.
 
