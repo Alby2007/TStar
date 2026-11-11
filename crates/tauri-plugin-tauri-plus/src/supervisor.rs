@@ -914,7 +914,9 @@ async fn monitor_child(
 }
 
 /// Kill the child process tree: killpg on unix (own process group, protocol
-/// §10), Job Object on Windows, falling back to plain child kill.
+/// §10); other targets fall back to plain child kill. On Windows the Job
+/// Object reaps the tree when its handle closes (see monitor_child).
+#[cfg(not(windows))]
 async fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
