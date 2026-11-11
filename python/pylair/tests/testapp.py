@@ -182,3 +182,11 @@ async def wedge_the_loop() -> None:
     # Starves the event loop in native code — the fault-injection case for
     # ping/pong liveness. Never returns on its own.
     time.sleep(3600)  # noqa: ASYNC251 - intentional event-loop starvation
+
+
+@expose
+async def block_loop(seconds: float) -> str:
+    # Same starvation as wedge_the_loop but bounded and it returns: the
+    # diagnostic-vs-kill case (a bounded stall must not be killed).
+    time.sleep(seconds)  # noqa: ASYNC251 - intentional event-loop starvation
+    return "unblocked"

@@ -201,9 +201,13 @@ deadlock) never crashes, so it never restarts.
 - **Transport health is not serving health.** The `pong` also carries
   `loop_stale_ms`: how long the runtime's asyncio loop has made no
   progress (measured by a heartbeat task on the loop, read by the reader
-  thread). A short stall is normal; once it reaches the host's
-  `loop_stall_kill` (default 60s) the loop can no longer serve calls or
-  cancels, so the runtime is treated as wedged: in-flight calls fail with
+  thread). A stalled loop cannot serve calls or cancels, but a stall is
+  not proof of a wedge — legitimate blocking work (loading a multi-GB
+  model inside an `async def`) can stall it for minutes. The host
+  therefore reports stalls past ~1s as a diagnostic (`Unresponsive`
+  state + a stderr note) and keeps serving once the loop frees. Only a
+  configured `loop_stall_kill` (**off by default**) treats a stall at or
+  beyond that duration as wedged: in-flight calls fail with
   `RUNTIME_WEDGED` and the runtime is killed and restarted. The field is
   additive — hosts that ignore it keep the older behaviour.
 - `seq` matching guards staleness.

@@ -161,7 +161,7 @@ fn fast_config() -> SupervisorConfig {
         shutdown_grace: Duration::from_secs(2),
         initial_stream_credit: 8,
         stream_buffer: 256,
-        loop_stall_kill: Duration::from_secs(3600),
+        loop_stall_kill: None,
         cancel_timeout: Duration::from_secs(5),
         max_frame: proto::max_frame(),
         restart_trigger: None,
@@ -684,7 +684,7 @@ async fn blocked_event_loop_is_killed_and_the_call_fails_wedged() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
     let mut cfg = fast_config();
     cfg.ping_interval = Duration::from_millis(100);
-    cfg.loop_stall_kill = Duration::from_millis(1500);
+    cfg.loop_stall_kill = Some(Duration::from_millis(1500));
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
@@ -703,7 +703,7 @@ async fn cancel_ack_is_bounded() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
     let mut cfg = fast_config();
     cfg.cancel_timeout = Duration::from_millis(600);
-    // loop_stall_kill stays huge: only the cancel deadline can save us.
+    // loop_stall_kill stays off (the default): only the cancel deadline can save us.
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
@@ -717,4 +717,49 @@ async fn cancel_ack_is_bounded() {
     let err = r.expect_err("a blocked loop cannot have acknowledged the cancel");
     assert_eq!(err.code, proto::RUNTIME_WEDGED, "{err:?}");
     assert!(t0.elapsed() < Duration::from_secs(3));
+}
+
+/// Default behaviour (loop_stall_kill = None): a stalled loop is reported,
+/// not killed. A multi-GB model load can legitimately block asyncio for
+/// minutes — the runtime must NOT restart and queued calls must still
+/// complete once the loop frees.
+#[tokio::test]
+async fn blocked_loop_warns_but_does_not_kill_by_default() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.ping_interval = Duration::from_millis(100);
+    // loop_stall_kill stays None — the shipped default.
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    // Block the loop ~1.5s: several ping intervals carry stale pongs. The
+    // call resolves once the loop frees — no kill, no restart.
+    let out = timeout(T, h.call("block_loop", json!({"seconds": 1.5})))
+        .await
+        .expect("call never returned — the runtime may have been killed")
+        .unwrap();
+    assert_eq!(out, json!("unblocked"));
+
+    wait_state(&h, State::Ready).await;
+    let mut saw_stall_diag = false;
+    let mut saw_restart = false;
+    while let Ok(e) = rx.try_recv() {
+        match e {
+            RuntimeEvent::StateChanged {
+                to: State::Unresponsive,
+                detail,
+                ..
+            } if detail.contains("event loop blocked") => saw_stall_diag = true,
+            RuntimeEvent::StateChanged {
+                to: State::Restarting | State::Starting | State::Failed,
+                ..
+            } => saw_restart = true,
+            _ => {}
+        }
+    }
+    assert!(saw_stall_diag, "no loop-stall diagnostic was emitted");
+    assert!(!saw_restart, "runtime restarted on a blocked loop");
+    // Same generation still serves calls.
+    let out = h.call("add", json!({"a": 1, "b": 2})).await.unwrap();
+    assert_eq!(out, json!(3));
 }

@@ -55,7 +55,36 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
         ]
         .map(String::from),
     );
+    scrub_appdir(&mut spec, |k| std::env::var(k).ok());
     spec
+}
+
+/// An AppImage's AppRun exports `APPDIR` and prepends its own dirs to
+/// `LD_LIBRARY_PATH` and `PATH`. A bundled Python inheriting those can load
+/// the AppImage's `libstdc++`/`libssl` instead of the system's and break
+/// native wheels (numpy, torch): drop every path entry under `APPDIR`.
+/// Removing the var entirely is the fallback when nothing else remains.
+fn scrub_appdir(spec: &mut SpawnSpec, env: impl Fn(&str) -> Option<String>) {
+    let Some(appdir) = env("APPDIR") else { return };
+    let appdir = appdir.trim_end_matches('/');
+    if appdir.is_empty() {
+        return;
+    }
+    for name in ["LD_LIBRARY_PATH", "PATH"] {
+        let Some(value) = env(name) else { continue };
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|e| {
+                let e = e.trim_end_matches('/');
+                !(e == appdir || e.strip_prefix(appdir).is_some_and(|r| r.starts_with('/')))
+            })
+            .collect();
+        if kept.is_empty() {
+            spec.env_remove.push(name.into());
+        } else {
+            spec.env.push((name.into(), kept.join(":")));
+        }
+    }
 }
 
 /// Dev-or-release spec: `pylair dev` exports PYLAIR_APP_MODULE / PYLAIR_PYTHON
@@ -414,4 +443,82 @@ fn python_state(rt: tauri::State<'_, PyRuntime>) -> &'static str {
 async fn python_shutdown(rt: tauri::State<'_, PyRuntime>) -> Result<(), ErrorObj> {
     rt.0.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| m.get(k).cloned()
+    }
+
+    fn env_get(spec: &SpawnSpec, k: &str) -> Option<String> {
+        spec.env
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn appdir_entries_are_scrubbed_from_child_paths() {
+        let mut spec = SpawnSpec::default();
+        scrub_appdir(
+            &mut spec,
+            fake_env(&[
+                ("APPDIR", "/tmp/.mount_App123"),
+                (
+                    "LD_LIBRARY_PATH",
+                    "/tmp/.mount_App123/usr/lib:/tmp/.mount_App123/lib:/usr/lib",
+                ),
+                ("PATH", "/tmp/.mount_App123/usr/bin:/usr/bin:/bin"),
+            ]),
+        );
+        assert_eq!(
+            env_get(&spec, "LD_LIBRARY_PATH").as_deref(),
+            Some("/usr/lib")
+        );
+        assert_eq!(env_get(&spec, "PATH").as_deref(), Some("/usr/bin:/bin"));
+        assert!(!spec.env_remove.iter().any(|k| k == "PATH"));
+    }
+
+    #[test]
+    fn appdir_only_entries_remove_the_var() {
+        let mut spec = SpawnSpec::default();
+        scrub_appdir(
+            &mut spec,
+            fake_env(&[("APPDIR", "/a"), ("LD_LIBRARY_PATH", "/a/usr/lib:/a/lib")]),
+        );
+        assert!(spec.env_remove.iter().any(|k| k == "LD_LIBRARY_PATH"));
+        assert!(env_get(&spec, "LD_LIBRARY_PATH").is_none());
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_scrubbed() {
+        // /appdir2 is NOT under /appdir — a naive starts_with would eat it.
+        let mut spec = SpawnSpec::default();
+        scrub_appdir(
+            &mut spec,
+            fake_env(&[
+                ("APPDIR", "/appdir"),
+                ("LD_LIBRARY_PATH", "/appdir2/lib:/appdir/lib"),
+            ]),
+        );
+        assert_eq!(
+            env_get(&spec, "LD_LIBRARY_PATH").as_deref(),
+            Some("/appdir2/lib")
+        );
+    }
+
+    #[test]
+    fn no_appdir_is_a_noop() {
+        let mut spec = SpawnSpec::default();
+        scrub_appdir(&mut spec, fake_env(&[("LD_LIBRARY_PATH", "/x")]));
+        assert!(spec.env.is_empty() && spec.env_remove.is_empty());
+    }
 }

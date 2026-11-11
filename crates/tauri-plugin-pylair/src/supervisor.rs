@@ -98,9 +98,12 @@ pub struct SupervisorConfig {
     pub stream_buffer: usize,
     /// Pongs come from a reader thread and only prove the process and pipe
     /// are alive. The runtime also reports how long its asyncio loop has made
-    /// no progress (`loop_stale_ms`); at or beyond this the loop can no longer
-    /// serve calls or cancels, so the runtime is treated as wedged.
-    pub loop_stall_kill: Duration,
+    /// no progress (`loop_stale_ms`). `None` (the default) reports stalls as
+    /// a diagnostic only — legitimate blocking work (a multi-GB model load
+    /// inside `async def`) can stall the loop for minutes. `Some(limit)`
+    /// treats a stall at or beyond it as wedged: in-flight calls fail with
+    /// `RUNTIME_WEDGED` and the runtime is killed and restarted.
+    pub loop_stall_kill: Option<Duration>,
     /// How long `cancel()` waits for the runtime's acknowledgement.
     pub cancel_timeout: Duration,
     pub max_frame: usize,
@@ -123,7 +126,7 @@ impl Default for SupervisorConfig {
             shutdown_grace: Duration::from_secs(5),
             initial_stream_credit: 64,
             stream_buffer: 256,
-            loop_stall_kill: Duration::from_secs(60),
+            loop_stall_kill: None,
             cancel_timeout: Duration::from_secs(5),
             max_frame: proto::max_frame(),
             restart_trigger: None,
@@ -244,6 +247,10 @@ enum Command {
         ack: oneshot::Sender<()>,
     },
 }
+
+/// Stale-loop duration at which pongs surface an `Unresponsive` diagnostic.
+/// Below the Python lag monitor's 1s threshold this would flap on jitter.
+const LOOP_STALL_WARN: Duration = Duration::from_secs(1);
 
 enum PendingKind {
     Call(oneshot::Sender<Result<Value, ErrorObj>>),
@@ -711,7 +718,7 @@ impl Supervisor {
                                     pongs_outstanding = 0;
                                     // Transport is alive. Is the loop SERVING?
                                     let stale = Duration::from_millis(p["loop_stale_ms"].as_u64().unwrap_or(0));
-                                    if stale >= self.config.loop_stall_kill {
+                                    if self.config.loop_stall_kill.is_some_and(|l| stale >= l) {
                                         self.set_state(State::Unresponsive,
                                             format!("event loop blocked for {stale:?}"));
                                         fail_all(&mut pending, proto::RUNTIME_WEDGED,
@@ -720,7 +727,15 @@ impl Supervisor {
                                         kill_and_reap(&mut io).await;
                                         return ExitCause::Crashed(format!("event loop blocked for {stale:?}"));
                                     }
-                                    self.set_state(State::Ready, "pong received");
+                                    if stale >= LOOP_STALL_WARN {
+                                        // Diagnostic only (P1-7): the loop
+                                        // cannot serve calls right now, but a
+                                        // long stall is not proof of a wedge.
+                                        self.set_state(State::Unresponsive,
+                                            format!("event loop blocked for {stale:?} (diagnostic)"));
+                                    } else {
+                                        self.set_state(State::Ready, "pong received");
+                                    }
                                 }
                                 "stream.chunk" => {
                                     let task = p["task"].as_u64().unwrap_or(0);

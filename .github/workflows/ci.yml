@@ -241,6 +241,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app-under-test/src-tauri
+      # A native wheel must load inside the packaged app: AppRun's
+      # LD_LIBRARY_PATH used to leak AppDir libstdc++/libssl into Python.
+      - name: Add a native-wheel dependency (numpy)
+        working-directory: app-under-test
+        run: |
+          uv add numpy
+          printf '\nimport numpy  # native wheel must load inside the bundle\n' >> backend/app.py
       - name: Install app deps
         working-directory: app-under-test
         run: pnpm install --no-frozen-lockfile && uv sync
