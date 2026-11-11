@@ -6,7 +6,10 @@
 
 import { spawnSync } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { build } from "./build.js";
 import { emit } from "./codegen.js";
+import { dev } from "./dev.js";
+import { doctor } from "./doctor.js";
 import { loadManifest } from "./manifest.js";
 
 const COMMANDS = ["dev", "build", "doctor", "codegen"] as const;
@@ -17,9 +20,9 @@ function usage(): void {
 Usage: pylair <command> [options]
 
 Commands:
-  dev       Run the app with supervised Python + hot reload (M4)
-  build     Produce a signed installer with bundled Python (M4)
-  doctor    Diagnose environment and app config (M4)
+  dev       Run the app with supervised Python + hot reload
+  build     Produce a native installer with bundled Python
+  doctor    Diagnose environment and app config
   codegen   Generate typed TypeScript stubs from @expose signatures
 
 codegen options:
@@ -28,6 +31,15 @@ codegen options:
   --python <path>       Interpreter to inspect the module
                         (default: $PYTHON, then python3)
   --check               Exit 1 if the output is stale; don't write
+
+build options:
+  --dir <path>          App directory (default: cwd)
+  --bundles <list>      Comma-separated bundle kinds passed to tauri build
+  --skip-fetch          Reuse already-staged resources/python
+  Any other flags are forwarded to tauri build.
+
+  Builds are native-only: run on each target OS (no cross-compile).
+  Unsigned by default — set signing env vars for distribution builds.
 `);
 }
 
@@ -80,7 +92,7 @@ function codegen(argv: string[]): number {
   return 0;
 }
 
-function main(argv: string[]): number {
+function main(argv: string[]): number | Promise<number> {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "-h") {
     usage();
@@ -98,8 +110,44 @@ function main(argv: string[]): number {
       return 1;
     }
   }
+  if (command === "build") {
+    const dir = argValue(rest, "--dir") ?? process.cwd();
+    const bundles = argValue(rest, "--bundles");
+    const own = new Set(["--dir", "--bundles", "--skip-fetch"]);
+    const tauriArgs: string[] = [];
+    for (let i = 0; i < rest.length; i++) {
+      if (own.has(rest[i])) i += rest[i] === "--skip-fetch" ? 0 : 1;
+      else if (rest[i].startsWith("--")) tauriArgs.push(rest[i]);
+    }
+    if (bundles) tauriArgs.push("--bundles", bundles);
+    return build({
+      appDir: dir,
+      tauriArgs,
+      skipFetch: rest.includes("--skip-fetch"),
+    }).then(
+      () => 0,
+      (e) => {
+        console.error(`pylair build: ${(e as Error).message}`);
+        return 1;
+      },
+    );
+  }
+  if (command === "dev") {
+    const dir = argValue(rest, "--dir") ?? process.cwd();
+    return dev({ appDir: dir }).then(
+      (code) => code,
+      (e) => {
+        console.error(`pylair dev: ${(e as Error).message}`);
+        return 1;
+      },
+    );
+  }
+  if (command === "doctor") {
+    const dir = argValue(rest, "--dir") ?? process.cwd();
+    return doctor(dir);
+  }
   console.error(`pylair: unknown command '${command}'. Run 'pylair --help'.`);
   return 1;
 }
 
-process.exit(main(process.argv.slice(2)));
+Promise.resolve(main(process.argv.slice(2))).then(process.exit);

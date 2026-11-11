@@ -1,0 +1,76 @@
+/** `pylair doctor` — diagnose the dev/build environment. */
+
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { platform, arch } from "node:os";
+import { loadConfig, loadTauriConfig } from "./config.js";
+import { venvPython } from "./dev.js";
+import { hostTriple } from "./build.js";
+
+interface Check {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+function probe(cmd: string, args: string[]): string | null {
+  const r = spawnSync(cmd, args, { encoding: "utf-8" });
+  return r.status === 0 ? (r.stdout || r.stderr).trim() : null;
+}
+
+export function doctor(appDir: string): number {
+  const checks: Check[] = [];
+  const add = (name: string, ok: boolean, detail: string) =>
+    checks.push({ name, ok, detail });
+
+  const pyVer = probe("python3", ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"]);
+  const py = pyVer ? "python3" : "python";
+  const pyV = pyVer ?? probe("python", ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"]);
+  add("python >= 3.12", !!pyV && pyV >= "3.12", pyV ? `found ${py} ${pyV}` : "not found");
+
+  add("uv", !!probe("uv", ["--version"]), probe("uv", ["--version"]) ?? "not found");
+  add("node", true, process.version);
+  add(
+    "rust/cargo",
+    !!probe("cargo", ["--version"]),
+    probe("cargo", ["--version"]) ?? "not found",
+  );
+
+  let triple = "unsupported";
+  try {
+    triple = hostTriple();
+  } catch { /* stays unsupported */ }
+  add("host triple", triple !== "unsupported", `${platform()}/${arch()} → ${triple}`);
+
+  if (existsSync(join(appDir, "pyproject.toml")) && pyV) {
+    try {
+      const cfg = loadConfig(appDir, py);
+      add("[tool.pylair] config", true, `app-module=${cfg.appModule} source=${cfg.source}`);
+      add("source dir", existsSync(join(appDir, cfg.source)), join(appDir, cfg.source));
+      add(
+        "requirements",
+        existsSync(join(appDir, cfg.requirements)),
+        cfg.requirements,
+      );
+    } catch (e) {
+      add("[tool.pylair] config", false, (e as Error).message);
+    }
+    try {
+      const t = loadTauriConfig(appDir);
+      add("tauri.conf.json", true, `${t.productName} (${t.identifier})`);
+    } catch (e) {
+      add("tauri.conf.json", false, (e as Error).message);
+    }
+    add("venv", existsSync(venvPython(appDir)), venvPython(appDir));
+  } else {
+    add("app dir", false, `${appDir} has no pyproject.toml`);
+  }
+
+  const w = Math.max(...checks.map((c) => c.name.length));
+  for (const c of checks)
+    console.log(`${c.ok ? " ok " : "FAIL"} ${c.name.padEnd(w)}  ${c.detail}`);
+  const fails = checks.filter((c) => !c.ok).length;
+  console.log(fails ? `\n${fails} problem(s) found` : "\nall checks passed");
+  return fails ? 1 : 0;
+}

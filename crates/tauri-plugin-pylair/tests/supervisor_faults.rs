@@ -147,6 +147,7 @@ fn fast_config() -> SupervisorConfig {
         shutdown_grace: Duration::from_secs(2),
         initial_stream_credit: 8,
         max_frame: proto::max_frame(),
+        restart_trigger: None,
     }
 }
 
@@ -425,4 +426,46 @@ time.sleep(0.3)
         }
     }
     assert!(lines.iter().any(|l| l.contains("hello from stderr")));
+}
+
+#[tokio::test]
+async fn restart_trigger_respawns_cleanly() {
+    // Dev-mode hot reload: touching the trigger file respawns the runtime
+    // without crash accounting — the state goes Restarting -> Ready and a
+    // fresh generation serves calls.
+    let dir = std::env::temp_dir().join(format!("pylair-trig-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let trigger = dir.join("trigger");
+    std::fs::write(&trigger, "0").unwrap();
+
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
+    let mut cfg = fast_config();
+    cfg.restart_trigger = Some(trigger.clone());
+    let h = spawn(spec(FAKE_READY), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    // Rewrite past the mtime granularity of the first write.
+    sleep(Duration::from_millis(50)).await;
+    std::fs::write(&trigger, "1").unwrap();
+
+    let saw_restart_note = timeout(T, async {
+        while let Some(e) = rx.recv().await {
+            if let RuntimeEvent::Stderr(l) = e {
+                if l.contains("source changed") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw_restart_note, "no restart notice on trigger change");
+
+    // The respawned generation must serve calls again.
+    wait_state(&h, State::Ready).await;
+    let out = h.call("echo", json!({"after": "restart"})).await.unwrap();
+    assert_eq!(out, json!({"after": "restart"}));
+    h.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

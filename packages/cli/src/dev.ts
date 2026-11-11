@@ -1,0 +1,98 @@
+/** `pylair dev` — supervised dev mode:
+ *   uv sync → codegen → watch the python source dir → on change,
+ *   re-run codegen and touch the restart trigger (the supervisor
+ *   respawns the runtime within ~250ms) → run `tauri dev`.
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { platform } from "node:os";
+import { join } from "node:path";
+import { loadConfig } from "./config.js";
+import { emit } from "./codegen.js";
+import { loadManifest } from "./manifest.js";
+
+const isWin = platform() === "win32";
+
+export function venvPython(appDir: string): string {
+  const p = join(
+    appDir,
+    ".venv",
+    isWin ? "Scripts/python.exe" : "bin/python",
+  );
+  return p;
+}
+
+function runCodegen(appDir: string, cfgModule: string, out: string): boolean {
+  const python = venvPython(appDir);
+  const env = { ...process.env, PYTHONPATH: join(appDir, "backend") };
+  try {
+    const manifest = loadManifest({ python, module: cfgModule, env });
+    const ts = emit(manifest, cfgModule);
+    const prev = existsSync(out) ? readFileSync(out, "utf-8") : null;
+    if (prev !== ts) {
+      writeFileSync(out, ts);
+      console.log(`pylair: codegen → ${out} (${manifest.functions?.length ?? 0} functions)`);
+      return true;
+    }
+  } catch (e) {
+    console.warn(`pylair: codegen failed (${(e as Error).message}) — keeping last stubs`);
+  }
+  return false;
+}
+
+export async function dev(opts: { appDir: string }): Promise<number> {
+  const { appDir } = opts;
+  const py = spawnSync("python3", ["--version"], { encoding: "utf-8" });
+  const cfg = loadConfig(appDir, py.status === 0 ? "python3" : "python");
+
+  // Resolve the dev interpreter: the app venv (uv sync) or env override.
+  if (spawnSync("uv", ["sync"], { cwd: appDir, stdio: "inherit" }).status !== 0)
+    throw new Error("uv sync failed — is uv installed and pyproject.toml valid?");
+
+  const srcDir = join(appDir, cfg.source);
+  const stateDir = join(appDir, ".pylair");
+  mkdirSync(stateDir, { recursive: true });
+  const trigger = join(stateDir, "restart-trigger");
+  writeFileSync(trigger, String(Date.now()));
+
+  const stubs = join(appDir, "src", "api.generated.ts");
+  mkdirSync(join(appDir, "src"), { recursive: true });
+  runCodegen(appDir, cfg.appModule, stubs);
+
+  // Watch python source; debounce bursts (saves, formatter runs).
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let changed = false;
+  watch(srcDir, { recursive: true }, (_ev, file) => {
+    if (!file?.endsWith(".py")) return;
+    changed = true;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!changed) return;
+      changed = false;
+      writeFileSync(trigger, String(Date.now()));
+      runCodegen(appDir, cfg.appModule, stubs);
+    }, 150);
+  });
+
+  const env = {
+    ...process.env,
+    PYLAIR_APP_MODULE: cfg.appModule,
+    PYLAIR_PYTHON: venvPython(appDir),
+    PYLAIR_PYTHONPATH: srcDir,
+    PYLAIR_RESTART_TRIGGER: trigger,
+    PYLAIR_DEV: "1",
+  };
+  console.log("pylair: watching python source; starting tauri dev");
+  const child = spawn("npx", ["tauri", "dev"], {
+    cwd: appDir,
+    stdio: "inherit",
+    env,
+    shell: isWin,
+  });
+  return new Promise((resolve) => {
+    child.on("exit", (code) => resolve(code ?? 1));
+    for (const sig of ["SIGINT", "SIGTERM"] as const)
+      process.on(sig, () => child.kill(sig));
+  });
+}

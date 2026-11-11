@@ -6,7 +6,7 @@
   "bin": {
     "create-pylair": "./dist/index.js"
   },
-  "files": ["dist"],
+  "files": ["dist", "templates"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -32,16 +32,33 @@ pub mod events {
 /// Managed state holding the supervisor handle.
 pub struct PyRuntime(pub Handle);
 
-/// Plugin builder — the app supplies where Python lives.
-pub struct Builder {
+/// Plugin builder — the app supplies where Python lives, eagerly or lazily.
+/// `new` takes a fixed spec; `new_with` defers it to setup time, which is how
+/// apps resolve the bundled interpreter under `resource_dir` at release while
+/// using a dev venv when `PYLAIR_APP_MODULE` is set.
+type SpecFn<R> = Box<dyn Fn(&tauri::AppHandle<R>) -> SpawnSpec + Send + Sync>;
+
+pub struct Builder<R: Runtime = tauri::Wry> {
     spec: SpawnSpec,
+    lazy: Option<SpecFn<R>>,
     config: SupervisorConfig,
 }
 
-impl Builder {
+impl<R: Runtime> Builder<R> {
     pub fn new(spec: SpawnSpec) -> Self {
         Self {
             spec,
+            lazy: None,
+            config: SupervisorConfig::default(),
+        }
+    }
+
+    /// Spec computed at plugin setup — receives the AppHandle so it can
+    /// resolve `path().resource_dir()`.
+    pub fn new_with(f: impl Fn(&tauri::AppHandle<R>) -> SpawnSpec + Send + Sync + 'static) -> Self {
+        Self {
+            spec: SpawnSpec::default(),
+            lazy: Some(Box::new(f)),
             config: SupervisorConfig::default(),
         }
     }
@@ -51,11 +68,12 @@ impl Builder {
         self
     }
 
-    pub fn build<R: Runtime>(self) -> tauri::plugin::TauriPlugin<R> {
+    pub fn build(self) -> tauri::plugin::TauriPlugin<R> {
         tauri::plugin::Builder::<R>::new("pylair")
             .setup(move |app, _api| {
+                let spec = self.lazy.as_ref().map(|f| f(app)).unwrap_or_else(|| self.spec.clone());
                 let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(256);
-                let handle = spawn_supervisor(self.spec.clone(), self.config.clone(), ev_tx);
+                let handle = spawn_supervisor(spec, self.config.clone(), ev_tx);
                 app.manage(PyRuntime(handle));
 
                 let app_handle = app.clone();

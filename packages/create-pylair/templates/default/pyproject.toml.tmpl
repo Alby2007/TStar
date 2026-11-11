@@ -1,0 +1,13 @@
+[project]
+name = "__APP_NAME__"
+version = "0.1.0"
+description = "A Pylair desktop app"
+requires-python = ">=3.12"
+dependencies = ["__PYLAIR_PY__"]
+
+[tool.pylair]
+app-module = "backend.app"
+source = "backend"
+requirements = "requirements.txt"
+python-version = "3.12"
+# prune = ["extra/deny-glob"]   # extend the default bundle deny-list

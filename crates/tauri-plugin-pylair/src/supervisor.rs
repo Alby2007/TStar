@@ -49,7 +49,7 @@ pub enum RuntimeEvent {
     Exposes(Value),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnSpec {
     /// Path to the Python interpreter (system python in dev, bundled in prod).
     pub program: PathBuf,
@@ -89,6 +89,10 @@ pub struct SupervisorConfig {
     /// Stream pull-credit granted to a new streaming call up front.
     pub initial_stream_credit: u64,
     pub max_frame: usize,
+    /// Dev-mode hot reload: when this file's mtime changes, respawn the
+    /// runtime (no crash accounting). Falls back to the
+    /// PYLAIR_RESTART_TRIGGER env var when unset.
+    pub restart_trigger: Option<PathBuf>,
 }
 
 impl Default for SupervisorConfig {
@@ -104,6 +108,7 @@ impl Default for SupervisorConfig {
             shutdown_grace: Duration::from_secs(5),
             initial_stream_credit: 64,
             max_frame: proto::max_frame(),
+            restart_trigger: None,
         }
     }
 }
@@ -338,6 +343,9 @@ enum ExitCause {
     /// Unrecoverable without operator action (e.g. protocol version mismatch)
     /// — straight to Failed, no restart loop.
     Fatal(String),
+    /// Dev-mode hot reload: PYLAIR_RESTART_TRIGGER file changed — respawn
+    /// immediately, no crash accounting.
+    DevRestart,
 }
 
 impl Supervisor {
@@ -371,6 +379,10 @@ impl Supervisor {
                 ExitCause::CleanShutdown => {
                     self.set_state(State::Stopped, "shutdown");
                     return;
+                }
+                ExitCause::DevRestart => {
+                    self.set_state(State::Restarting, "source changed");
+                    self.generation += 1;
                 }
                 ExitCause::Fatal(reason) => {
                     self.set_state(State::Failed, reason);
@@ -500,6 +512,16 @@ impl Supervisor {
         let mut stalled_calls: Vec<u64> = Vec::new();
         let mut ping_tick = interval(self.config.ping_interval);
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Dev-mode hot reload: the CLI touches the trigger file when source
+        // changes; we poll its mtime (no fs-watch dep). Config wins over env.
+        let restart_trigger = self
+            .config
+            .restart_trigger
+            .clone()
+            .or_else(|| std::env::var_os("PYLAIR_RESTART_TRIGGER").map(PathBuf::from));
+        let trigger_mtime = restart_trigger.as_deref().and_then(mtime);
+        let mut trigger_tick = interval(Duration::from_millis(250));
 
         loop {
             tokio::select! {
@@ -674,6 +696,18 @@ impl Supervisor {
                         "ping", serde_json::json!({"seq": ping_seq}));
                     send_frame(&io, &body);
                 }
+                // --- dev restart trigger ---
+                _ = trigger_tick.tick(), if restart_trigger.is_some() => {
+                    let m = restart_trigger.as_deref().and_then(mtime);
+                    if m != trigger_mtime {
+                        let _ = self.events.try_send(RuntimeEvent::Stderr(
+                            "pylair: source changed — restarting python runtime".into()));
+                        fail_all(&mut pending, proto::RUNTIME_CRASHED,
+                            "python restarted (source change)").await;
+                        kill_and_reap(&mut io).await;
+                        return ExitCause::DevRestart;
+                    }
+                }
                 // --- child exit ---
                 status = &mut io.exited => {
                     let detail = match status {
@@ -693,6 +727,10 @@ impl Supervisor {
             }
         }
     }
+}
+
+fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
 fn send_frame(io: &ChildIo, body: &Value) -> bool {

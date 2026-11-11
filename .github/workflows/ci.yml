@@ -177,3 +177,90 @@ jobs:
           Write-Output "bundled interpreter: $($py.FullName)"
           $resroot = Split-Path (Split-Path $py.FullName -Parent) -Parent
           ./scripts/verify-bundled.ps1 -Root $resroot
+
+  # The one-command story, proven: scaffold a fresh app, build a native
+  # installer bundling Python, install/extract on a clean machine, and call
+  # the app's Python through the bundled interpreter — no system Python.
+  acceptance:
+    name: acceptance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            bundles: "appimage,deb"
+          - os: windows-latest
+            bundles: "nsis"
+          - os: macos-latest
+            bundles: "app,dmg"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-under-test/src-tauri
+      - name: Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Build workspace packages (client + cli + scaffolder dists)
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -r build
+      - name: Scaffold app (local dep wiring)
+        run: node packages/create-pylair/dist/index.js app-under-test --local "$PWD"
+      - name: Install app deps
+        working-directory: app-under-test
+        run: pnpm install --no-frozen-lockfile && uv sync
+      - name: pylair build (stages interpreter, env, prunes, tauri build)
+        working-directory: app-under-test
+        run: pnpm exec pylair build --bundles ${{ matrix.bundles }}
+      - name: Verify bundled payload (Linux, clean container)
+        if: runner.os == 'Linux'
+        working-directory: app-under-test
+        run: |
+          DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
+          dpkg -x "$DEB" /tmp/approot
+          RES=/tmp/approot/usr/lib/app-under-test
+          for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
+          docker run --rm -v "$RES:/r:ro" ubuntu:22.04 bash -c '
+            PYTHONPATH=/r/site-packages:/r/backend PYTHONNOUSERSITE=1 \
+              /r/python/bin/python3 -c "import backend.app as a; print(a.hello())"'
+      - name: Verify bundled payload (macOS)
+        if: runner.os == 'macOS'
+        working-directory: app-under-test
+        run: |
+          APP=$(find src-tauri/target/release/bundle/macos -name '*.app' | head -1)
+          RES="$APP/Contents/Resources"
+          PYTHONPATH="$RES/site-packages:$RES/backend" PYTHONNOUSERSITE=1 \
+            "$RES/python/bin/python3" -c "import backend.app as a; print(a.hello())"
+      - name: Verify bundled payload (Windows)
+        if: runner.os == 'Windows'
+        working-directory: app-under-test
+        shell: pwsh
+        run: |
+          $i = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          Start-Process -FilePath $i.FullName -ArgumentList '/S' -Wait
+          $py = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles" `
+                -Recurse -Filter 'python.exe' -Depth 4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -like '*app-under-test*' } | Select-Object -First 1
+          if (-not $py) { Write-Error 'installed python.exe not found'; exit 1 }
+          $res = Split-Path (Split-Path $py.FullName -Parent) -Parent
+          $env:PYTHONPATH = "$res/site-packages;$res/backend"
+          $env:PYTHONNOUSERSITE = '1'
+          & $py.FullName -c "import backend.app as a; print(a.hello())"
