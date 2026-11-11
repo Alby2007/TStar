@@ -144,7 +144,7 @@ function main(argv: string[]): number | Promise<number> {
   }
   if (command === "doctor") {
     const dir = argValue(rest, "--dir") ?? process.cwd();
-    return doctor(dir);
+    return doctor(dir).then((code) => code);
   }
   console.error(`pylair: unknown command '${command}'. Run 'pylair --help'.`);
   return 1;

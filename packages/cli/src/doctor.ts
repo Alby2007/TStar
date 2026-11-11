@@ -19,7 +19,7 @@ function probe(cmd: string, args: string[]): string | null {
   return r.status === 0 ? (r.stdout || r.stderr).trim() : null;
 }
 
-export function doctor(appDir: string): number {
+export async function doctor(appDir: string): Promise<number> {
   const checks: Check[] = [];
   const add = (name: string, ok: boolean, detail: string) =>
     checks.push({ name, ok, detail });
@@ -66,6 +66,22 @@ export function doctor(appDir: string): number {
   } else {
     add("app dir", false, `${appDir} has no pyproject.toml`);
   }
+
+  // Optional integration: report Ollama when present; absence is a note,
+  // not a failure — it's opt-in.
+  const ollama = await (async () => {
+    try {
+      const r = await fetch("http://127.0.0.1:11434/api/tags", {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!r.ok) return { ok: false, detail: `API returned ${r.status}` };
+      const j = (await r.json()) as { models?: { name: string }[] };
+      return { ok: true, detail: `${j.models?.length ?? 0} model(s) available` };
+    } catch {
+      return { ok: true, detail: "not running (optional — pylair-ollama)" };
+    }
+  })();
+  checks.push({ name: "ollama (optional)", ok: ollama.ok, detail: ollama.detail });
 
   const w = Math.max(...checks.map((c) => c.name.length));
   for (const c of checks)
