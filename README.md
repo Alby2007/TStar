@@ -68,7 +68,10 @@ See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 Installers produced by `pylair build` are **unsigned** unless you configure
 code signing — expect Gatekeeper (macOS) and SmartScreen (Windows)
-warnings on unsigned builds. See [docs/build.md](docs/build.md).
+warnings on unsigned builds. A first build downloads the bundled Python
+runtime and Tauri's installer toolchain (WiX/NSIS on Windows) from
+GitHub, so it needs network access once; later builds reuse the caches.
+See [docs/build.md](docs/build.md).
 
 Pylair builds on [Tauri](https://tauri.app) but is not affiliated with or
 endorsed by the Tauri project. Apps it produces bundle third-party

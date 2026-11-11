@@ -26,6 +26,14 @@ pyproject.toml [tool.pylair] + src-tauri/tauri.conf.json
 7. warn loudly if no signing credentials are configured
 ```
 
+## Network access on first build
+
+A first build needs GitHub access twice: we download
+python-build-standalone (step 1, then cached in `.pylair/cache/`), and
+Tauri's bundler downloads its installer toolchain — WiX and NSIS on
+Windows, the AppImage runtime on Linux — on first use. Later builds
+reuse the caches; an offline rebuild works once they've been warmed.
+
 ## Configuration — one file
 
 Everything pylair-specific lives in `[tool.pylair]` in `pyproject.toml`.
