@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { emit } from "../dist/codegen.js";
 import { loadManifest } from "../dist/manifest.js";
 
@@ -292,7 +293,8 @@ test("generated fixture compiles under tsc --strict", () => {
     ]),
     "fixture",
   );
-  const root = new URL("../../../", import.meta.url).pathname;
+  // fileURLToPath, not .pathname — Windows yields "/D:/..." otherwise.
+  const root = fileURLToPath(new URL("../../../", import.meta.url));
   const dir = mkdtempSync(path.join(tmpdir(), "pylair-tsc-"));
   writeFileSync(path.join(dir, "fixture.ts"), ts);
   writeFileSync(

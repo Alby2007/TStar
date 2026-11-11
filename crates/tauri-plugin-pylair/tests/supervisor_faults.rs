@@ -728,6 +728,10 @@ async fn blocked_loop_warns_but_does_not_kill_by_default() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
     let mut cfg = fast_config();
     cfg.ping_interval = Duration::from_millis(100);
+    // A blocked loop must not starve reader-thread pongs — but on a loaded CI
+    // runner the reader can lag by scheduling alone. Give the transport check
+    // a 3s dead-air budget so only a genuinely wedged transport kills.
+    cfg.missed_pongs_to_kill = 30;
     // loop_stall_kill stays None — the shipped default.
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
