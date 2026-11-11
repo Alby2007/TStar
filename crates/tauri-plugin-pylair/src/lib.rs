@@ -87,9 +87,22 @@ fn resources_from_exe() -> Option<PathBuf> {
 }
 
 async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
-    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let (h, actor) = spawn_supervisor(spec, SupervisorConfig::default(), tx);
     tokio::spawn(actor);
+    // Surface the runtime's stderr and lifecycle: a self-test that only says
+    // "never reached Ready" is undiagnosable in CI.
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                RuntimeEvent::Stderr(line) => eprintln!("[runtime stderr] {line}"),
+                RuntimeEvent::StateChanged { from, to, detail } => {
+                    eprintln!("[runtime state] {from:?} -> {to:?}: {detail}")
+                }
+                RuntimeEvent::Exposes(_) => {}
+            }
+        }
+    });
     let mut rx = h.subscribe_state();
     let ready = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         while *rx.borrow() != State::Ready {
