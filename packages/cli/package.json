@@ -1,0 +1,20 @@
+{
+  "name": "tauri-plus-cli",
+  "version": "0.0.0",
+  "description": "Tauri+ CLI: dev, build, doctor, codegen",
+  "type": "module",
+  "bin": {
+    "tauri-plus": "./dist/cli.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm build",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

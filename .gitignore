@@ -1,0 +1,29 @@
+# Node / pnpm
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust
+target/
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Tauri / build outputs
+**/src-tauri/target/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Logs
+*.log

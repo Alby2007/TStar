@@ -1,0 +1,6 @@
+packages:
+  - "packages/*"
+  - "examples/*"
+
+# templates/* is deliberately NOT a workspace member: scaffolded apps must
+# install standalone from the registry, not via the monorepo lockfile.

@@ -1,0 +1,14 @@
+[package]
+name = "tauri-plugin-tauri-plus"
+version = "0.0.0"
+description = "Tauri plugin: Python runtime supervisor, IPC bridge, and permissions for Tauri+ apps"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+# Tauri plugin deps (tauri, serde, tokio) arrive with M0/M1. The crate is a
+# compilable stub until then; see docs/decisions/0000-repo-decisions.md.
