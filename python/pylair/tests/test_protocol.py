@@ -23,6 +23,11 @@ def call(rid: int, fn: str, task: int, input: dict | None = None) -> dict:
     return proto.request(rid, "call", {"fn": fn, "task": task, "input": input or {}})
 
 
+def grant(task: int, n: int = proto.INITIAL_STREAM_CREDIT) -> dict:
+    """The host's initial window — it owns the grant (protocol §3.1)."""
+    return proto.notification("stream.credit", {"task": task, "n": n})
+
+
 # ---- handshake ------------------------------------------------------------
 
 
@@ -93,6 +98,7 @@ def test_ping_pong(runtime):
 def test_stream_terminal_is_the_call_response(runtime):
     runtime.recv()
     runtime.send(call(9, "counter", task=5, input={"n": 3}))
+    runtime.send(grant(5))
     chunks = [
         runtime.recv_until(lambda m: m.get("method") == "stream.chunk")
         for _ in range(3)
@@ -107,8 +113,9 @@ def test_producer_runs_only_with_credit(runtime):
     """An infinite generator must pause at the initial credit boundary."""
     runtime.recv()
     runtime.send(call(1, "infinite", task=1))
+    runtime.send(grant(1))
     got = 0
-    # initial credit is INITIAL_STREAM_CREDIT; drain exactly that many
+    # the host granted INITIAL_STREAM_CREDIT; drain exactly that many
     for _ in range(proto.INITIAL_STREAM_CREDIT):
         runtime.recv_until(lambda m: m.get("method") == "stream.chunk", timeout=5)
         got += 1
@@ -149,6 +156,7 @@ def test_cancel_unknown_task(runtime):
 def test_cancel_stream(runtime):
     runtime.recv()
     runtime.send(call(7, "infinite", task=7))
+    runtime.send(grant(7))
     for _ in range(5):
         runtime.recv_until(lambda m: m.get("method") == "stream.chunk")
     runtime.send(proto.request(8, "cancel", {"task": 7}))

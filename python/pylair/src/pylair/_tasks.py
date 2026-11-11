@@ -58,7 +58,10 @@ class TaskRegistry:
         self._tasks[task_id] = task
 
         if kind == "generator":
-            task.credit = proto.INITIAL_STREAM_CREDIT
+            # Credit is owned by the HOST: it grants the initial window right
+            # after `call` (protocol §3.1). Starting at zero here avoids a
+            # double grant (64 + host's 64).
+            task.credit = 0
             task.asyncio_task = asyncio.create_task(self._pump_stream(task, fn, input))
         elif kind == "async":
             task.asyncio_task = asyncio.create_task(self._run_async(task, fn, input))

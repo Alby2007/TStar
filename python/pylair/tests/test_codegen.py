@@ -220,6 +220,9 @@ def test_unserializable_stream_chunk_fails_only_that_task(runtime):
             "params": {"fn": "bad_stream", "task": 9, "input": {}},
         }
     )
+    runtime.send(
+        {"jsonrpc": "2.0", "method": "stream.credit", "params": {"task": 9, "n": 64}}
+    )
     chunk = runtime.recv_until(lambda m: m.get("method") == "stream.chunk")
     assert chunk["params"]["value"] == 1
     terminal = runtime.recv_until(lambda m: m.get("id") == 9)
