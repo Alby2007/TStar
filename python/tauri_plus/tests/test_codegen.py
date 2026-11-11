@@ -5,10 +5,12 @@ import subprocess
 import sys
 import typing
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(__file__.rsplit("/", 1)[0]))
+HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE))
 
 import testapp
 from tauri_plus import _json, _schema
@@ -141,7 +143,7 @@ def test_codegen_manifest_subprocess():
         capture_output=True,
         text=True,
         check=False,
-        cwd=str(__file__.rsplit("/", 1)[0]),
+        cwd=str(HERE),
     )
     assert out.returncode == 0, out.stderr
     manifest = _json.loads(out.stdout)
