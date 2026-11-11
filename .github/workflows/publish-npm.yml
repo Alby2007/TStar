@@ -67,5 +67,7 @@ jobs:
       - name: Tag the release
         if: ${{ !inputs.dry_run }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "npm-v${{ inputs.version }}" -m "npm packages ${{ inputs.version }}"
           git push origin "npm-v${{ inputs.version }}"
