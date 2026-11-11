@@ -15,7 +15,7 @@ for await (const token of stream<string>("generate", { prompt })) {
 ```
 
 **Release candidate:** install with an exact pin or the `next` tag —
-`npm i @pylair/client@next` / `npm i @pylair/client@0.1.0-rc.1`.
+`npm i @pylair/client@next` / `npm i @pylair/client@0.1.0-rc.2`.
 
 Pylair builds on [Tauri](https://tauri.app) but is not affiliated with
 or endorsed by the Tauri project.

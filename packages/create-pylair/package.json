@@ -1,11 +1,11 @@
 {
   "name": "create-pylair",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.0-rc.2",
   "description": "Scaffold a new Pylair project (npx create-pylair my-app)",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PylairHQ/Pylair",
+    "url": "git+https://github.com/PylairHQ/Pylair.git",
     "directory": "packages/create-pylair"
   },
   "publishConfig": {
@@ -13,9 +13,14 @@
   },
   "type": "module",
   "bin": {
-    "create-pylair": "./dist/index.js"
+    "create-pylair": "dist/index.js"
   },
-  "files": ["dist", "templates", "LICENSE-MIT", "LICENSE-APACHE"],
+  "files": [
+    "dist",
+    "templates",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

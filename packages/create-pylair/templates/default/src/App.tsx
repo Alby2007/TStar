@@ -8,7 +8,7 @@ export default function App() {
   return (
     <main style={{ fontFamily: "system-ui", padding: 32 }}>
       <h1>Pylair app</h1>
-      <button onClick={async () => setGreeting(await call("hello", { name: "tauri" }))}>
+      <button onClick={async () => setGreeting(await call("hello", { name: "pylair" }))}>
         Call python hello()
       </button>
       <button

@@ -22,6 +22,10 @@ use tauri::{Emitter, Manager, Runtime};
 /// `python/`, `site-packages/` and the app's source dir. Kept here (not in
 /// app code) so path/env fixes reach every app via a plugin update.
 pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) -> SpawnSpec {
+    // Tauri's resource_dir is canonicalized, so on Windows it arrives as a
+    // \\?\ verbatim path — Python code reading sys.executable or sys.path
+    // can trip on the prefix. Simplify it back when safe (no-op elsewhere).
+    let resources = dunce::simplified(resources);
     let python = resources.join("python").join(if cfg!(windows) {
         "python.exe"
     } else {

@@ -1,11 +1,11 @@
 {
   "name": "@pylair/cli",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.0-rc.2",
   "description": "Pylair CLI: dev, build, doctor, codegen",
   "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/PylairHQ/Pylair",
+    "url": "git+https://github.com/PylairHQ/Pylair.git",
     "directory": "packages/cli"
   },
   "publishConfig": {
@@ -13,9 +13,13 @@
   },
   "type": "module",
   "bin": {
-    "pylair": "./dist/cli.js"
+    "pylair": "dist/cli.js"
   },
-  "files": ["dist", "LICENSE-MIT", "LICENSE-APACHE"],
+  "files": [
+    "dist",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

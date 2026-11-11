@@ -10,4 +10,7 @@ for Python and local-AI applications. Apps scaffolded with
 [`@pylair/client`](../packages/client) SDK and `pylair` CLI are the
 supported path.
 
+Pylair builds on [Tauri](https://tauri.app) but is not affiliated with
+or endorsed by the Tauri project.
+
 License: MIT OR Apache-2.0 — see LICENSE-MIT / LICENSE-APACHE.

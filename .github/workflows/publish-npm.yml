@@ -65,9 +65,17 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           # client first — cli and create-pylair may reference it.
-          # --tag next: RCs must not become `latest`.
+          # --tag next: RCs must not become `latest` (npm still sets
+          # latest on a package's very first publish — harmless here).
+          # npm has no --skip-existing: a mid-loop failure leaves earlier
+          # packages published, so skip what's already live on a rerun.
           for p in packages/client packages/cli packages/create-pylair; do
-            (cd "$p" && npm publish --access public --provenance --tag next)
+            name=$(node -p "require('./$p/package.json').name")
+            if npm view "$name@${{ inputs.version }}" version >/dev/null 2>&1; then
+              echo "$name@${{ inputs.version }} already published — skipping"
+            else
+              (cd "$p" && npm publish --access public --provenance --tag next)
+            fi
           done
 
       - name: Tag the release

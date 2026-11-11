@@ -1017,7 +1017,9 @@ async fn spawn_child(
     config: &SupervisorConfig,
     events: &mpsc::Sender<RuntimeEvent>,
 ) -> io::Result<ChildIo> {
-    let mut cmd = TokioCommand::new(&spec.program);
+    // Simplify a canonicalized (Windows \\?\-prefixed) program path so the
+    // child sees a plain sys.executable — dev-mode callers may pass one too.
+    let mut cmd = TokioCommand::new(dunce::simplified(&spec.program));
     cmd.args(&spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

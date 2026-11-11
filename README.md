@@ -48,7 +48,8 @@ integration → `M6` reference app + RC.
 ## Dev setup
 
 Toolchain (pinned in repo): Node 22, pnpm 10.18.3 (corepack), Rust 1.92.0,
-uv (any recent), Python 3.12 via uv.
+uv (any recent), Python 3.12 via uv. On Windows you also need the Visual
+Studio Build Tools "Desktop development with C++" workload.
 
 ```sh
 pnpm install            # JS workspace

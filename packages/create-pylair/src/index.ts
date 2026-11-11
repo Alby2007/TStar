@@ -44,8 +44,8 @@ export function substitutions(name: string, identifier: string, local?: string):
   } else {
     subs.__PYLAIR_PY__ = "pylair==0.1.0rc1";
     subs.__PYLAIR_JS_PKG__ = "@pylair/client";
-    subs.__PYLAIR_JS__ = "0.1.0-rc.1";
-    subs.__PYLAIR_CLI__ = "0.1.0-rc.1";
+    subs.__PYLAIR_JS__ = "0.1.0-rc.2";
+    subs.__PYLAIR_CLI__ = "0.1.0-rc.2";
     subs.__PYLAIR_RS__ = `tauri-plugin-pylair = "=0.1.0-rc.1"`;
   }
   return subs;
@@ -105,10 +105,10 @@ next:
   cd ${name}
   npm install         # or pnpm install
   uv sync             # python env (https://docs.astral.sh/uv/)
-  npm run pylair dev  # supervised dev: python hot reload + vite
+  npx pylair dev      # supervised dev: python hot reload + vite
                       # (pnpm users: pnpm pylair dev / pnpm pylair build)
-  npm run pylair build   # native installer with bundled python
-  npm run pylair doctor  # diagnose environment any time
+  npx pylair build    # native installer with bundled python
+  npx pylair doctor   # diagnose environment any time
 `);
   return 0;
 }
