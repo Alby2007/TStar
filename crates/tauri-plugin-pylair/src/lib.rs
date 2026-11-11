@@ -354,6 +354,17 @@ impl<R: Runtime> Builder<R> {
                 Ok(())
             })
             .on_event(|app, event| {
+                // A destroyed window leaves the subscriber set; a reload does
+                // NOT remove it (label survives reloads — an in-flight stream
+                // to a reloaded page just has no listener, which is fine).
+                if let tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } = event
+                {
+                    app.state::<Registry>().lock().unwrap().drop_label(label);
+                }
                 // Block exit until the runtime's process tree is gone: the
                 // async drop below may never get to run once the process ends.
                 if let tauri::RunEvent::Exit = event {
@@ -628,6 +639,14 @@ mod tests {
         assert!(!same_origin("about:blank", "about:blank"));
         // Default-port normalization: explicit :443 == https default.
         assert!(same_origin("https://a.example:443/", "https://a.example/"));
+        // Case-insensitive host compare; trailing dot and IPv6 literals are
+        // distinct origins (url-crate normalization decides, we don't guess).
+        assert!(same_origin("http://EXAMPLE.com/", "http://example.com/"));
+        assert!(!same_origin("http://localhost/", "http://localhost./"));
+        assert!(same_origin("http://[::1]:8080/", "http://[::1]:8080/x"));
+        // localhost and 127.0.0.1 are DIFFERENT origins — pinned so nobody
+        // "fixes" the false negative into a false positive later.
+        assert!(!same_origin("http://localhost/", "http://127.0.0.1/"));
     }
 
     #[test]

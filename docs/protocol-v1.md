@@ -211,6 +211,17 @@ deadlock) never crashes, so it never restarts.
   `RUNTIME_WEDGED` and the runtime is killed and restarted. The field is
   additive — hosts that ignore it keep the older behaviour.
 - `seq` matching guards staleness.
+
+### 5.1 Event delivery (host → webviews)
+
+Runtime events are **scoped, not broadcast**: state/stderr/exposes go to
+webviews that have invoked the bridge (`emit_to` per label); stream items
+go only to the webview that started the stream. Subscriptions outlive a
+page reload (labels persist), so a webview reloaded mid-stream receives
+chunks it has no listener for — they are dropped harmlessly and the call
+still completes; the producer is unaffected. A destroyed window is
+removed from the subscriber set.
+
 - `cancel()` waits at most `cancel_timeout` (default 5s) for the runtime's
   acknowledgement and then fails with `RUNTIME_WEDGED`; a blocked runtime
   cannot be relied on to answer. The client's `timeoutMs` call option is

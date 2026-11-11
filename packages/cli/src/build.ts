@@ -236,6 +236,10 @@ export function stageNotices(resources: string, pylairDir: string): string {
         const lines = readFileSync(meta, "utf-8")
           .split("\n")
           .filter((l) => /^(License|Classifier: License)/i.test(l));
+        // Copyleft is legal to ship but app authors deserve to know they
+        // bundled it — warn, never block.
+        if (/\b(a?lgpl|gpl)[ -]?v?\d/i.test(lines.join(" ")))
+          console.warn(`warning: bundled wheel ${e.name} declares a copyleft license`);
         if (lines.length) {
           mkdirSync(join(out, pkg), { recursive: true });
           writeFileSync(join(out, pkg, "METADATA-LICENSE.txt"), lines.join("\n") + "\n");
