@@ -1,0 +1,3 @@
+# This example lives inside the pylair monorepo; keep pnpm from
+# treating it as a workspace member (it is not in the root globs).
+packages: []

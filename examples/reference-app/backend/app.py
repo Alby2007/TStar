@@ -1,0 +1,77 @@
+"""Reference app backend — a local-AI workflow over the Pylair bridge.
+
+Covers the four M6 acceptance criteria: token-by-token streaming from a
+real model (Ollama), safe cancellation, deliberate crash + supervised
+recovery, and packaged installs on machines with no Python.
+
+`add` and `count` stay exposed: the webview self-test
+(PYLAIR_SELF_TEST_WEBVIEW, run by the acceptance job) drives them.
+"""
+
+import asyncio
+import os
+from collections.abc import AsyncIterator
+
+from pylair import expose
+from pylair_ollama import Message, chat as ollama_chat, status as ollama_status
+
+DEFAULT_MODEL = os.environ.get("REFERENCE_MODEL", "qwen2.5:0.5b")
+
+
+@expose
+async def status() -> dict:
+    """Ollama reachability + model list — drives the UI status badge.
+    Never raises: the app must still work when Ollama is absent (clean
+    install machines have no Ollama either)."""
+    s = await ollama_status()
+    return {
+        "installed": s.installed,
+        "running": s.running,
+        "version": s.version,
+        "models": s.models,
+        "default_model": DEFAULT_MODEL,
+        "error": s.error,
+    }
+
+
+@expose
+async def chat(prompt: str, model: str | None = None) -> AsyncIterator[str]:
+    """Token-by-token stream from a local Ollama model. Cancelling the
+    consuming task aborts the HTTP request mid-stream (pylair_ollama owns
+    the httpx lifecycle), so a cancelled chat releases its connection."""
+    async for delta in ollama_chat(
+        model or DEFAULT_MODEL, [Message(role="user", content=prompt)]
+    ):
+        yield delta
+
+
+@expose
+async def demo_stream(tokens: int = 80, delay_ms: int = 60) -> AsyncIterator[str]:
+    """Deterministic token-ish stream when no Ollama is present — same
+    streaming and cancellation path as `chat`, exercisable on clean CI
+    machines that have no model server."""
+    for i in range(tokens):
+        yield f"token-{i} "
+        await asyncio.sleep(delay_ms / 1000)
+
+
+@expose
+def crash() -> None:
+    """Kill the runtime process on purpose. The supervisor must detect the
+    exit, restart the runtime, and the UI watches the state transitions."""
+    os._exit(3)
+
+
+# ---- exercised by the packaged webview self-test (acceptance job) ----
+
+
+@expose
+async def add(a: int, b: int) -> int:
+    return a + b
+
+
+@expose
+async def count(n: int = 5) -> AsyncIterator[int]:
+    for i in range(n):
+        yield i
+        await asyncio.sleep(0.2)

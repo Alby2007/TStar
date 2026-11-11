@@ -1,0 +1,19 @@
+[project]
+name = "reference-app"
+version = "0.1.0"
+description = "Pylair reference app — local-AI chat over the bridge"
+requires-python = ">=3.12"
+dependencies = ["pylair", "pylair-ollama"]
+
+# In-repo path deps: this example lives inside the pylair checkout and
+# tracks the workspace packages. A scaffolded app uses published versions.
+[tool.uv.sources]
+pylair = { path = "../../python/pylair" }
+pylair-ollama = { path = "../../integrations/ollama" }
+
+[tool.pylair]
+app-module = "backend.app"
+source = "backend"
+requirements = "requirements.txt"
+python-version = "3.12"
+# prune = ["extra/deny-glob"]   # extend the default bundle deny-list

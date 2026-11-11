@@ -1,0 +1,5 @@
+# Locked dependencies bundled into the installer by `pylair build`.
+# In-repo paths — uv.lock (via `uv export --frozen`) is authoritative;
+# this file is only the no-lock fallback for `pylair build`.
+../../python/pylair
+../../integrations/ollama
