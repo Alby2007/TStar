@@ -192,18 +192,35 @@ jobs:
   # installer bundling Python, install/extract on a clean machine, and call
   # the app's Python through the bundled interpreter — no system Python.
   acceptance:
-    name: acceptance (${{ matrix.os }})
+    name: acceptance (${{ matrix.os }}, ${{ matrix.app }})
     runs-on: ${{ matrix.os }}
+    env:
+      APP_DIR: ${{ matrix.app == 'reference' && 'examples/reference-app' || 'app-under-test' }}
+      APP_BIN: ${{ matrix.app == 'reference' && 'reference-app' || 'app-under-test' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             bundles: "appimage,deb"
+            app: scaffold
           - os: windows-latest
             bundles: "nsis"
+            app: scaffold
           - os: macos-latest
             bundles: "app,dmg"
+            app: scaffold
+          # The M6 exit test: the reference app installs and runs on clean
+          # machines with no Python on all three OSes.
+          - os: ubuntu-22.04
+            bundles: "appimage,deb"
+            app: reference
+          - os: windows-latest
+            bundles: "nsis"
+            app: reference
+          - os: macos-latest
+            bundles: "app,dmg"
+            app: reference
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -230,33 +247,35 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -r build
       - name: Scaffold app (local dep wiring)
+        if: matrix.app == 'scaffold'
         run: |
           node packages/create-pylair/dist/index.js app-under-test --local "$PWD"
           # The app lives inside this repo's checkout; without its own
           # workspace root pnpm installs the monorepo instead of the app.
           echo "packages: []" > app-under-test/pnpm-workspace.yaml
       # After scaffolding: restoring the cache earlier creates
-      # app-under-test/src-tauri/target, and the scaffolder rightly refuses a
+      # src-tauri/target, and the scaffolder rightly refuses a
       # non-empty target directory.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: app-under-test/src-tauri
+          workspaces: ${{ env.APP_DIR }}/src-tauri
       # A native wheel must load inside the packaged app: AppRun's
       # LD_LIBRARY_PATH used to leak AppDir libstdc++/libssl into Python.
       - name: Add a native-wheel dependency (numpy)
+        if: matrix.app == 'scaffold'
         working-directory: app-under-test
         run: |
           uv add numpy
           printf '\nimport numpy  # native wheel must load inside the bundle\n' >> backend/app.py
       - name: Install app deps
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         run: pnpm install --no-frozen-lockfile && uv sync
       - name: pylair build (stages interpreter, env, prunes, tauri build)
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         run: pnpm exec pylair build --bundles ${{ matrix.bundles }}
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
           dpkg -x "$DEB" /tmp/approot
@@ -264,14 +283,14 @@ jobs:
           # Bare ubuntu:22.04 has NO python — the binary is a GUI binary so it
           # needs its linked system libs, but --self-test exits before the
           # Tauri loop/GTK init. It must spawn the bundled interpreter.
-          docker run --rm -v /tmp/approot:/r:ro ubuntu:22.04 bash -c '
+          docker run --rm -e APP_BIN="$APP_BIN" -v /tmp/approot:/r:ro ubuntu:22.04 bash -c '
             set -e; export DEBIAN_FRONTEND=noninteractive
             for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates >/dev/null
-            /r/usr/bin/app-under-test --self-test'
+            /r/usr/bin/$APP_BIN --self-test'
       - name: Self-test installed app (Linux GUI path, deb + AppImage)
         if: runner.os == 'Linux'
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
           dpkg -x "$DEB" /tmp/approot
@@ -284,12 +303,12 @@ jobs:
           # AppImage is launched via AppRun, its real entry point: it sets the
           # library paths for the bundled WebKit (running the inner binary
           # directly fails to find WebKitNetworkProcess).
-          docker run --rm -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
+          docker run --rm -e APP_BIN="$APP_BIN" -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
             set -e; export DEBIAN_FRONTEND=noninteractive
             for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates xvfb libfuse2 >/dev/null
             echo "── deb layout (resource_dir path)"
-            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a /r/usr/bin/app-under-test
+            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a /r/usr/bin/$APP_BIN
             echo "── appimage layout"
             cd /tmp && cp /app.AppImage . && chmod +x app.AppImage
             ./app.AppImage --appimage-extract >/dev/null
@@ -298,29 +317,29 @@ jobs:
             # bridge (Tauri ACL, event routing): typed call, ordered stream,
             # cancellation. Exit code 0 only if all pass.
             echo "── webview self-test: deb"
-            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/app-under-test
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/$APP_BIN
             echo "── webview self-test: appimage"
             PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun'
       - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         run: |
           APP=$(find src-tauri/target/release/bundle/macos -name '*.app' | head -1)
-          env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/app-under-test" --self-test
-          env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/app-under-test"
+          env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/$APP_BIN" --self-test
+          env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/$APP_BIN"
           # Webview self-test through the real bridge, run from outside the checkout.
-          cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/app-under-test/$APP/Contents/MacOS/app-under-test"
+          cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN"
       - name: Self-test installed app (Windows)
         if: runner.os == 'Windows'
-        working-directory: app-under-test
+        working-directory: ${{ env.APP_DIR }}
         shell: pwsh
         run: |
           $i = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
           Start-Process -FilePath $i.FullName -ArgumentList '/S' -Wait
           $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles" `
-                -Recurse -Filter 'app-under-test.exe' -Depth 3 -ErrorAction SilentlyContinue |
+                -Recurse -Filter "$env:APP_BIN.exe" -Depth 3 -ErrorAction SilentlyContinue |
                 Select-Object -First 1
-          if (-not $exe) { Write-Error 'installed app-under-test.exe not found'; exit 1 }
+          if (-not $exe) { Write-Error "installed $env:APP_BIN.exe not found"; exit 1 }
           & $exe.FullName --self-test
           if ($LASTEXITCODE -ne 0) { Write-Error "self-test exit $LASTEXITCODE"; exit 1 }
           # Webview self-test through the real bridge (ACL, events, cancel).
