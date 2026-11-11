@@ -78,9 +78,30 @@ wire. The runtime now encodes:
 
 **Param coercion** (`coerce_kwargs`): before dispatch, each incoming
 kwarg is coerced by its annotation — dict → dataclass instance,
-`list[T]`/`dict[K,V]` recurse, `Optional` unwraps. Failures surface as
-`INTERNAL` with the real exception, not silent dict-instead-of-object
-bugs.
+`list[T]`/`dict[K,V]` recurse, `Optional`/`Union` tries arms in order,
+enums rebuild by value, ISO strings become `datetime`. Two honest
+modes:
+
+- **Construction failures** (missing dataclass field, unconstructable
+  value) raise `InvalidParams` → wire `INVALID_PARAMS` — a caller bug,
+  reported before any task is spawned.
+- **Unmapped annotations** (anything without a wire encoding) pass the
+  raw JSON value through — Python is duck-typed and the function may
+  still handle it; failures there surface as `INTERNAL` as usual.
+  Scalar coercion (e.g. `"5"` → `int`) is *not* attempted.
+
+## Limits to know
+
+- **NaN/Infinity are not valid JSON.** `json.dumps(allow_nan=False)`
+  rejects them at encode time — a model returning a NaN score fails
+  that one call with `INTERNAL`, never the runtime (protocol §2). Use
+  `Optional[float]` and return `None` for missing scores.
+- **Python `int` is unbounded; JS `number` is not.** Values beyond
+  ±2^53 lose precision on the wire (JSON has no bigint). If your API
+  moves exact big integers (ids, counts), annotate `str` and format in
+  Python. `{"$bigint"}` tagging is tracked in `docs/ideas.md`.
+- Non-serializable results (numpy values, torch tensors, open objects)
+  fail the *call* with `INTERNAL` — serialize to list/dict/bytes first.
 
 ## Emitted stubs
 

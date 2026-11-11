@@ -16,11 +16,10 @@ from this file — promote to a milestone or a decision doc first.
   lazily respawn on next call. The API is already reserved; per-call
   workers reload everything — seconds with torch — so this is what
   makes `isolated=True` usable for AI apps.
-- Answer `pong` from the runtime's reader THREAD, not the asyncio loop:
-  today a healthy runtime is killed when user code blocks the loop inside
-  an `async def` (common: sync model call awaited directly). Thread-side
-  pongs prove the host<->runtime channel is alive; report event-loop lag
-  separately as a diagnostic metric instead of a kill signal.
-  (Review 2026-02 — tracked, not M1-blocking.)
-- Event-loop-lag diagnostic: heartbeat timestamp in `pong` params so the
-  host can warn "loop busy" without restarting a healthy runtime.
+- `{"$bigint": "<decimal>"}` tagging for Python ints beyond ±2^53 —
+  emitted as `bigint` in generated TS. Documented limitation for now
+  (docs/codegen.md): annotate `str` for exact big integers.
+- Richer loop diagnostics: event-loop lag is currently a stderr line
+  (`event loop lag Ns`, forwarded to the UI). Could become a typed
+  notification + a heartbeat timestamp in `pong` params so the host can
+  distinguish "loop busy" from "process hung" in the UI.

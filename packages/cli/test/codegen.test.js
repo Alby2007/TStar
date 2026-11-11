@@ -144,6 +144,26 @@ test("snake_case names stay the wire name", () => {
   assert.match(ts, /call\("make_thing"/);
 });
 
+// ---- golden: the emitted file is reviewable in-repo ------------------------
+
+test("golden: emit(fixture) matches committed testapp stubs", () => {
+  const manifest = JSON.parse(
+    readFileSync(
+      new URL("../golden/testapp.manifest.json", import.meta.url),
+      "utf-8",
+    ),
+  );
+  const golden = readFileSync(
+    new URL("../golden/testapp.api.generated.ts", import.meta.url),
+    "utf-8",
+  );
+  assert.equal(
+    emit(manifest, "testapp"),
+    golden,
+    "emitter drift — regenerate golden: see golden/README",
+  );
+});
+
 // ---- manifest loading (real python subprocess) ----------------------------
 
 const hasPython = (() => {

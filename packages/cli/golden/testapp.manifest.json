@@ -1,0 +1,393 @@
+{
+    "version": 1,
+    "functions": [
+        {
+            "name": "add",
+            "kind": "sync",
+            "doc": null,
+            "params": [
+                {
+                    "name": "a",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                },
+                {
+                    "name": "b",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "int"
+            }
+        },
+        {
+            "name": "bad_stream",
+            "kind": "generator",
+            "doc": "A stream whose second chunk can't be serialized.",
+            "params": [],
+            "returns": {
+                "type": "int"
+            }
+        },
+        {
+            "name": "counter",
+            "kind": "generator",
+            "doc": null,
+            "params": [
+                {
+                    "name": "n",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "any"
+            }
+        },
+        {
+            "name": "echo_later",
+            "kind": "async",
+            "doc": null,
+            "params": [
+                {
+                    "name": "text",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "str"
+                    }
+                },
+                {
+                    "name": "delay",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": false,
+                    "schema": {
+                        "type": "float"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "infinite",
+            "kind": "generator",
+            "doc": null,
+            "params": [],
+            "returns": {
+                "type": "any"
+            }
+        },
+        {
+            "name": "isolated_add",
+            "kind": "isolated",
+            "doc": null,
+            "params": [
+                {
+                    "name": "a",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                },
+                {
+                    "name": "b",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "int"
+            }
+        },
+        {
+            "name": "isolated_print",
+            "kind": "isolated",
+            "doc": null,
+            "params": [
+                {
+                    "name": "text",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "str"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "isolated_sleep",
+            "kind": "isolated",
+            "doc": null,
+            "params": [
+                {
+                    "name": "seconds",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "float"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "move",
+            "kind": "sync",
+            "doc": "Translate a point; dataclass in, dataclass out.",
+            "params": [
+                {
+                    "name": "p",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "dataclass",
+                        "name": "Point",
+                        "fields": [
+                            {
+                                "name": "x",
+                                "required": true,
+                                "schema": {
+                                    "type": "float"
+                                }
+                            },
+                            {
+                                "name": "y",
+                                "required": true,
+                                "schema": {
+                                    "type": "float"
+                                }
+                            },
+                            {
+                                "name": "label",
+                                "required": false,
+                                "schema": {
+                                    "type": "str"
+                                }
+                            }
+                        ]
+                    }
+                },
+                {
+                    "name": "dx",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": false,
+                    "schema": {
+                        "type": "float"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "dataclass",
+                "name": "Point",
+                "fields": [
+                    {
+                        "name": "x",
+                        "required": true,
+                        "schema": {
+                            "type": "float"
+                        }
+                    },
+                    {
+                        "name": "y",
+                        "required": true,
+                        "schema": {
+                            "type": "float"
+                        }
+                    },
+                    {
+                        "name": "label",
+                        "required": false,
+                        "schema": {
+                            "type": "str"
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "name": "nan_score",
+            "kind": "sync",
+            "doc": "Returns NaN \u2014 must fail this one call, never the runtime (\u00a72).",
+            "params": [],
+            "returns": {
+                "type": "float"
+            }
+        },
+        {
+            "name": "numbers",
+            "kind": "generator",
+            "doc": null,
+            "params": [
+                {
+                    "name": "n",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "int"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "int"
+            }
+        },
+        {
+            "name": "opaque_result",
+            "kind": "sync",
+            "doc": "A non-serializable result (stands in for numpy/tensor values).",
+            "params": [],
+            "returns": {
+                "type": "any"
+            }
+        },
+        {
+            "name": "orphan_maker",
+            "kind": "isolated",
+            "doc": "Spawn a grandchild that IGNORES SIGTERM, then sleep.\n\nCancelling must kill the whole process group \u2014 the grandchild surviving\nis the leaked-orphan failure mode.",
+            "params": [
+                {
+                    "name": "pidfile",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "str"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "pick",
+            "kind": "sync",
+            "doc": null,
+            "params": [
+                {
+                    "name": "c",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "enum",
+                        "values": [
+                            "red",
+                            "blue"
+                        ]
+                    }
+                },
+                {
+                    "name": "fallback",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": false,
+                    "schema": {
+                        "type": "union",
+                        "opts": [
+                            {
+                                "type": "str"
+                            },
+                            {
+                                "type": "none"
+                            }
+                        ]
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "print_then_answer",
+            "kind": "sync",
+            "doc": null,
+            "params": [
+                {
+                    "name": "text",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "str"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "roundtrip",
+            "kind": "sync",
+            "doc": null,
+            "params": [
+                {
+                    "name": "data",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "bytes"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "bytes"
+            }
+        },
+        {
+            "name": "sleep_forever",
+            "kind": "async",
+            "doc": null,
+            "params": [],
+            "returns": {
+                "type": "none"
+            }
+        },
+        {
+            "name": "sync_sleep",
+            "kind": "sync",
+            "doc": null,
+            "params": [
+                {
+                    "name": "seconds",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "float"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
+            "name": "wedge_the_loop",
+            "kind": "async",
+            "doc": null,
+            "params": [],
+            "returns": {
+                "type": "none"
+            }
+        }
+    ]
+}

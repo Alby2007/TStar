@@ -167,6 +167,154 @@ def test_codegen_manifest_bad_module():
     assert "error" in _json.loads(out.stdout)
 
 
+# ---- wire hardening (review: one bad call must never kill the runtime) -----
+
+
+def test_nan_result_is_internal_runtime_survives(runtime):
+    runtime.recv()  # hello
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {"fn": "nan_score", "task": 1, "input": {}},
+        }
+    )
+    resp = runtime.recv()
+    assert resp["error"]["code"] == -32000  # INTERNAL
+    assert "serializ" in resp["error"]["message"].lower()
+    # The runtime is still alive and answering calls.
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "call",
+            "params": {"fn": "add", "task": 2, "input": {"a": 1, "b": 2}},
+        }
+    )
+    assert runtime.recv()["result"] == 3
+
+
+def test_opaque_result_is_internal(runtime):
+    runtime.recv()
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {"fn": "opaque_result", "task": 1, "input": {}},
+        }
+    )
+    resp = runtime.recv()
+    assert resp["error"]["code"] == -32000
+    assert "serializ" in resp["error"]["message"].lower()
+
+
+def test_unserializable_stream_chunk_fails_only_that_task(runtime):
+    runtime.recv()
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "call",
+            "params": {"fn": "bad_stream", "task": 9, "input": {}},
+        }
+    )
+    chunk = runtime.recv_until(lambda m: m.get("method") == "stream.chunk")
+    assert chunk["params"]["value"] == 1
+    terminal = runtime.recv_until(lambda m: m.get("id") == 9)
+    assert terminal["error"]["code"] == -32000
+
+
+def test_coercion_failure_is_invalid_params(runtime):
+    runtime.recv()
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {
+                "fn": "move",
+                "task": 1,
+                "input": {"p": {"x": 1.0}},  # missing required y
+            },
+        }
+    )
+    resp = runtime.recv()
+    assert resp["error"]["code"] == -32602  # INVALID_PARAMS
+    assert "y" in resp["error"]["message"]
+
+
+def test_invalid_b64_tag_is_a_call_error_not_death(runtime):
+    runtime.recv()
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {
+                "fn": "roundtrip",
+                "task": 1,
+                "input": {"data": {"$b64": "!!!not-base64!!!"}},
+            },
+        }
+    )
+    resp = runtime.recv()
+    assert resp["error"]["code"] == -32000  # INTERNAL from the function
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "call",
+            "params": {"fn": "add", "task": 2, "input": {"a": 1, "b": 1}},
+        }
+    )
+    assert runtime.recv()["result"] == 2
+
+
+def test_pong_survives_a_wedged_event_loop(runtime):
+    """Reader-thread pongs: a starved loop must not fail liveness (§5)."""
+    runtime.recv()
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {"fn": "wedge_the_loop", "task": 1, "input": {}},
+        }
+    )
+    import time as _t
+
+    _t.sleep(0.3)  # let the wedge call reach time.sleep(3600)
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {"seq": 42},
+        }
+    )
+    pong = runtime.recv_until(lambda m: m.get("method") == "pong", timeout=5.0)
+    assert pong["params"]["seq"] == 42
+    runtime.kill()  # the wedge call can never return
+
+
+def test_coerce_kwargs_strict_and_string_hints():
+    @dataclass
+    class StrRef:
+        # Quoted annotation -> f.type is a string; get_type_hints must
+        # resolve it or the nested dataclass never rebuilds.
+        p: "testapp.Point"
+
+    # construction failure raises InvalidParams (wire INVALID_PARAMS)
+    with pytest.raises(_json.InvalidParams):
+        _json.coerce_kwargs(testapp.move, {"p": {"x": 1.0}})
+
+    # string-annotated field resolves to the real class and coerces
+    out = _json.coerce(StrRef, {"p": {"x": 1.0, "y": 2.0}})
+    assert out.p == testapp.Point(1.0, 2.0)
+
+
 # ---- end-to-end through a real runtime -------------------------------------
 
 

@@ -9,7 +9,6 @@ exit (protocol §6).
 from __future__ import annotations
 
 import asyncio
-import json
 import queue
 import sys
 import threading
@@ -39,19 +38,25 @@ class Server:
         self._stopping = False
 
     def _send(self, msg: dict) -> None:
-        self._out.put(msg)
+        # Serialize HERE, on the caller's thread (the event loop for task
+        # results): a TypeError/ValueError can then be turned into an
+        # INTERNAL response for that one call. The writer thread only ever
+        # sees valid bytes and must never die (protocol §2).
+        self._out.put(_json.dumps(msg).encode())
 
     # ---- io threads --------------------------------------------------------
 
     def _writer(self) -> None:
         while True:
-            msg = self._out.get()
-            if msg is _STOP:
+            body = self._out.get()
+            if body is _STOP:
                 return
             try:
-                self._channel.write_frame(msg)
+                self._channel.write_frame(body)
             except OSError:
                 return  # frame fd dead — host is gone
+            except Exception as e:  # noqa: BLE001 - writer must never die
+                _log(f"writer dropped a frame: {e!r}")
 
     def _reader(self, loop: asyncio.AbstractEventLoop) -> None:
         try:
@@ -62,11 +67,23 @@ class Server:
                     return
                 try:
                     msg = _json.loads(body)
-                except json.JSONDecodeError:
+                except Exception:  # noqa: BLE001 - any decode failure is PARSE_ERROR
                     msg = {
                         "__parse_error__": True,
                         "raw": body[:200].decode(errors="replace"),
                     }
+                if (
+                    isinstance(msg, dict)
+                    and not msg.get("__parse_error__")
+                    and msg.get("method") == "ping"
+                ):
+                    # Pongs are answered off the event loop (protocol §5):
+                    # blocking code inside an `async def` must not starve
+                    # liveness. Event-loop lag is reported separately.
+                    params = msg.get("params")
+                    seq = params.get("seq") if isinstance(params, dict) else None
+                    self._send(proto.notification("pong", {"seq": seq}))
+                    continue
                 loop.call_soon_threadsafe(self._in.put_nowait, msg)
         except FrameTooLarge as e:
             _log(f"protocol violation: {e} — treating host as gone")
@@ -111,6 +128,8 @@ class Server:
         rid, method, params = msg["id"], msg["method"], msg.get("params") or {}
         try:
             if method == "ping":
+                # Unreachable — the reader thread answers pings (§5). Kept
+                # defensively so a direct dispatch still gets a pong.
                 self._send(proto.notification("pong", {"seq": params.get("seq")}))
             elif method == "call":
                 await self._call(rid, params)
@@ -168,6 +187,11 @@ class Server:
                 )
             )
             return
+        try:
+            input = _json.coerce_kwargs(ex.fn, input)
+        except _json.InvalidParams as e:
+            self._send(proto.error_response(rid, proto.INVALID_PARAMS, str(e)))
+            return
         await self._tasks.start(task_id, rid, fn_name, ex.kind, ex.fn, input)
         # Handlers emit the response: value calls on completion, stream
         # calls at the terminal message (protocol §3.1).
@@ -188,6 +212,23 @@ class Server:
             if t.asyncio_task is not None:
                 t.asyncio_task.cancel()
 
+    async def _lag_monitor(self) -> None:
+        """Diagnostic: report event-loop lag on stderr (forwarded to the
+        UI). Blocking code inside an `async def` no longer fails
+        liveness, so this is how a wedged loop stays visible (§5)."""
+        t = asyncio.get_running_loop().time()
+        while True:
+            await asyncio.sleep(1.0)
+            now = asyncio.get_running_loop().time()
+            lag = now - t - 1.0
+            t = now
+            if lag > 1.0:
+                _log(
+                    f"event loop lag {lag:.2f}s — blocking code inside "
+                    "an async def starves calls (it no longer fails "
+                    "liveness; see docs/cancellation.md)"
+                )
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         writer = threading.Thread(target=self._writer, name="tp-writer", daemon=True)
@@ -197,6 +238,7 @@ class Server:
         writer.start()
         self._send(proto.hello(exposes_manifest()))
         reader.start()
+        lag = asyncio.create_task(self._lag_monitor())
 
         while not self._stopping:
             msg = await self._in.get()
@@ -205,6 +247,11 @@ class Server:
                 break
             await self._handle(msg)
 
+        lag.cancel()
+        try:
+            await lag
+        except asyncio.CancelledError:
+            pass
         await self._drain(grace_s=3.0)
         self._out.put(_STOP)
         self._channel.close_write()

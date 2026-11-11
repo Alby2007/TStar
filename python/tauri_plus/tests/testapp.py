@@ -138,6 +138,25 @@ async def numbers(n: int) -> AsyncGenerator[int, None]:
 
 
 @expose
+def nan_score() -> float:
+    """Returns NaN — must fail this one call, never the runtime (§2)."""
+    return float("nan")
+
+
+@expose
+def opaque_result() -> object:
+    """A non-serializable result (stands in for numpy/tensor values)."""
+    return object()
+
+
+@expose
+async def bad_stream() -> AsyncGenerator[int, None]:
+    """A stream whose second chunk can't be serialized."""
+    yield 1
+    yield object()  # type: ignore[misc]
+
+
+@expose
 async def wedge_the_loop() -> None:
     # Starves the event loop in native code — the fault-injection case for
     # ping/pong liveness. Never returns on its own.

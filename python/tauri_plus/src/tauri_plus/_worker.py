@@ -18,6 +18,7 @@ import sys
 import traceback
 
 from tauri_plus import _json
+from tauri_plus import _protocol as proto
 
 
 def main() -> int:
@@ -43,6 +44,16 @@ def main() -> int:
         input = _json.loads(raw) if raw else {}
         result = fn(**_json.coerce_kwargs(fn, input))
         payload = {"result": result}
+    except _json.InvalidParams as e:
+        # Caller sent values the signature can't hold — a params error,
+        # not a worker failure; the parent maps `code` through.
+        payload = {
+            "error": {
+                "code": proto.INVALID_PARAMS,
+                "message": str(e),
+                "data": {"type": "InvalidParams"},
+            }
+        }
     except BaseException as e:  # noqa: BLE001 - boundary: report everything
         payload = {
             "error": {

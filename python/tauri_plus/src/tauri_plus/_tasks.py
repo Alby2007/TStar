@@ -73,7 +73,7 @@ class TaskRegistry:
 
     async def _run_async(self, task: Task, fn: Callable[..., Any], input: dict) -> None:
         try:
-            result = await fn(**_json.coerce_kwargs(fn, input))
+            result = await fn(**input)  # input coerced at dispatch (_call)
             self._finish(task, proto.response(task.call_id, result))
         except asyncio.CancelledError:
             self._finish(
@@ -93,9 +93,7 @@ class TaskRegistry:
     async def _run_sync(self, task: Task, fn: Callable[..., Any], input: dict) -> None:
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(
-                None, lambda: fn(**_json.coerce_kwargs(fn, input))
-            )
+            result = await loop.run_in_executor(None, lambda: fn(**input))
             self._finish(task, proto.response(task.call_id, result))
         except asyncio.CancelledError:
             # Inline sync can't be interrupted — the executor thread keeps
@@ -118,7 +116,7 @@ class TaskRegistry:
     async def _pump_stream(
         self, task: Task, fn: Callable[..., Any], input: dict
     ) -> None:
-        agen: AsyncGenerator = fn(**_json.coerce_kwargs(fn, input))
+        agen: AsyncGenerator = fn(**input)
         try:
             while True:
                 # Pull-based flow control: only advance while we hold credit.
@@ -194,7 +192,7 @@ class TaskRegistry:
                     task,
                     proto.error_response(
                         task.call_id,
-                        proto.INTERNAL,
+                        payload["error"].get("code", proto.INTERNAL),
                         payload["error"]["message"],
                         payload["error"].get("data"),
                     ),
@@ -302,7 +300,19 @@ class TaskRegistry:
         if task.done:
             return  # a cancelled task's late result is discarded
         task.done = True
-        self._send(terminal)
+        try:
+            self._send(terminal)  # serializes on the event loop
+        except (TypeError, ValueError) as e:
+            # Result not wire-serializable (numpy/tensor object, NaN) —
+            # fail this one call, never the runtime (protocol §2).
+            self._send(
+                proto.error_response(
+                    task.call_id,
+                    proto.INTERNAL,
+                    f"result is not wire-serializable: {e}",
+                    {"type": "SerializationError"},
+                )
+            )
         self._tasks.pop(task.id, None)
 
 

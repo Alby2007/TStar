@@ -10,8 +10,13 @@ actually round-trip:
   Enum -> its value; set/frozenset -> list
 
 Param coercion (coerce_kwargs) reconstructs annotated types on the call
-path: dict -> dataclass, containers recurse. Anything unannotated or
-unmatched passes through untouched.
+path: dict -> dataclass, containers recurse. Construction failures raise
+InvalidParams (wire INVALID_PARAMS); annotations that don't map to a
+reconstructable type pass the wire value through untouched.
+
+NaN/Infinity are rejected at encode time (allow_nan=False) — a bare NaN
+token would be a malformed frame to the Rust host, and a model returning
+a NaN score must fail one call, never the runtime (protocol §2).
 """
 
 from __future__ import annotations
@@ -27,6 +32,15 @@ import typing
 from typing import Any
 
 _B64_TAG = "$b64"
+
+
+class InvalidParams(Exception):
+    """Incoming params couldn't be coerced by annotation.
+
+    Maps to INVALID_PARAMS on the wire (protocol §8) — the host sent a
+    value the annotated signature can't hold (e.g. a dataclass field
+    missing), which is a caller error, not an internal failure.
+    """
 
 
 def _default(obj: Any) -> Any:
@@ -45,12 +59,18 @@ def _default(obj: Any) -> Any:
 
 def _object_hook(d: dict) -> Any:
     if set(d) == {_B64_TAG} and isinstance(d[_B64_TAG], str):
-        return base64.b64decode(d[_B64_TAG])
+        try:
+            return base64.b64decode(d[_B64_TAG], validate=True)
+        except Exception:  # noqa: BLE001 - invalid tag stays a plain object
+            return d
     return d
 
 
 def dumps(obj: Any) -> str:
-    return json.dumps(obj, default=_default, separators=(",", ":"))
+    # allow_nan=False: a bare NaN/Infinity token is invalid JSON to the
+    # Rust host (serde_json rejects it as a malformed frame) — surface
+    # it as a serialization error for this call instead.
+    return json.dumps(obj, default=_default, separators=(",", ":"), allow_nan=False)
 
 
 def loads(raw: str | bytes) -> Any:
@@ -82,8 +102,16 @@ def coerce(annotation: Any, value: Any) -> Any:
     if inspect.isclass(annotation) and dataclasses.is_dataclass(annotation):
         if isinstance(value, dict):
             fields = {f.name: f for f in dataclasses.fields(annotation)}
+            try:
+                # Under `from __future__ import annotations` f.type is a
+                # string — resolved hints are required for nested types.
+                hints = typing.get_type_hints(annotation)
+            except Exception:  # noqa: BLE001 - fall back to raw field types
+                hints = {}
             kwargs = {
-                k: coerce(fields[k].type, v) for k, v in value.items() if k in fields
+                k: coerce(hints.get(k, fields[k].type), v)
+                for k, v in value.items()
+                if k in fields
             }
             return annotation(**kwargs)
         return value
@@ -145,6 +173,8 @@ def coerce_kwargs(fn: Any, input: dict) -> dict:
         ann = hints.get(name, param.annotation)
         try:
             out[name] = coerce(ann, out[name])
-        except Exception:  # noqa: BLE001,S110 - leave wire value on failure
-            pass
+        except Exception as e:
+            # A construction failure must not silently deliver a dict
+            # where the function expects an object (docs/codegen.md).
+            raise InvalidParams(f"param '{name}': {e}") from e
     return out

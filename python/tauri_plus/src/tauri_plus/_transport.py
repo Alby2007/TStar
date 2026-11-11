@@ -13,8 +13,6 @@ import os
 import struct
 import sys
 
-from tauri_plus import _json
-
 MAX_FRAME = int(os.environ.get("TAURI_PLUS_MAX_FRAME", str(16 * 1024 * 1024)))
 _LEN = struct.Struct(">I")
 
@@ -36,8 +34,13 @@ class FrameChannel:
             raise FrameTooLarge(n)
         return self._read_exactly(n)
 
-    def write_frame(self, obj: dict) -> None:
-        body = _json.dumps(obj).encode()
+    def write_frame(self, body: bytes) -> None:
+        """Write an already-serialized frame body.
+
+        Serialization happens on the caller's thread (_json.dumps in
+        Server._send) so a TypeError/ValueError can become INTERNAL for
+        that one call — a dead writer would kill the runtime (§2).
+        """
         self._w.write(_LEN.pack(len(body)) + body)
 
     def _read_exactly(self, n: int) -> bytes | None:

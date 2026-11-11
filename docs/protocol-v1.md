@@ -62,8 +62,14 @@ hang or OOM the host.
   `datetime`/`date`/`time` as ISO 8601 strings, `Enum` as its value, and
   `set` as a list. Incoming params are coerced back by annotation — a
   dataclass-annotated parameter receives an instance, not a dict.
-  Anything unserializable raises `TypeError` at encode time, surfacing
-  as `INTERNAL` on the calling task.
+- **Serialization happens on the event loop**, before a message reaches
+  the writer thread. A result that can't serialize (numpy/tensor
+  objects, `NaN`/`Infinity` — `allow_nan=False` since bare `NaN` is not
+  valid JSON and serde_json would reject the frame) fails *that one
+  call* with `INTERNAL`; the writer thread sees only valid bytes and
+  can never die silently.
+- Param coercion failures are caller errors: `INVALID_PARAMS`, not a
+  function exception (docs/codegen.md).
 
 ## 3. Message shapes
 
@@ -172,19 +178,26 @@ deadlock) never crashes, so it never restarts.
 
 - The host sends `ping {seq}` every `PING_INTERVAL` (default 5s).
   The runtime answers with a `pong {seq}` notification within
-  `PING_TIMEOUT` (default 10s) — the reply is emitted by the event
-  loop's frame handler, so it proves the loop is alive.
+  `PING_TIMEOUT` (default 10s).
+- **Pongs are emitted by the reader thread, not the event loop.** A
+  pong therefore proves the frame pipeline (and process) is alive —
+  *not* that asyncio is making progress. Blocking code inside an
+  `async def` (a very common AI-app pattern: model calls inside an
+  async handler) starves the loop but must not fail liveness, or a
+  healthy runtime would be killed on its first real workload.
+- Event-loop lag is reported **separately as a diagnostic**: the
+  runtime logs `event loop lag Ns` lines on stderr (forwarded to the
+  UI via `tauri-plus://stderr`) when the loop falls >1s behind. Calls
+  queued behind a busy loop simply wait — same as any overloaded
+  async service.
 - A missed deadline → state `unresponsive` (event emitted). The host
   keeps pinging. `unresponsive` is entered **only after a real miss** —
   an in-flight ping below its deadline does not flap the UI state.
 - `MAX_MISSES` consecutive misses (default 3) → treated as `crashed`:
-  killed and the restart policy applies.
-- **Known limit:** a C extension holding the GIL starves the frame loop
-  too, so `pong` can be late during legitimate long native calls. That
-  is exactly why the spec pushes CPU-heavy work to `isolated=True`
-  workers — whose liveness is process exit, not pong. `unresponsive`
-  is a warning state so the UI can show "backend busy/stuck" before the
-  supervisor gives up.
+  killed and the restart policy applies. Since pongs come from the
+  reader thread, missing them means the *process* is truly hung
+  (deadlocked native code, interpreter fault) — the correct thing to
+  kill.
 - `ping`/`pong` carries no data; `seq` matching just guards staleness.
 
 ## 6. Orphan prevention
