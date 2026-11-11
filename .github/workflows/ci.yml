@@ -270,7 +270,10 @@ jobs:
           for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
           # The GUI variant runs the REAL app under xvfb and makes the call
           # through app.path().resource_dir() — the code path users hit.
-          # Checked for both deb and AppImage layouts (they mount differently).
+          # Checked for both deb and AppImage layouts (they mount differently). The
+          # AppImage is launched via AppRun, its real entry point: it sets the
+          # library paths for the bundled WebKit (running the inner binary
+          # directly fails to find WebKitNetworkProcess).
           docker run --rm -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
             set -e; export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
@@ -280,14 +283,14 @@ jobs:
             echo "── appimage layout"
             cd /tmp && cp /app.AppImage . && chmod +x app.AppImage
             ./app.AppImage --appimage-extract >/dev/null
-            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a ./squashfs-root/usr/bin/app-under-test
+            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a ./squashfs-root/AppRun
             # Webview self-test: the generated frontend drives the REAL
             # bridge (Tauri ACL, event routing): typed call, ordered stream,
             # cancellation. Exit code 0 only if all pass.
             echo "── webview self-test: deb"
             PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/app-under-test
             echo "── webview self-test: appimage"
-            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/usr/bin/app-under-test'
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun'
       - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
         working-directory: app-under-test
