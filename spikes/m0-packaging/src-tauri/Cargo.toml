@@ -1,0 +1,24 @@
+[package]
+name = "m0-packaging-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+# Standalone workspace: keeps the heavy Tauri dep tree out of the root
+# `cargo build` path (root CI stays fast; this is built explicitly by the
+# M0 job via `pnpm tauri build`).
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# tauri's default feature set is enabled transitively; this stub exists so
+# `cargo tauri` feature plumbing has a place to land if needed later.
+default = []

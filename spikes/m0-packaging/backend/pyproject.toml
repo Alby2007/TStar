@@ -1,0 +1,7 @@
+[project]
+name = "m0-spike-backend"
+version = "0.0.0"
+requires-python = ">=3.12"
+# numpy is the spike's native-wheel canary: if the bundled env imports it,
+# the wheel-selection + relocation story works end to end.
+dependencies = ["numpy>=2.1"]

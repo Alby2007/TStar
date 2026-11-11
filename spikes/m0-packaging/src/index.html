@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>M0 Packaging Spike</title>
+    <style>
+      body { font-family: ui-monospace, Menlo, monospace; margin: 2rem; background: #111; color: #eee; }
+      button { padding: 0.5rem 1rem; font: inherit; cursor: pointer; }
+      pre { background: #1c1c1c; border: 1px solid #333; padding: 1rem; overflow: auto; min-height: 8rem; }
+      #status { margin: 0.5rem 0; }
+      .ok { color: #6f6; } .err { color: #f66; }
+    </style>
+  </head>
+  <body>
+    <h1>M0 Packaging Spike</h1>
+    <p>Round-trips one length-prefixed JSON frame through the bundled Python interpreter.</p>
+    <button id="ping">ping python</button>
+    <div id="status"></div>
+    <pre id="out">—</pre>
+    <script>
+      const out = document.getElementById("out");
+      const status = document.getElementById("status");
+      document.getElementById("ping").addEventListener("click", async () => {
+        status.className = ""; status.textContent = "calling…";
+        const t0 = performance.now();
+        try {
+          const res = await window.__TAURI__.core.invoke("ping_python", { message: "hello from the webview" });
+          const ms = (performance.now() - t0).toFixed(0);
+          status.className = "ok"; status.textContent = `ok in ${ms} ms`;
+          out.textContent = JSON.stringify(res, null, 2);
+        } catch (e) {
+          status.className = "err"; status.textContent = "error";
+          out.textContent = String(e);
+        }
+      });
+    </script>
+  </body>
+</html>
