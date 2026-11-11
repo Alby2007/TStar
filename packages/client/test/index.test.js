@@ -259,3 +259,32 @@ test("listener is installed before the first invoke returns", async () => {
   ]);
   assert.equal(r, "ok");
 });
+
+test("breaking out of a stream cancels the producer", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const it = stream("counter", { n: 1000 });
+  const first = it.next();
+  await new Promise((r) => setTimeout(r, 0));
+  b.emit("pylair://stream", streamChunk(100, 0, "a"));
+  assert.equal((await first).value, "a");
+  await it.return(undefined); // what `break` does
+  assert.ok(
+    b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel" && c.args.task === 100),
+    "abandoning the iterator must send python_cancel",
+  );
+});
+
+test("a stream that finished normally does not send a redundant cancel", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const it = stream("counter", { n: 1 });
+  const first = it.next();
+  await new Promise((r) => setTimeout(r, 0));
+  b.emit("pylair://stream", streamChunk(100, 0, "a"));
+  await first;
+  const second = it.next();
+  b.emit("pylair://stream", streamDone(100, null));
+  assert.equal((await second).done, true);
+  assert.ok(!b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
+});

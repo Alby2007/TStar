@@ -263,6 +263,7 @@ export async function* stream<T = unknown>(
   const queue: StreamEvent[] = [];
   let wake: (() => void) | null = null;
   let pendingCredit = 0;
+  let finished = false; // terminal event seen: producer already done
 
   register(task, {
     onItem: (ev) => {
@@ -278,6 +279,7 @@ export async function* stream<T = unknown>(
       }
       const ev = queue.shift()!;
       if (ev.done) {
+        finished = true;
         if (ev.error) throw new PythonError(ev.error.code, ev.error.message, ev.error.data);
         return;
       }
@@ -290,7 +292,10 @@ export async function* stream<T = unknown>(
     }
   } finally {
     tasks.delete(task);
-    if (pendingCredit > 0) void b.invoke(CMD.grantCredit, { task, n: pendingCredit });
+    // Consumer walked away (break / return() / throw) before the producer
+    // finished: stop it instead of leaving it running and granting credit.
+    if (!finished) void b.invoke(CMD.cancel, { task }).catch(() => {});
+    else if (pendingCredit > 0) void b.invoke(CMD.grantCredit, { task, n: pendingCredit });
   }
 }
 
