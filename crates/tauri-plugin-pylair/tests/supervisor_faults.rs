@@ -161,6 +161,8 @@ fn fast_config() -> SupervisorConfig {
         shutdown_grace: Duration::from_secs(2),
         initial_stream_credit: 8,
         stream_buffer: 256,
+        loop_stall_kill: Duration::from_secs(3600),
+        cancel_timeout: Duration::from_secs(5),
         max_frame: proto::max_frame(),
         restart_trigger: None,
     }
@@ -569,7 +571,7 @@ fn runtime_with_grandchild(beat: &std::path::Path, crash: bool) -> String {
     let path = beat.to_string_lossy().replace('\\', "/");
     format!(
         r#"
-import sys, struct, json, subprocess, time
+import sys, struct, json, subprocess, time, threading, os
 def w(o):
     b = json.dumps(o).encode()
     sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
@@ -577,8 +579,9 @@ subprocess.Popen([sys.executable, "-c",
     "import time\nf = open('{path}', 'a')\nwhile True:\n    f.write('x'); f.flush(); time.sleep(0.1)"])
 w({{"jsonrpc":"2.0","method":"hello","params":{{"protocol":1,"exposes":[]}}}})
 if {crash}:
-    time.sleep(0.5)
-    sys.exit(3)
+    # Keep answering pings (so the supervisor does NOT take its wedged-kill
+    # path), then die on our own: the natural-exit path.
+    threading.Timer(0.6, lambda: os._exit(3)).start()
 while True:
     h = sys.stdin.buffer.read(4)
     if len(h) < 4: break
@@ -669,4 +672,49 @@ async fn shutdown_during_restart_backoff_does_not_wait_out_the_backoff() {
         .await
         .expect("shutdown blocked behind the restart backoff");
     assert!(t0.elapsed() < Duration::from_secs(5));
+}
+
+// ---- serving health vs transport health (audit P1-7) ----
+
+/// Pongs prove the pipe is alive, not that asyncio is serving. A loop blocked
+/// past the stall limit must be treated as wedged: the in-flight call fails
+/// with RUNTIME_WEDGED instead of hanging forever behind healthy pongs.
+#[tokio::test]
+async fn blocked_event_loop_is_killed_and_the_call_fails_wedged() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.ping_interval = Duration::from_millis(100);
+    cfg.loop_stall_kill = Duration::from_millis(1500);
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    let ct = h.call_task("wedge_the_loop", json!({})).unwrap();
+    let err = timeout(T, ct.result)
+        .await
+        .expect("call hung behind a blocked loop with healthy pongs")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, proto::RUNTIME_WEDGED, "{err:?}");
+}
+
+/// A cancel the runtime cannot acknowledge must not hang the caller forever.
+#[tokio::test]
+async fn cancel_ack_is_bounded() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.cancel_timeout = Duration::from_millis(600);
+    // loop_stall_kill stays huge: only the cancel deadline can save us.
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    let ct = h.call_task("wedge_the_loop", json!({})).unwrap();
+    let task = timeout(T, ct.task).await.unwrap().unwrap();
+    sleep(Duration::from_millis(300)).await; // let the loop block
+    let t0 = std::time::Instant::now();
+    let r = timeout(Duration::from_secs(5), h.cancel(task))
+        .await
+        .expect("cancel() never returned");
+    let err = r.expect_err("a blocked loop cannot have acknowledged the cancel");
+    assert_eq!(err.code, proto::RUNTIME_WEDGED, "{err:?}");
+    assert!(t0.elapsed() < Duration::from_secs(3));
 }

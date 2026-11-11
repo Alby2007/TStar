@@ -217,6 +217,36 @@ function wireAbort(signal: AbortSignal | undefined, task: number): void {
 
 export interface CallOptions {
   signal?: AbortSignal;
+  /**
+   * Application-level deadline. When it expires the task is cancelled and the
+   * call rejects/throws a PythonError with code DEADLINE_EXCEEDED, without
+   * waiting for the runtime to acknowledge — a blocked runtime cannot be
+   * relied on to answer.
+   */
+  timeoutMs?: number;
+}
+
+/** Client-side error code for an expired `timeoutMs`. */
+export const DEADLINE_EXCEEDED = -32013;
+
+function deadlineError(ms: number): PythonError {
+  return new PythonError(DEADLINE_EXCEEDED, `deadline of ${ms}ms exceeded`);
+}
+
+/** Arm `timeoutMs`: on expiry cancel the task and run `onExpire`. */
+function armDeadline(
+  opts: CallOptions,
+  task: number,
+  onExpire: (e: PythonError) => void,
+): () => void {
+  const ms = opts.timeoutMs;
+  if (ms === undefined || ms <= 0) return () => {};
+  const t = setTimeout(() => {
+    void ipc().then((b) => b.invoke(CMD.cancel, { task })).catch(() => {});
+    onExpire(deadlineError(ms));
+  }, ms);
+  (t as { unref?: () => void }).unref?.();
+  return () => clearTimeout(t);
 }
 
 /** Call a Python function; resolves with its result. */
@@ -233,9 +263,14 @@ export async function call<T = unknown>(
   });
   wireAbort(opts.signal, task);
   return new Promise<T>((resolve, reject) => {
+    const disarm = armDeadline(opts, task, (e) => {
+      tasks.delete(task);
+      reject(e);
+    });
     register(task, {
       onItem: (ev) => {
         if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
+        disarm();
         tasks.delete(task);
         if (ev.error) reject(new PythonError(ev.error.code, ev.error.message, ev.error.data));
         else resolve(fromWire(ev.result) as T);
@@ -264,6 +299,12 @@ export async function* stream<T = unknown>(
   let wake: (() => void) | null = null;
   let pendingCredit = 0;
   let finished = false; // terminal event seen: producer already done
+  let expired: PythonError | null = null;
+  const disarm = armDeadline(opts, task, (e) => {
+    expired = e;
+    finished = true; // the deadline already sent the cancel
+    wake?.();
+  });
 
   register(task, {
     onItem: (ev) => {
@@ -274,9 +315,11 @@ export async function* stream<T = unknown>(
   try {
     for (;;) {
       while (queue.length === 0) {
+        if (expired) throw expired;
         await new Promise<void>((r) => (wake = r));
         wake = null;
       }
+      if (expired) throw expired;
       const ev = queue.shift()!;
       if (ev.done) {
         finished = true;
@@ -291,6 +334,7 @@ export async function* stream<T = unknown>(
       yield fromWire(ev.value) as T;
     }
   } finally {
+    disarm();
     tasks.delete(task);
     // Consumer walked away (break / return() / throw) before the producer
     // finished: stop it instead of leaving it running and granting credit.

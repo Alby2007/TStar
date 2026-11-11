@@ -12,6 +12,7 @@ import asyncio
 import queue
 import sys
 import threading
+import time
 import traceback
 from typing import Any
 
@@ -36,6 +37,9 @@ class Server:
         self._in: asyncio.Queue = asyncio.Queue()
         self._tasks = TaskRegistry(self._send)
         self._stopping = False
+        # Last time the asyncio loop proved it was making progress; read by the
+        # reader thread when answering pings (single float store: atomic).
+        self._loop_beat = time.monotonic()
 
     def _send(self, msg: dict) -> None:
         # Serialize HERE, on the caller's thread (the event loop for task
@@ -82,7 +86,12 @@ class Server:
                     # liveness. Event-loop lag is reported separately.
                     params = msg.get("params")
                     seq = params.get("seq") if isinstance(params, dict) else None
-                    self._send(proto.notification("pong", {"seq": seq}))
+                    stale_ms = int((time.monotonic() - self._loop_beat) * 1000)
+                    self._send(
+                        proto.notification(
+                            "pong", {"seq": seq, "loop_stale_ms": stale_ms}
+                        )
+                    )
                     continue
                 loop.call_soon_threadsafe(self._in.put_nowait, msg)
         except FrameTooLarge as e:
@@ -212,6 +221,13 @@ class Server:
             if t.asyncio_task is not None:
                 t.asyncio_task.cancel()
 
+    async def _loop_heartbeat(self) -> None:
+        """Stamp loop progress. If the loop is blocked this stops advancing,
+        which the host sees as `loop_stale_ms` in the next pong."""
+        while True:
+            self._loop_beat = time.monotonic()
+            await asyncio.sleep(0.25)
+
     async def _lag_monitor(self) -> None:
         """Diagnostic: report event-loop lag on stderr (forwarded to the
         UI). Blocking code inside an `async def` no longer fails
@@ -239,6 +255,7 @@ class Server:
         self._send(proto.hello(exposes_manifest()))
         reader.start()
         lag = asyncio.create_task(self._lag_monitor())
+        beat = asyncio.create_task(self._loop_heartbeat())
 
         while not self._stopping:
             msg = await self._in.get()
@@ -247,11 +264,12 @@ class Server:
                 break
             await self._handle(msg)
 
-        lag.cancel()
-        try:
-            await lag
-        except asyncio.CancelledError:
-            pass
+        for t in (lag, beat):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
         await self._drain(grace_s=3.0)
         self._out.put(_STOP)
         self._channel.close_write()

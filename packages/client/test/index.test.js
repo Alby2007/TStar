@@ -288,3 +288,33 @@ test("a stream that finished normally does not send a redundant cancel", async (
   assert.equal((await second).done, true);
   assert.ok(!b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
 });
+
+test("call with timeoutMs rejects with a deadline error and cancels the task", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("slow", {}, { timeoutMs: 50 });
+  await assert.rejects(p, (e) => e instanceof PythonError && e.code === -32013);
+  assert.ok(
+    b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel" && c.args.task === 100),
+    "an expired deadline must cancel the producer",
+  );
+});
+
+test("a call that finishes before its deadline is unaffected", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("fast", {}, { timeoutMs: 500 });
+  await new Promise((r) => setTimeout(r, 0));
+  b.emit("pylair://stream", streamDone(100, "ok"));
+  assert.equal(await p, "ok");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
+});
+
+test("stream with timeoutMs throws the deadline error and cancels", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const it = stream("slow", {}, { timeoutMs: 50 });
+  await assert.rejects(it.next(), (e) => e instanceof PythonError && e.code === -32013);
+  assert.ok(b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
+});

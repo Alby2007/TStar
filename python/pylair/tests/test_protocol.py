@@ -90,7 +90,9 @@ def test_ping_pong(runtime):
     runtime.recv()
     runtime.send(proto.request(7, "ping", {"seq": 42}))
     msg = runtime.recv()
-    assert msg == {"jsonrpc": "2.0", "method": "pong", "params": {"seq": 42}}
+    assert msg["method"] == "pong" and msg["params"]["seq"] == 42
+    # additive field (protocol §5): how long the asyncio loop has been stuck
+    assert isinstance(msg["params"]["loop_stale_ms"], int)
 
 
 # ---- streaming + credit ----------------------------------------------------

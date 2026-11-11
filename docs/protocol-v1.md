@@ -198,7 +198,21 @@ deadlock) never crashes, so it never restarts.
   reader thread, missing them means the *process* is truly hung
   (deadlocked native code, interpreter fault) — the correct thing to
   kill.
-- `ping`/`pong` carries no data; `seq` matching just guards staleness.
+- **Transport health is not serving health.** The `pong` also carries
+  `loop_stale_ms`: how long the runtime's asyncio loop has made no
+  progress (measured by a heartbeat task on the loop, read by the reader
+  thread). A short stall is normal; once it reaches the host's
+  `loop_stall_kill` (default 60s) the loop can no longer serve calls or
+  cancels, so the runtime is treated as wedged: in-flight calls fail with
+  `RUNTIME_WEDGED` and the runtime is killed and restarted. The field is
+  additive — hosts that ignore it keep the older behaviour.
+- `seq` matching guards staleness.
+- `cancel()` waits at most `cancel_timeout` (default 5s) for the runtime's
+  acknowledgement and then fails with `RUNTIME_WEDGED`; a blocked runtime
+  cannot be relied on to answer. The client's `timeoutMs` call option is
+  an application-level deadline: it cancels the task and rejects with the
+  client-side code `-32013` (`DEADLINE_EXCEEDED`) without waiting for that
+  acknowledgement.
 
 ## 6. Orphan prevention
 
@@ -214,10 +228,22 @@ platform:
   runtime in a **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
   when the host's last job handle closes (clean or crash), the kernel
   kills everything in the job. The runtime does the same for workers.
-- **POSIX:** runtime and workers get their own process group; the
-  supervisor kills `-pgid`, and on Linux `PR_SET_PDEATHSIG` is set as a
-  belt-and-suspenders. macOS has no parent-death signal — stdin EOF is
-  the mechanism there (and everywhere, really).
+- **POSIX:** the runtime gets its own process group and the supervisor
+  kills `-pgid` — both on a forced kill and when the runtime exits on its
+  own (so group members cannot outlive a dead leader). Isolated workers
+  run in their *own session* (so one task can be cancelled by killing
+  exactly its group), which a kill of the runtime's group cannot reach.
+  Each worker therefore watches its parent and, when re-parented,
+  SIGKILLs its whole group (worker plus any grandchildren, SIGTERM
+  ignorers included). Limitation: a worker wedged in native code holding
+  the GIL cannot run that watcher. There is no parent-death signal on
+  macOS, so no `PR_SET_PDEATHSIG` is used on any POSIX platform.
+- **Shutdown completes before it is acknowledged.** `shutdown()` resolves
+  only after the runtime's process tree has been reaped, and the plugin
+  blocks application exit on it (`RunEvent::Exit`). A shutdown requested
+  during a restart backoff is honoured immediately.
+- **Windows without a Job Object:** if assignment fails the host says so
+  on the stderr event stream and falls back to `taskkill /T` on kill.
 
 ## 7. Supervisor policy (host-side, not on the wire)
 
@@ -231,6 +257,13 @@ platform:
   call is retried is the app's choice — the supervisor never replays
   calls (no idempotency guarantees in Python user code).
 - Graceful `shutdown` → `grace_ms` deadline → SIGTERM → 5s → SIGKILL.
+- Calls issued while the runtime is *restarting* (crash backoff) or
+  *failed* fail fast with `RUNTIME_UNAVAILABLE`; calls issued while it is
+  merely *starting* queue until the handshake completes.
+- A stream consumer that stops draining (buffer full) or disappears ends
+  with an explicit `INTERNAL` terminal error and the Python producer is
+  cancelled. The terminal result is delivered on its own slot, so it is
+  never lost to a full chunk buffer.
 
 ## 8. Error codes
 

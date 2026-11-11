@@ -96,6 +96,13 @@ pub struct SupervisorConfig {
     /// A consumer that falls this far behind is cut off (and its producer
     /// cancelled) rather than allowed to stall the supervisor.
     pub stream_buffer: usize,
+    /// Pongs come from a reader thread and only prove the process and pipe
+    /// are alive. The runtime also reports how long its asyncio loop has made
+    /// no progress (`loop_stale_ms`); at or beyond this the loop can no longer
+    /// serve calls or cancels, so the runtime is treated as wedged.
+    pub loop_stall_kill: Duration,
+    /// How long `cancel()` waits for the runtime's acknowledgement.
+    pub cancel_timeout: Duration,
     pub max_frame: usize,
     /// Dev-mode hot reload: when this file's mtime changes, respawn the
     /// runtime (no crash accounting). Falls back to the
@@ -116,6 +123,8 @@ impl Default for SupervisorConfig {
             shutdown_grace: Duration::from_secs(5),
             initial_stream_credit: 64,
             stream_buffer: 256,
+            loop_stall_kill: Duration::from_secs(60),
+            cancel_timeout: Duration::from_secs(5),
             max_frame: proto::max_frame(),
             restart_trigger: None,
         }
@@ -256,6 +265,7 @@ pub struct Handle {
     cmd: mpsc::Sender<Command>,
     state: watch::Receiver<State>,
     stream_buffer: usize,
+    cancel_timeout: Duration,
 }
 
 impl Handle {
@@ -329,7 +339,17 @@ impl Handle {
             .send(Command::Cancel { task, respond: tx })
             .await
             .map_err(|_| stopped_err())?;
-        rx.await.map_err(|_| stopped_err())
+        match timeout(self.cancel_timeout, rx).await {
+            Ok(r) => r.map_err(|_| stopped_err()),
+            Err(_) => Err(ErrorObj {
+                code: proto::RUNTIME_WEDGED,
+                message: format!(
+                    "cancel not acknowledged within {:?}: the runtime's event loop may be blocked",
+                    self.cancel_timeout
+                ),
+                data: None,
+            }),
+        }
     }
 
     /// Grant more stream pull-credit to `task`.
@@ -374,6 +394,7 @@ pub fn spawn(
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (state_tx, state_rx) = watch::channel(State::Starting);
     let stream_buffer = config.stream_buffer;
+    let cancel_timeout = config.cancel_timeout;
     let actor = Supervisor {
         spec,
         config,
@@ -392,6 +413,7 @@ pub fn spawn(
             cmd: cmd_tx,
             state: state_rx,
             stream_buffer,
+            cancel_timeout,
         },
         actor,
     )
@@ -687,6 +709,17 @@ impl Supervisor {
                             match method.as_str() {
                                 "pong" => {
                                     pongs_outstanding = 0;
+                                    // Transport is alive. Is the loop SERVING?
+                                    let stale = Duration::from_millis(p["loop_stale_ms"].as_u64().unwrap_or(0));
+                                    if stale >= self.config.loop_stall_kill {
+                                        self.set_state(State::Unresponsive,
+                                            format!("event loop blocked for {stale:?}"));
+                                        fail_all(&mut pending, proto::RUNTIME_WEDGED,
+                                            &format!("the runtime's event loop has been blocked for {stale:?} \
+                                                      (blocking code inside an async def?)")).await;
+                                        kill_and_reap(&mut io).await;
+                                        return ExitCause::Crashed(format!("event loop blocked for {stale:?}"));
+                                    }
                                     self.set_state(State::Ready, "pong received");
                                 }
                                 "stream.chunk" => {

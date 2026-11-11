@@ -302,6 +302,33 @@ def test_pong_survives_a_wedged_event_loop(runtime):
     runtime.kill()  # the wedge call can never return
 
 
+def test_pong_reports_how_long_the_event_loop_has_been_blocked(runtime):
+    """Transport health (pong) and serving health (loop progress) are
+    different things: the pong carries `loop_stale_ms` so the host can tell
+    a live pipe from a loop that can no longer serve calls or cancels."""
+    import time as _t
+
+    runtime.recv()
+    runtime.send({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {"seq": 1}})
+    healthy = runtime.recv_until(lambda m: m.get("method") == "pong", timeout=5.0)
+    assert healthy["params"]["loop_stale_ms"] < 1500
+
+    runtime.send(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "call",
+            "params": {"fn": "wedge_the_loop", "task": 1, "input": {}},
+        }
+    )
+    _t.sleep(2.0)  # loop is now blocked in time.sleep(3600)
+    runtime.send({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {"seq": 2}})
+    wedged = runtime.recv_until(lambda m: m.get("method") == "pong", timeout=5.0)
+    assert wedged["params"]["seq"] == 2
+    assert wedged["params"]["loop_stale_ms"] >= 1500
+    runtime.kill()
+
+
 def test_coerce_kwargs_strict_and_string_hints():
     @dataclass
     class StrRef:
