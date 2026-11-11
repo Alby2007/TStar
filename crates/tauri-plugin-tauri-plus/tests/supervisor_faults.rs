@@ -82,11 +82,14 @@ fn python() -> PathBuf {
         return p.into();
     }
     for cand in ["python3", "python"] {
-        if std::process::Command::new(cand)
+        // Check exit status, not just spawn: on Windows `python3` can be the
+        // Microsoft Store alias — it launches but does not run Python.
+        let ok = std::process::Command::new(cand)
             .arg("--version")
             .output()
-            .is_ok()
-        {
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
             return cand.into();
         }
     }
