@@ -159,7 +159,7 @@ test("golden: emit(fixture) matches committed testapp stubs", () => {
   );
   assert.equal(
     emit(manifest, "testapp"),
-    golden,
+    golden.replace(/\r\n/g, "\n"), // tolerate autocrlf checkouts
     "emitter drift — regenerate golden: see golden/README",
   );
 });

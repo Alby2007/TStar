@@ -1,0 +1,3 @@
+# LF everywhere — generated files, golden fixtures, and scripts are
+# line-ending sensitive across OSes.
+* text=auto eol=lf
