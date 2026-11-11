@@ -46,11 +46,13 @@ test("--local wires all three deps at the checkout", () => {
   const res = scaffold(["local-app", "--local", "/fake/repo"], dir);
   assert.equal(res.status, 0, res.stderr);
   const app = join(dir, "local-app");
-  assert.match(readFileSync(join(app, "pyproject.toml"), "utf8"), /file:\/\/\/fake\/repo\/python\/pylair/);
-  assert.match(readFileSync(join(app, "package.json"), "utf8"), /file:\/fake\/repo\/packages\/client/);
+  // On Windows "/fake/repo" resolves under a drive letter; the file URI
+  // must still have three slashes (file:///C:/fake/...).
+  assert.match(readFileSync(join(app, "pyproject.toml"), "utf8"), /file:\/\/\/(?:[A-Za-z]:\/)?fake\/repo\/python\/pylair/);
+  assert.match(readFileSync(join(app, "package.json"), "utf8"), /file:(?:[A-Za-z]:)?\/fake\/repo\/packages\/client/);
   assert.match(
     readFileSync(join(app, "src-tauri/Cargo.toml"), "utf8"),
-    /tauri-plugin-pylair = \{ path = "\/fake\/repo\/crates\/tauri-plugin-pylair" \}/,
+    /tauri-plugin-pylair = \{ path = "(?:[A-Za-z]:)?\/fake\/repo\/crates\/tauri-plugin-pylair" \}/,
   );
   rmSync(dir, { recursive: true });
 });

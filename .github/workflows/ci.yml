@@ -233,7 +233,11 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm -r build
       - name: Scaffold app (local dep wiring)
-        run: node packages/create-pylair/dist/index.js app-under-test --local "$PWD"
+        run: |
+          node packages/create-pylair/dist/index.js app-under-test --local "$PWD"
+          # The app lives inside this repo's checkout; without its own
+          # workspace root pnpm installs the monorepo instead of the app.
+          echo "packages: []" > app-under-test/pnpm-workspace.yaml
       - name: Install app deps
         working-directory: app-under-test
         run: pnpm install --no-frozen-lockfile && uv sync

@@ -35,7 +35,8 @@ export function substitutions(name: string, identifier: string, local?: string):
   if (local) {
     const root = resolve(local);
     const unixPath = (p: string) => p.replace(/\\/g, "/");
-    subs.__PYLAIR_PY__ = `pylair @ file://${unixPath(join(root, "python/pylair"))}`;
+    const py = unixPath(join(root, "python/pylair"));
+    subs.__PYLAIR_PY__ = `pylair @ file://${py.startsWith("/") ? py : `/${py}`}`;
     subs.__PYLAIR_JS_PKG__ = "@pylair/client";
     subs.__PYLAIR_JS__ = `file:${unixPath(join(root, "packages/client"))}`;
     subs.__PYLAIR_RS__ = `tauri-plugin-pylair = { path = "${unixPath(join(root, "crates/tauri-plugin-pylair"))}" }`;

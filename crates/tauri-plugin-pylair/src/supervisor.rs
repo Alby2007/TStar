@@ -274,7 +274,10 @@ pub fn spawn(
     spec: SpawnSpec,
     config: SupervisorConfig,
     events: mpsc::Sender<RuntimeEvent>,
-) -> (Handle, impl std::future::Future<Output = ()> + Send + 'static) {
+) -> (
+    Handle,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (state_tx, state_rx) = watch::channel(State::Starting);
     let actor = Supervisor {

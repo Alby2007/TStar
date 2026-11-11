@@ -12,9 +12,7 @@ import sys
 
 
 def main() -> int:
-    module = (
-        sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PYLAIR_APP_MODULE")
-    )
+    module = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PYLAIR_APP_MODULE")
     if not module:
         print(
             "usage: python -m pylair <app.module>  (or set PYLAIR_APP_MODULE)",
