@@ -1,10 +1,10 @@
 {
-  "$comment": "Single source of truth for product naming. 'Tauri+' is a working title (see PROJECT_BRIEF.md section 1) - do not hard-code these values elsewhere; read them from this file in tooling. Directory and package names still embed 'tauri-plus' for now; a rename is a mechanical pass once the final name is chosen.",
-  "productName": "TauriPlus",
-  "displayName": "Tauri+",
-  "cliBinary": "tauri-plus",
-  "packageScope": "@tauri-plus",
-  "pythonPackage": "tauri_plus",
-  "rustPluginCrate": "tauri-plugin-tauri-plus",
-  "createPackage": "create-tauri-plus"
+  "$comment": "Single source of truth for product naming — locked in as 'Pylair' (also avoids the Tauri trademark constraints on 'Tauri+'). Do not hard-code these values elsewhere; read them from this file in tooling.",
+  "productName": "Pylair",
+  "displayName": "Pylair",
+  "cliBinary": "pylair",
+  "packageScope": "@pylair",
+  "pythonPackage": "pylair",
+  "rustPluginCrate": "tauri-plugin-pylair",
+  "createPackage": "create-pylair"
 }

@@ -1,0 +1,20 @@
+{
+  "name": "create-pylair",
+  "version": "0.0.0",
+  "description": "Scaffold a new Pylair project (npx create-pylair my-app)",
+  "type": "module",
+  "bin": {
+    "create-pylair": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "pnpm build",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,4 +1,4 @@
-# Tauri+ wire protocol v1
+# Pylair wire protocol v1
 
 The contract between the host (Rust supervisor, inside the Tauri app) and
 the managed Python runtime process. Implemented in M1; streaming and
@@ -47,7 +47,7 @@ hang or OOM the host.
 
 - Big-endian length prefix, then exactly that many bytes of UTF-8 JSON.
 - `MAX_FRAME` defaults to **16 MiB**, configurable via
-  `TAURI_PLUS_MAX_FRAME` (bytes). A length prefix above the cap →
+  `PYLAIR_MAX_FRAME` (bytes). A length prefix above the cap →
   protocol violation → runtime killed and restarted (it is either buggy
   or hostile). The cap is not meant for data throughput — large binary
   payloads (images, audio) currently travel base64-in-JSON (+33% size);
@@ -163,7 +163,7 @@ host-side only, never emitted by the runtime).
    - `kind`: `"sync" | "async" | "generator" | "isolated"`
    - `signature`: `{params: [{name, kind, required, schema}], returns: schema}`
      where `schema` is the annotation map defined in docs/codegen.md (the
-     same schema `tauri-plus codegen` consumes). `doc` is the function's
+     same schema `pylair codegen` consumes). `doc` is the function's
      docstring or null — used for generated JSDoc.
 3. `HELLO_TIMEOUT = 15s`. No hello → kill → `crashed` → backoff →
    `restarting`.
@@ -187,7 +187,7 @@ deadlock) never crashes, so it never restarts.
   healthy runtime would be killed on its first real workload.
 - Event-loop lag is reported **separately as a diagnostic**: the
   runtime logs `event loop lag Ns` lines on stderr (forwarded to the
-  UI via `tauri-plus://stderr`) when the loop falls >1s behind. Calls
+  UI via `pylair://stderr`) when the loop falls >1s behind. Calls
   queued behind a busy loop simply wait — same as any overloaded
   async service.
 - A missed deadline → state `unresponsive` (event emitted). The host
@@ -269,7 +269,7 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 - Unknown top-level fields are ignored both directions (forward
   compatibility within a major version).
 - The Python runtime refuses to start for an incompatible host the same
-  way (host sends its version in an env var `TAURI_PLUS_PROTOCOL=1`).
+  way (host sends its version in an env var `PYLAIR_PROTOCOL=1`).
 
 ## 11. What this does not cover (yet)
 

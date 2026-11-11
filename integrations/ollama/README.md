@@ -1,4 +1,4 @@
-# @tauri-plus/ollama (placeholder)
+# @pylair/ollama (placeholder)
 
 Optional Ollama integration — detect install, connect, list models, report
 status, stream completions through the normal bridge. Lands in M5.

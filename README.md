@@ -1,4 +1,4 @@
-# Tauri+ (working title)
+# Pylair (working title)
 
 Desktop framework for Python and local AI applications: run one command,
 get a Tauri desktop app with a modern web front end and a managed,
@@ -17,11 +17,11 @@ supervisor/protocol → `M2` typed bridge → `M3` streaming/cancellation →
 
 | Path | What |
 |---|---|
-| `crates/tauri-plugin-tauri-plus` | Rust plugin: supervisor, IPC, permissions |
-| `packages/client` | `@tauri-plus/client` — typed calls, streams, cancellation |
-| `packages/cli` | `tauri-plus` CLI — dev, build, doctor, codegen |
-| `packages/create-tauri-plus` | project scaffolder |
-| `python/tauri_plus` | Python runtime — `@expose`, protocol server, tasks |
+| `crates/tauri-plugin-pylair` | Rust plugin: supervisor, IPC, permissions |
+| `packages/client` | `@pylair/client` — typed calls, streams, cancellation |
+| `packages/cli` | `pylair` CLI — dev, build, doctor, codegen |
+| `packages/create-pylair` | project scaffolder |
+| `python/pylair` | Python runtime — `@expose`, protocol server, tasks |
 | `integrations/` | optional: ollama (M5), fastapi (later) |
 | `templates/` | scaffold templates (not in pnpm workspace, by design) |
 | `examples/` | `reference-app` — the real acceptance test (M6) |
@@ -37,7 +37,7 @@ uv (any recent), Python 3.12 via uv.
 pnpm install            # JS workspace
 pnpm build              # build all TS packages
 cargo build             # Rust workspace
-cd python/tauri_plus && uv sync   # Python env (fetches managed CPython)
+cd python/pylair && uv sync   # Python env (fetches managed CPython)
 ```
 
 Docs: [security](docs/security.md), [protocol](docs/protocol-v1.md),

@@ -1,8 +1,8 @@
 /**
- * @tauri-plus/client — typed calls into the managed Python runtime.
+ * @pylair/client — typed calls into the managed Python runtime.
  *
- * Transport: `plugin:tauri-plus|python_*` commands + `tauri-plus://*` events
- * (see crates/tauri-plugin-tauri-plus/src/lib.rs `events` and
+ * Transport: `plugin:pylair|python_*` commands + `pylair://*` events
+ * (see crates/tauri-plugin-pylair/src/lib.rs `events` and
  * docs/protocol-v1.md). The bridge is injectable for testing/headless use.
  */
 
@@ -48,20 +48,20 @@ export interface StreamEvent {
 }
 
 const EVT = {
-  state: "tauri-plus://state",
-  stderr: "tauri-plus://stderr",
-  exposes: "tauri-plus://exposes",
-  stream: "tauri-plus://stream",
+  state: "pylair://state",
+  stderr: "pylair://stderr",
+  exposes: "pylair://exposes",
+  stream: "pylair://stream",
 } as const;
 
 const CMD = {
-  call: "plugin:tauri-plus|python_call",
-  callStream: "plugin:tauri-plus|python_call_stream",
-  grantCredit: "plugin:tauri-plus|python_grant_credit",
-  cancel: "plugin:tauri-plus|python_cancel",
-  retry: "plugin:tauri-plus|python_retry",
-  state: "plugin:tauri-plus|python_state",
-  shutdown: "plugin:tauri-plus|python_shutdown",
+  call: "plugin:pylair|python_call",
+  callStream: "plugin:pylair|python_call_stream",
+  grantCredit: "plugin:pylair|python_grant_credit",
+  cancel: "plugin:pylair|python_cancel",
+  retry: "plugin:pylair|python_retry",
+  state: "plugin:pylair|python_state",
+  shutdown: "plugin:pylair|python_shutdown",
 } as const;
 
 // ---- bridge management -----------------------------------------------------
@@ -90,6 +90,58 @@ export function setBridge(bridge: IpcBridge | null): void {
 
 async function ipc(): Promise<IpcBridge> {
   return _bridge ?? defaultBridge();
+}
+
+// ---- wire JSON (protocol §2, docs/codegen.md) -------------------------------
+//
+// The runtime encodes bytes as {"$b64": "<base64>"} — anywhere in the
+// payload. `call`/`stream` apply the transform here so generated stubs
+// and hand-written callers stay wire-agnostic: pass Uint8Array, get
+// Uint8Array back.
+
+const B64_TAG = "$b64";
+
+function b64encode(u8: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < u8.length; i += 0x8000)
+    s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+function b64decode(b64: string): Uint8Array {
+  const s = atob(b64);
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  return u8;
+}
+
+function toWire(v: unknown): unknown {
+  if (v instanceof Uint8Array) return { [B64_TAG]: b64encode(v) };
+  if (Array.isArray(v)) return v.map(toWire);
+  if (v !== null && typeof v === "object")
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
+        k,
+        toWire(x),
+      ]),
+    );
+  return v;
+}
+
+function fromWire(v: unknown): unknown {
+  if (v !== null && typeof v === "object") {
+    const ks = Object.keys(v);
+    if (ks.length === 1 && ks[0] === B64_TAG)
+      return b64decode((v as Record<string, string>)[B64_TAG]);
+    if (Array.isArray(v)) return v.map(fromWire);
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
+        k,
+        fromWire(x),
+      ]),
+    );
+  }
+  return v;
 }
 
 // ---- internal stream machinery ---------------------------------------------
@@ -135,7 +187,10 @@ export async function call<T = unknown>(
 ): Promise<T> {
   const b = await ipc();
   await ensureStreamListener();
-  const task = await b.invoke<number>(CMD.callStream, { fnName: fn, input });
+  const task = await b.invoke<number>(CMD.callStream, {
+    fnName: fn,
+    input: toWire(input) as Record<string, unknown>,
+  });
   wireAbort(opts.signal, task);
   return new Promise<T>((resolve, reject) => {
     tasks.set(task, {
@@ -143,7 +198,7 @@ export async function call<T = unknown>(
         if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
         tasks.delete(task);
         if (ev.error) reject(new PythonError(ev.error.code, ev.error.message, ev.error.data));
-        else resolve(ev.result as T);
+        else resolve(fromWire(ev.result) as T);
       },
     });
   });
@@ -159,7 +214,10 @@ export async function* stream<T = unknown>(
 ): AsyncGenerator<T, void, void> {
   const b = await ipc();
   await ensureStreamListener();
-  const task = await b.invoke<number>(CMD.callStream, { fnName: fn, input });
+  const task = await b.invoke<number>(CMD.callStream, {
+    fnName: fn,
+    input: toWire(input) as Record<string, unknown>,
+  });
   wireAbort(opts.signal, task);
 
   const queue: StreamEvent[] = [];
@@ -188,7 +246,7 @@ export async function* stream<T = unknown>(
         void b.invoke(CMD.grantCredit, { task, n: pendingCredit });
         pendingCredit = 0;
       }
-      yield ev.value as T;
+      yield fromWire(ev.value) as T;
     }
   } finally {
     tasks.delete(task);
@@ -233,7 +291,7 @@ export async function onExposes<T = unknown>(cb: (manifest: T) => void): Promise
 
 /**
  * Namespace-style convenience surface; `python.<fn>` typed wrappers are
- * generated by `tauri-plus codegen` in M2 on top of call/stream.
+ * generated by `pylair codegen` in M2 on top of call/stream.
  */
 export const python = {
   call,

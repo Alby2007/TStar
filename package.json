@@ -1,5 +1,5 @@
 {
-  "name": "tauri-plus-monorepo",
+  "name": "pylair-monorepo",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.18.3",

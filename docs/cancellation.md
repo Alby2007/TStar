@@ -1,6 +1,6 @@
 # Cancellation semantics
 
-Cancellation is the hardest correctness problem in Tauri+ (PROJECT_BRIEF
+Cancellation is the hardest correctness problem in Pylair (PROJECT_BRIEF
 section 4), so it is specified before it is built. This document is the
 contract: `docs/protocol-v1.md` says *how* cancel travels on the wire;
 this says *what it guarantees*. Implemented in M3; tests in M3 must prove
@@ -79,7 +79,7 @@ at `@expose` time, not at cancel time.
   result is computed and **discarded**, and the caller still observes
   `TASK_CANCELLED` immediately — the UI is never held hostage.
 - Docs/API guidance: mark anything that can run longer than ~1s or touch
-  native code `isolated=True`. `tauri-plus doctor` warns on exposed sync
+  native code `isolated=True`. `pylair doctor` warns on exposed sync
   functions without the flag (M4).
 
 ## Cross-cutting cases

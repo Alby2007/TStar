@@ -1,12 +1,12 @@
-# Tauri+ (working title): Project Brief
+# Pylair (working title): Project Brief
 
 Read this whole document before writing any code. It describes what we are building, why, the order to build it in, and the rules for working on it. When something here is ambiguous, pick the simplest option that satisfies the acceptance criteria, write down the decision in `docs/decisions/`, and keep moving.
 
 ## 1. One-paragraph summary
 
-Tauri+ is a desktop framework for Python and local AI applications. A developer with a Python app, an agent, a LangChain workflow or an Ollama integration should be able to run one command and get a working desktop application with a modern web front end, then run one more command and get a signed, installable build that works on a machine with no Python installed. Tauri provides the shell. Tauri+ provides everything between the shell and the developer's Python code: packaging, process supervision, a typed bridge, streaming, cancellation and diagnostics.
+Pylair is a desktop framework for Python and local AI applications. A developer with a Python app, an agent, a LangChain workflow or an Ollama integration should be able to run one command and get a working desktop application with a modern web front end, then run one more command and get a signed, installable build that works on a machine with no Python installed. Tauri provides the shell. Pylair provides everything between the shell and the developer's Python code: packaging, process supervision, a typed bridge, streaming, cancellation and diagnostics.
 
-The name is a placeholder. "Tauri+" implies official affiliation with the Tauri project, so do not hard-code the name in places that are expensive to change. Use a single constants file for the product name, CLI binary name and package scope.
+The name is a placeholder. "Pylair" implies official affiliation with the Tauri project, so do not hard-code the name in places that are expensive to change. Use a single constants file for the product name, CLI binary name and package scope.
 
 ## 2. The problem
 
@@ -19,15 +19,15 @@ Today, shipping a Python AI app as a desktop product means solving all of this b
 - Cancelling that work safely.
 - Building installers for Windows, macOS and Linux, including signing and notarization.
 
-Each of these is a few days of work, and together they are why most Python AI projects never get a real desktop app. Tauri+ solves them once, in one coherent developer experience.
+Each of these is a few days of work, and together they are why most Python AI projects never get a real desktop app. Pylair solves them once, in one coherent developer experience.
 
 ## 3. Goals and non-goals
 
 ### Goals (v0.1)
 
-1. `npx create-tauri-plus my-app` scaffolds a working project.
-2. `tauri-plus dev` runs the Python backend and the front end with hot reload for both.
-3. `tauri-plus build` produces an installer that runs on a clean machine with no Python.
+1. `npx create-pylair my-app` scaffolds a working project.
+2. `pylair dev` runs the Python backend and the front end with hot reload for both.
+3. `pylair build` produces an installer that runs on a clean machine with no Python.
 4. Python functions can be exposed with a decorator and called from TypeScript with generated types.
 5. Async generators in Python stream to the front end. Any running task can be cancelled.
 6. If the Python process crashes, the supervisor restarts it and the UI is told what happened.
@@ -46,7 +46,7 @@ Each of these is a few days of work, and together they are why most Python AI pr
 ```
 React / Svelte / Vue         (developer's UI)
         |
-Tauri+ client SDK (TypeScript)   typed calls, streams, cancellation, diagnostics
+Pylair client SDK (TypeScript)   typed calls, streams, cancellation, diagnostics
         |
 Tauri app + Rust core        windows, process management, security, packaging
         |
@@ -59,11 +59,11 @@ Layers and responsibilities:
 
 | Layer | Responsibility |
 |---|---|
-| TS client SDK (`@tauri-plus/client`) | Typed `python.<fn>()` calls, `AsyncIterable` streams, `AbortSignal` cancellation, runtime status events |
+| TS client SDK (`@pylair/client`) | Typed `python.<fn>()` calls, `AsyncIterable` streams, `AbortSignal` cancellation, runtime status events |
 | Rust core (Tauri plugin) | Spawn and supervise the Python runtime, own the IPC channel, enforce which commands the front end may call, surface diagnostics |
-| Python runtime package (`tauri_plus`) | `@expose` decorator, protocol server, task runner, cancellation, schema export |
-| CLI (`tauri-plus`) | `dev`, `build`, `doctor`, `codegen` |
-| Scaffolder (`create-tauri-plus`) | Project templates |
+| Python runtime package (`pylair`) | `@expose` decorator, protocol server, task runner, cancellation, schema export |
+| CLI (`pylair`) | `dev`, `build`, `doctor`, `codegen` |
+| Scaffolder (`create-pylair`) | Project templates |
 
 ### Design decisions (starting positions, challenge them with evidence)
 
@@ -91,7 +91,7 @@ Layers and responsibilities:
 Python:
 
 ```python
-from tauri_plus import expose
+from pylair import expose
 
 @expose
 async def summarize(text: str) -> str:
@@ -110,7 +110,7 @@ def heavy_job(path: str) -> dict:
 TypeScript:
 
 ```ts
-import { python } from "@tauri-plus/client";
+import { python } from "@pylair/client";
 
 const summary = await python.summarize({ text: "Summarize this document" });
 
@@ -133,13 +133,13 @@ Treat this as a starting sketch. If a better shape emerges while building, chang
     security.md
     cancellation.md
   crates/
-    tauri-plugin-tauri-plus/   Rust plugin: supervisor, IPC, permissions
+    tauri-plugin-pylair/   Rust plugin: supervisor, IPC, permissions
   packages/
-    client/                    @tauri-plus/client (TypeScript)
-    cli/                       tauri-plus CLI
-    create-tauri-plus/         scaffolder
+    client/                    @pylair/client (TypeScript)
+    cli/                       pylair CLI
+    create-pylair/         scaffolder
   python/
-    tauri_plus/                Python runtime package
+    pylair/                Python runtime package
   integrations/
     ollama/                    optional
     fastapi/                   optional
@@ -189,8 +189,8 @@ If M0 cannot be made reliable with a torch-class dependency, stop and report. Th
 
 ### M4: CLI and scaffolder
 
-- `create-tauri-plus` with a React + TypeScript template.
-- `tauri-plus dev`, `build`, `doctor` (preflight checks for toolchains, signing config, disk space, Ollama if configured).
+- `create-pylair` with a React + TypeScript template.
+- `pylair dev`, `build`, `doctor` (preflight checks for toolchains, signing config, disk space, Ollama if configured).
 - Clear, actionable error messages. A first-time user should never see a raw Rust or Python stack trace without a plain-language explanation above it.
 
 ### M5: Local AI integration
@@ -215,7 +215,7 @@ If the reference app works reliably, the framework is real. If it does not, noth
 
 ## 9. Success metrics for v0.1
 
-- Time from `npx create-tauri-plus` to a running dev window: under 5 minutes on a normal connection, excluding first-time toolchain installs.
+- Time from `npx create-pylair` to a running dev window: under 5 minutes on a normal connection, excluding first-time toolchain installs.
 - Time from a working dev app to an installable build: one command, under 15 minutes on CI.
 - Clean-machine install test passes on all three OS targets for the reference app.
 - Cancellation test suite passes with no leaked processes.

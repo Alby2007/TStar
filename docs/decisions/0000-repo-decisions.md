@@ -17,7 +17,7 @@ the first owner Q&A (2026-11-11).
   install from the registry standalone, not ride the monorepo lockfile.
 - **Naming**: `product.json` at repo root is the single source of truth for
   product name, CLI binary, package scope. Directory/package names still
-  embed `tauri-plus`; renaming later is a mechanical pass. `Tauri+` is a
+  embed `pylair`; renaming later is a mechanical pass. `Pylair` is a
   working title — see PROJECT_BRIEF.md section 1.
 - **License**: deferred by owner. No LICENSE file; packages marked
   `private`/unpublished (`publish = false` on crates, `private` root
@@ -33,7 +33,7 @@ the first owner Q&A (2026-11-11).
 - Every tool reading product naming should go through `product.json`; the
   rename cost is concentrated in directory/package names, which a script
   can rewrite.
-- `uv sync` in `python/tauri_plus` downloads a python-build-standalone
+- `uv sync` in `python/pylair` downloads a python-build-standalone
   interpreter — the same distribution mechanism M0 bundles, so local dev
   dogfoods the packaging path from day one.
 - Rust crate is a compilable stub with no dependencies; real plugin deps

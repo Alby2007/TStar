@@ -32,7 +32,7 @@ Honest assessment: for async-clean Python codebases where crash isolation
 doesn't matter, PyTauri is simpler *today*. For local-AI workloads —
 torch-class native deps, long-running cancellable jobs, crash recovery the
 UI can observe — a supervised subprocess is the right architecture, and
-that is the thing Tauri+ exists to make easy.
+that is the thing Pylair exists to make easy.
 
 ### marcomq/tauri-plugin-python (Tauri v2 plugin)
 

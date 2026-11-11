@@ -1,4 +1,4 @@
-/** Load the codegen manifest by running `python -m tauri_plus.codegen`. */
+/** Load the codegen manifest by running `python -m pylair.codegen`. */
 
 import { spawnSync } from "node:child_process";
 import type { Manifest } from "./codegen.js";
@@ -17,7 +17,7 @@ export interface ManifestOptions {
 export function loadManifest(opts: ManifestOptions): Manifest {
   const res = spawnSync(
     opts.python,
-    ["-m", "tauri_plus.codegen", opts.module],
+    ["-m", "pylair.codegen", opts.module],
     {
       encoding: "utf-8",
       cwd: opts.cwd,
@@ -50,7 +50,7 @@ export function loadManifest(opts: ManifestOptions): Manifest {
     return JSON.parse(res.stdout) as Manifest;
   } catch {
     throw new Error(
-      `tauri_plus.codegen printed no manifest for '${opts.module}' ` +
+      `pylair.codegen printed no manifest for '${opts.module}' ` +
         `(stdout: ${res.stdout.slice(0, 200)})`,
     );
   }

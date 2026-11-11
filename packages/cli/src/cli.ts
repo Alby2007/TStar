@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * tauri-plus CLI. `codegen` is implemented (M2, docs/codegen.md);
+ * pylair CLI. `codegen` is implemented (M2, docs/codegen.md);
  * dev/build/doctor arrive in M4.
  */
 
@@ -12,9 +12,9 @@ import { loadManifest } from "./manifest.js";
 const COMMANDS = ["dev", "build", "doctor", "codegen"] as const;
 
 function usage(): void {
-  console.log(`tauri-plus — Tauri+ CLI
+  console.log(`pylair — Pylair CLI
 
-Usage: tauri-plus <command> [options]
+Usage: pylair <command> [options]
 
 Commands:
   dev       Run the app with supervised Python + hot reload (M4)
@@ -56,7 +56,7 @@ function spawnProbe(cmd: string): boolean {
 function codegen(argv: string[]): number {
   const module = argValue(argv, "--module", "-m");
   if (!module) {
-    console.error("tauri-plus codegen: --module is required");
+    console.error("pylair codegen: --module is required");
     return 2;
   }
   const out = argValue(argv, "--out", "-o") ?? "src/api.generated.ts";
@@ -69,14 +69,14 @@ function codegen(argv: string[]): number {
   if (check) {
     const stale = !existsSync(out) || readFileSync(out, "utf-8") !== ts;
     if (stale) {
-      console.error(`tauri-plus codegen: ${out} is stale — re-run codegen`);
+      console.error(`pylair codegen: ${out} is stale — re-run codegen`);
       return 1;
     }
     return 0;
   }
   writeFileSync(out, ts);
   const n = manifest.functions?.length ?? 0;
-  console.log(`tauri-plus codegen: wrote ${out} (${n} functions)`);
+  console.log(`pylair codegen: wrote ${out} (${n} functions)`);
   return 0;
 }
 
@@ -94,11 +94,11 @@ function main(argv: string[]): number {
     try {
       return codegen(rest);
     } catch (e) {
-      console.error(`tauri-plus codegen: ${(e as Error).message}`);
+      console.error(`pylair codegen: ${(e as Error).message}`);
       return 1;
     }
   }
-  console.error(`tauri-plus: unknown command '${command}'. Run 'tauri-plus --help'.`);
+  console.error(`pylair: unknown command '${command}'. Run 'pylair --help'.`);
   return 1;
 }
 

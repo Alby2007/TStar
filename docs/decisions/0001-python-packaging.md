@@ -45,7 +45,7 @@ unaffected.
    the last release with Intel-Mac wheels (PyTorch dropped them). aarch64
    / linux / windows get current torch. `uv` resolving against the bundled
    interpreter handles this *correctly and silently* — exactly what we
-   want, but version pinning in `tauri-plus doctor` should surface it.
+   want, but version pinning in `pylair doctor` should surface it.
 3. **Install size is env-dominated.** Interpreter ≈ 69 MiB; torch env adds
    ~593 MiB. A torch-class app ships ~300 MiB installers. Acceptable for
    local-AI apps; document it rather than fight it. (Trimming: stripped

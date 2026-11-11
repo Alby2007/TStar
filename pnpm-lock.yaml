@@ -34,7 +34,7 @@ importers:
         specifier: ^5.6.3
         version: 5.9.3
 
-  packages/create-tauri-plus:
+  packages/create-pylair:
     devDependencies:
       '@types/node':
         specifier: ^22.10.0

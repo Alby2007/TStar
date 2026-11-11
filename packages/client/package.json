@@ -1,7 +1,7 @@
 {
-  "name": "@tauri-plus/client",
+  "name": "@pylair/client",
   "version": "0.0.0",
-  "description": "Tauri+ client SDK: typed Python calls, streams, cancellation, diagnostics",
+  "description": "Pylair client SDK: typed Python calls, streams, cancellation, diagnostics",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

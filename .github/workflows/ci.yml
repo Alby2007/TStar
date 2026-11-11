@@ -26,8 +26,8 @@ jobs:
           cache: pnpm
       - uses: actions/setup-python@v5
         with:
-          # cli codegen tests spawn `python -m tauri_plus.codegen`;
-          # tauri_plus needs 3.12+ (PEP 695 syntax)
+          # cli codegen tests spawn `python -m pylair.codegen`;
+          # pylair needs 3.12+ (PEP 695 syntax)
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -50,7 +50,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          # e2e tests spawn the real runtime; tauri_plus needs 3.12+
+          # e2e tests spawn the real runtime; pylair needs 3.12+
           # (PEP 695 syntax). Matches the bundled-runtime version class.
           python-version: "3.12"
       - name: Linux Tauri dependencies
@@ -75,7 +75,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - working-directory: python/tauri_plus
+      - working-directory: python/pylair
         run: |
           uv sync --frozen
           uv run ruff check src tests

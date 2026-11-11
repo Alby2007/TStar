@@ -1,10 +1,10 @@
 {
-  "name": "tauri-plus-cli",
+  "name": "pylair-cli",
   "version": "0.0.0",
-  "description": "Tauri+ CLI: dev, build, doctor, codegen",
+  "description": "Pylair CLI: dev, build, doctor, codegen",
   "type": "module",
   "bin": {
-    "tauri-plus": "./dist/cli.js"
+    "pylair": "./dist/cli.js"
   },
   "files": ["dist"],
   "scripts": {

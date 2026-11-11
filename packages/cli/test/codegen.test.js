@@ -32,7 +32,9 @@ test("emits plain call wrappers", () => {
     "myapp",
   );
   assert.match(ts, /export function addThem\(a: number, b: number, opts\?: CallOptions\): Promise<number>/);
-  assert.match(ts, /call\("add_them", _toWire\(\{ "a": a, "b": b \}\), opts\)/);
+  assert.match(ts, /call<number>\("add_them", \{ "a": a, "b": b \}, opts\)/);
+  // no wire helpers pasted into generated files — they live in the client
+  assert.doesNotMatch(ts, /_toWire|_fromWire|_mapStream|b64encode/);
 });
 
 test("optional params become ?", () => {
@@ -56,7 +58,7 @@ test("generators emit stream + async generator", () => {
     "m",
   );
   assert.match(ts, /AsyncGenerator<number, void, void>/);
-  assert.match(ts, /_mapStream<number>\(stream\("ticks"/);
+  assert.match(ts, /stream<number>\("ticks"/);
 });
 
 test("dataclasses dedupe into interfaces", () => {
@@ -141,7 +143,7 @@ test("docs become jsdoc, manifest errors throw", () => {
 test("snake_case names stay the wire name", () => {
   const ts = emit(M([FN({ name: "make_thing" })]), "m");
   assert.match(ts, /export function makeThing\(/);
-  assert.match(ts, /call\("make_thing"/);
+  assert.match(ts, /call<null>\("make_thing", \{\}, opts\)/);
 });
 
 // ---- golden: the emitted file is reviewable in-repo ------------------------
@@ -183,9 +185,9 @@ test("loadManifest reads a manifest from a real module", { skip: !hasPython }, (
   const dir = mkdtempSync(path.join(tmpdir(), "tp-codegen-"));
   writeFileSync(
     path.join(dir, "appmod.py"),
-    "from tauri_plus import expose\n@expose\ndef hi(name: str) -> str:\n    return name\n",
+    "from pylair import expose\n@expose\ndef hi(name: str) -> str:\n    return name\n",
   );
-  const src = path.resolve("../../python/tauri_plus/src");
+  const src = path.resolve("../../python/pylair/src");
   const m = loadManifest({
     python: "python3",
     module: "appmod",
