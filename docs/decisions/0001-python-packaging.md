@@ -77,5 +77,14 @@ unaffected.
   (no hypervisor for macOS/Windows); Linux gets closest via the bare
   container. Manual clean-VM pass remains an M6 exit item for the
   reference app.
-- Windows/Linux numbers come from CI (remote pending); only macOS was
-  measured locally.
+- Windows/Linux numbers come from CI; only macOS was measured locally.
+
+## CI confirmation (2026-11-11)
+
+`m0-spike` green on all three OSes: installers built and bundled payload
+verified — bare `ubuntu:22.04` container (Linux), silent NSIS install +
+payload check (Windows), `.app` resource tree (macOS). Two CI lessons
+folded back into the workflow: don't execute AppImages on shared runners
+(extract the deb via `dpkg -x` instead), and normalize path separators
+before asserting on JSON-reported `sys.executable` on Windows.
+**M0 exit criteria met.**
