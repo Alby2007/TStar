@@ -1,14 +1,17 @@
 """Thin async Ollama client for Pylair apps.
 
-Streams plain content deltas — when an app wraps `chat` in an async
-generator and marks it @expose(kind="stream"), tokens flow through the
-normal bridge: pull-credit backpressure, and cancellation aborts the HTTP
-request because task cancellation propagates into httpx.
+Streams plain content deltas — when an app wraps `chat` in an @expose'd
+async generator, tokens flow through the normal bridge: pull-credit
+backpressure, and cancellation aborts the HTTP request because task
+cancellation propagates into httpx.
+
+Host resolution: `host` argument, then $OLLAMA_HOST, then 127.0.0.1:11434.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -16,6 +19,13 @@ from dataclasses import dataclass, field
 import httpx
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
+
+
+def _host(explicit: str | None) -> str:
+    """`host` arg, else OLLAMA_HOST (the same env var the Ollama CLI and
+    its own SDK honor), else localhost."""
+    return explicit or os.environ.get("OLLAMA_HOST") or DEFAULT_HOST
+
 
 # Generation streams can run for minutes; only the connect is bounded.
 _TIMEOUT = httpx.Timeout(None, connect=5.0)
@@ -56,12 +66,12 @@ def _err(e: Exception) -> OllamaError:
     return OllamaError(f"Ollama request failed: {e}")
 
 
-async def status(host: str = DEFAULT_HOST, timeout: float = 2.0) -> OllamaStatus:
+async def status(host: str | None = None, timeout: float = 2.0) -> OllamaStatus:
     """Installed? Running? Version, models — for app UIs and `pylair doctor`
     parity. Never raises; failures land in `error`."""
     s = OllamaStatus(installed=shutil.which("ollama") is not None, running=False)
     try:
-        async with httpx.AsyncClient(base_url=host, timeout=timeout) as c:
+        async with httpx.AsyncClient(base_url=_host(host), timeout=timeout) as c:
             v = await c.get("/api/version")
             v.raise_for_status()
             s.running = True
@@ -80,7 +90,7 @@ async def chat(
     model: str,
     messages: list[Message],
     *,
-    host: str = DEFAULT_HOST,
+    host: str | None = None,
     options: dict | None = None,
 ) -> AsyncIterator[str]:
     """Yield assistant content deltas for a chat completion. Cancelling the
@@ -94,7 +104,7 @@ async def chat(
         payload["options"] = options
     try:
         async with (
-            httpx.AsyncClient(base_url=host, timeout=_TIMEOUT) as c,
+            httpx.AsyncClient(base_url=_host(host), timeout=_TIMEOUT) as c,
             c.stream("POST", "/api/chat", json=payload) as r,
         ):
             r.raise_for_status()
@@ -114,12 +124,12 @@ async def chat(
         raise _err(e) from e
 
 
-async def pull(model: str, *, host: str = DEFAULT_HOST) -> AsyncIterator[dict]:
+async def pull(model: str, *, host: str | None = None) -> AsyncIterator[dict]:
     """Yield Ollama pull progress events ({status, completed, total}).
     For 'download the model on first run' UX."""
     try:
         async with (
-            httpx.AsyncClient(base_url=host, timeout=_TIMEOUT) as c,
+            httpx.AsyncClient(base_url=_host(host), timeout=_TIMEOUT) as c,
             c.stream("POST", "/api/pull", json={"model": model, "stream": True}) as r,
         ):
             r.raise_for_status()
