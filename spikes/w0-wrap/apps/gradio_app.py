@@ -15,11 +15,22 @@ def save_file(f):
     return f"{MARKER} got {f.name if f else 'nothing'}"
 
 
+def make_file():
+    # gr.File output needs a real path — return one so the UI renders a
+    # download link (that link is the webview download row).
+    import tempfile
+
+    p = tempfile.mktemp(prefix="w0-gradio-", suffix=".txt")
+    with open(p, "w") as fh:
+        fh.write(MARKER)
+    return p
+
+
 with gr.Blocks(title="w0 gradio") as demo:
     gr.Markdown(f"# {MARKER}")
     gr.ChatInterface(chat, type="messages")
     gr.Interface(save_file, inputs=gr.File(), outputs=gr.Text())
-    gr.Interface(lambda: MARKER, inputs=None, outputs=gr.File())
+    gr.Interface(make_file, inputs=None, outputs=gr.File())
     gr.Interface(lambda p: p, inputs=gr.Image(), outputs=gr.Image())
 
 if __name__ == "__main__":

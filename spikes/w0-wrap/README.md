@@ -91,18 +91,31 @@ loopback URL. Findings that matter beyond the spike:
 
 | check | fastapi mac | fastapi win | fastapi linux | gradio mac | gradio win | gradio linux | streamlit mac | streamlit win | streamlit linux |
 |---|---|---|---|---|---|---|---|---|---|
-| page load + WS/SSE stays connected | pass (SSE held) | | | pass (session conns) | | | pass (ws conns) | | |
-| text input + long streamed output | | | | | | | | | |
-| file upload dialog + drag-drop | | | | | | | | | |
-| file download (save dialog, destination) | | | | | | | | | |
-| mic/camera permission prompts | | | | n/a in sample | | | | | |
-| clipboard copy/paste | | | | | | | | | |
-| external link → system browser | | | | | | | | | |
-| window close kills server tree | pass (0 survivors) | | | pass* | | | pass (0 survivors) | | |
-| kill -9 → restarting page → recover | pass (re-nav) | | | | | | | | |
+| page load + WS/SSE stays connected | pass (SSE held) | | | pass (chat works) | | | pass (ws conns) | | |
+| text input + long streamed output | pass (SSE ticks) | | | pass (chat echo) | | | pass (rerun) | | |
+| file upload dialog + drag-drop | pass (native picker) | | | pass (native picker) | | | pass (native picker) | | |
+| file download (save dialog, destination) | quirk¹ | | | quirk¹ | | | silent² | | |
+| mic/camera permission prompts | n/a in sample | | | n/a in sample | | | n/a | | |
+| clipboard copy/paste | pass | | | pass | | | pass | | |
+| external link → system browser | fail³ | | | fail³ | | | fail³ | | |
+| window close kills server tree | pass (0 survivors) | | | pass | | | pass (0 survivors) | | |
+| kill -9 → restarting page → recover | pass (re-nav, 3x) | | | pass (re-nav) | | | — | | |
 | IPC from remote page | pass (all REJECTED) | | | (same origin policy) | | | (same) | | |
 | launch→ready time | ~1-3s | | | ~2s | | | ~2s | | |
 | installer size / memory | | | | | | | | | |
+
+¹ download: file lands in ~/Downloads silently (no save dialog) AND the
+  webview navigates to display the content — user stranded with no
+  back/reload. W1: register a download handler + keep navigation on the
+  app origin.
+² streamlit download_button: downloads silently to ~/Downloads with ZERO
+  feedback — no dialog, no toast. Mechanically fine, UX trap.
+³ external link (target=_blank / link_button): silently swallowed —
+  wry drops new-window requests without a registered
+  new_window_req_handler. W1: handler → shell.open in system browser,
+  plus navigation_handler blocking off-origin in-place nav.
+Also noted: a full-page navigation to an error/JSON response strands
+the user — no back button, Cmd+R not wired.
 
 Fill with pass / works-with-fix / fails + notes; results and the go/no-go
 recommendation land in docs/decisions/0003-wrap-mode.md.
