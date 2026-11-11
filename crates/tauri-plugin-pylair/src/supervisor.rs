@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{interval, timeout};
 
 use crate::protocol::{self as proto, ErrorObj, InMsg};
 use crate::transport::Transport;
@@ -92,6 +92,10 @@ pub struct SupervisorConfig {
     pub shutdown_grace: Duration,
     /// Stream pull-credit granted to a new streaming call up front.
     pub initial_stream_credit: u64,
+    /// Chunks buffered per stream between the supervisor and its consumer.
+    /// A consumer that falls this far behind is cut off (and its producer
+    /// cancelled) rather than allowed to stall the supervisor.
+    pub stream_buffer: usize,
     pub max_frame: usize,
     /// Dev-mode hot reload: when this file's mtime changes, respawn the
     /// runtime (no crash accounting). Falls back to the
@@ -111,6 +115,7 @@ impl Default for SupervisorConfig {
             breaker_window: Duration::from_secs(60),
             shutdown_grace: Duration::from_secs(5),
             initial_stream_credit: 64,
+            stream_buffer: 256,
             max_frame: proto::max_frame(),
             restart_trigger: None,
         }
@@ -128,6 +133,80 @@ pub enum StreamItem {
     End(Result<Value, ErrorObj>),
 }
 
+/// Supervisor-side end of a stream. Chunks are bounded (`try_send`); the
+/// terminal result travels on its own one-shot, so it can never be lost to a
+/// full chunk buffer and delivering it never awaits.
+struct StreamSink {
+    chunks: mpsc::Sender<StreamItem>,
+    end: Option<oneshot::Sender<Result<Value, ErrorObj>>>,
+}
+
+/// Why a chunk could not be delivered.
+enum ChunkFail {
+    /// Buffer full: the consumer is not draining.
+    Stalled,
+    /// Receiver dropped: the consumer is gone.
+    Gone,
+}
+
+impl StreamSink {
+    fn chunk(&self, seq: u64, value: Value) -> Result<(), ChunkFail> {
+        self.chunks
+            .try_send(StreamItem::Chunk { seq, value })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => ChunkFail::Stalled,
+                mpsc::error::TrySendError::Closed(_) => ChunkFail::Gone,
+            })
+    }
+
+    /// Deliver the terminal. Never blocks; dropping the sink afterwards closes
+    /// the chunk channel, which is how the receiver learns to read the end.
+    fn finish(mut self, result: Result<Value, ErrorObj>) {
+        if let Some(end) = self.end.take() {
+            let _ = end.send(result);
+        }
+    }
+}
+
+/// Consumer-side end of a stream: queued chunks first, then exactly one
+/// `StreamItem::End`, then `None`.
+pub struct StreamRx {
+    chunks: mpsc::Receiver<StreamItem>,
+    end: Option<oneshot::Receiver<Result<Value, ErrorObj>>>,
+}
+
+impl StreamRx {
+    pub async fn recv(&mut self) -> Option<StreamItem> {
+        if self.end.is_some() {
+            if let Some(item) = self.chunks.recv().await {
+                return Some(item);
+            }
+            // Chunk channel closed => the sink is gone and the terminal is set
+            // (or the supervisor itself dropped).
+            let end = self.end.take()?;
+            return Some(StreamItem::End(
+                end.await.unwrap_or_else(|_| Err(stopped_err())),
+            ));
+        }
+        None
+    }
+}
+
+fn stream_pair(buffer: usize) -> (StreamSink, StreamRx) {
+    let (ctx, crx) = mpsc::channel(buffer.max(1));
+    let (etx, erx) = oneshot::channel();
+    (
+        StreamSink {
+            chunks: ctx,
+            end: Some(etx),
+        },
+        StreamRx {
+            chunks: crx,
+            end: Some(erx),
+        },
+    )
+}
+
 enum Command {
     Call {
         fn_name: String,
@@ -138,7 +217,7 @@ enum Command {
     CallStream {
         fn_name: String,
         input: Value,
-        items: mpsc::Sender<StreamItem>,
+        items: StreamSink,
         task_out: oneshot::Sender<u64>,
     },
     Cancel {
@@ -151,12 +230,15 @@ enum Command {
     },
     /// Operator-initiated restart out of the Failed state.
     Retry,
-    Shutdown,
+    /// Stop the runtime. `ack` fires only after the process tree is reaped.
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 enum PendingKind {
     Call(oneshot::Sender<Result<Value, ErrorObj>>),
-    Stream(mpsc::Sender<StreamItem>),
+    Stream(StreamSink),
     Cancel { respond: oneshot::Sender<bool> },
 }
 
@@ -173,6 +255,7 @@ pub struct CallTask {
 pub struct Handle {
     cmd: mpsc::Sender<Command>,
     state: watch::Receiver<State>,
+    stream_buffer: usize,
 }
 
 impl Handle {
@@ -215,8 +298,8 @@ impl Handle {
         &self,
         fn_name: &str,
         input: Value,
-    ) -> Result<(u64, mpsc::Receiver<StreamItem>), ErrorObj> {
-        let (items_tx, items_rx) = mpsc::channel(64);
+    ) -> Result<(u64, StreamRx), ErrorObj> {
+        let (items_tx, items_rx) = stream_pair(self.stream_buffer);
         let (task_tx, task_rx) = oneshot::channel();
         self.cmd
             .send(Command::CallStream {
@@ -257,8 +340,14 @@ impl Handle {
             .map_err(|_| stopped_err())
     }
 
+    /// Stop the runtime and wait until its process tree is gone (or the
+    /// supervisor has already stopped). Resolving means cleanup finished, not
+    /// merely that the request was queued.
     pub async fn shutdown(&self) {
-        let _ = self.cmd.send(Command::Shutdown).await;
+        let (ack, done) = oneshot::channel();
+        if self.cmd.send(Command::Shutdown { ack }).await.is_ok() {
+            let _ = done.await;
+        }
     }
 }
 
@@ -284,6 +373,7 @@ pub fn spawn(
 ) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (state_tx, state_rx) = watch::channel(State::Starting);
+    let stream_buffer = config.stream_buffer;
     let actor = Supervisor {
         spec,
         config,
@@ -294,12 +384,14 @@ pub fn spawn(
         next_id: AtomicU64::new(1),
         next_task: AtomicU64::new(1),
         ready_since: None,
+        shutdown_acks: Vec::new(),
     }
     .run();
     (
         Handle {
             cmd: cmd_tx,
             state: state_rx,
+            stream_buffer,
         },
         actor,
     )
@@ -317,6 +409,8 @@ struct Supervisor {
     /// When the current generation reached Ready — a crash after a sustained
     /// ready period is a fresh incident, not a boot loop.
     ready_since: Option<Instant>,
+    /// Waiters for a completed shutdown, released when the actor stops.
+    shutdown_acks: Vec<oneshot::Sender<()>>,
 }
 
 /// Per-child IO plumbing, owned by the per-spawn scope.
@@ -373,6 +467,34 @@ impl Supervisor {
     }
 
     async fn run(mut self) {
+        self.run_loop().await;
+        for ack in self.shutdown_acks.drain(..) {
+            let _ = ack.send(());
+        }
+    }
+
+    /// Wait out a restart backoff, but honour Shutdown immediately and fail
+    /// other commands fast (the runtime is down; callers must not hang).
+    /// Returns true if shutdown was requested.
+    async fn sleep_or_shutdown(&mut self, d: Duration) -> bool {
+        let deadline = tokio::time::sleep(d);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return false,
+                cmd = self.cmd_rx.recv() => match cmd {
+                    None => return true,
+                    Some(Command::Shutdown { ack }) => {
+                        self.shutdown_acks.push(ack);
+                        return true;
+                    }
+                    Some(c) => fail_command_fast(c, "runtime is restarting"),
+                },
+            }
+        }
+    }
+
+    async fn run_loop(&mut self) {
         let mut crashes: VecDeque<Instant> = VecDeque::new();
         let mut backoff = self.config.backoff_base;
         loop {
@@ -442,7 +564,10 @@ impl Supervisor {
                         continue;
                     }
                     self.set_state(State::Restarting, reason);
-                    sleep(jitter(backoff)).await;
+                    if self.sleep_or_shutdown(jitter(backoff)).await {
+                        self.set_state(State::Stopped, "shutdown");
+                        return;
+                    }
                     backoff = (backoff * 2).min(self.config.backoff_cap);
                     self.generation += 1;
                 }
@@ -455,21 +580,17 @@ impl Supervisor {
     async fn park_failed(&mut self) -> bool {
         loop {
             match self.cmd_rx.recv().await {
-                None | Some(Command::Shutdown) => {
+                None => {
+                    self.set_state(State::Stopped, "shutdown");
+                    return false;
+                }
+                Some(Command::Shutdown { ack }) => {
+                    self.shutdown_acks.push(ack);
                     self.set_state(State::Stopped, "shutdown");
                     return false;
                 }
                 Some(Command::Retry) => return true,
-                Some(Command::Call { respond, .. }) => {
-                    let _ = respond.send(Err(stopped_err()));
-                }
-                Some(Command::CallStream { items, .. }) => {
-                    let _ = items.try_send(StreamItem::End(Err(stopped_err())));
-                }
-                Some(Command::Cancel { respond, .. }) => {
-                    let _ = respond.send(false);
-                }
-                Some(Command::GrantCredit { .. }) => {}
+                Some(c) => fail_command_fast(c, "runtime is stopped"),
             }
         }
     }
@@ -520,7 +641,6 @@ impl Supervisor {
         let mut call_of_task: HashMap<u64, u64> = HashMap::new(); // task -> call_id
         let mut pongs_outstanding: u32 = 0;
         let mut ping_seq: u64 = 0;
-        let mut stalled_calls: Vec<u64> = Vec::new();
         let mut ping_tick = interval(self.config.ping_interval);
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -547,9 +667,7 @@ impl Supervisor {
                             if let Some(kind) = pending.remove(&id) {
                                 match kind {
                                     PendingKind::Call(tx) => { let _ = tx.send(out); }
-                                    PendingKind::Stream(tx) => {
-                                        let _ = tx.send(StreamItem::End(out)).await;
-                                    }
+                                    PendingKind::Stream(sink) => sink.finish(out),
                                     PendingKind::Cancel { respond } => {
                                         let cancelled = out
                                             .as_ref()
@@ -573,25 +691,40 @@ impl Supervisor {
                                 }
                                 "stream.chunk" => {
                                     let task = p["task"].as_u64().unwrap_or(0);
+                                    let seq = p["seq"].as_u64().unwrap_or(0);
+                                    let value = p["value"].clone();
+                                    let mut abandoned = None;
                                     if let Some(&call_id) = call_of_task.get(&task) {
-                                        if let Some(PendingKind::Stream(tx)) = pending.get(&call_id) {
-                                            let chunk = StreamItem::Chunk {
-                                                seq: p["seq"].as_u64().unwrap_or(0),
-                                                value: p["value"].clone(),
-                                            };
-                                            if tx.try_send(chunk).is_err() {
-                                                // Consumer channel full: don't silently
-                                                // drop — end the stream with an error.
-                                                let _ = self.events.try_send(RuntimeEvent::Stderr(
-                                                    format!("task {task}: stream consumer stalled")));
-                                                let _ = tx.try_send(StreamItem::End(Err(ErrorObj {
-                                                    code: proto::INTERNAL,
-                                                    message: "stream consumer stalled".into(),
-                                                    data: None,
-                                                })));
-                                                stalled_calls.push(call_id);
+                                        if let Some(PendingKind::Stream(sink)) = pending.get(&call_id) {
+                                            if let Err(why) = sink.chunk(seq, value) {
+                                                abandoned = Some((call_id, why));
                                             }
                                         }
+                                    }
+                                    if let Some((call_id, why)) = abandoned {
+                                        // The consumer stalled or vanished. End the stream
+                                        // with a terminal that cannot be lost, and STOP the
+                                        // producer instead of leaving it running unobserved.
+                                        let (msg, note) = match why {
+                                            ChunkFail::Stalled => ("stream consumer stalled", "stalled"),
+                                            ChunkFail::Gone => ("stream consumer went away", "went away"),
+                                        };
+                                        let _ = self.events.try_send(RuntimeEvent::Stderr(
+                                            format!("task {task}: stream consumer {note}; cancelling producer")));
+                                        if let Some(PendingKind::Stream(sink)) = pending.remove(&call_id) {
+                                            sink.finish(Err(ErrorObj {
+                                                code: proto::INTERNAL,
+                                                message: msg.into(),
+                                                data: None,
+                                            }));
+                                        }
+                                        task_of_call.remove(&call_id);
+                                        call_of_task.remove(&task);
+                                        let cid = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                        let (ack, _) = oneshot::channel();
+                                        pending.insert(cid, PendingKind::Cancel { respond: ack });
+                                        send_frame(&io, &proto::request(cid, "cancel",
+                                            serde_json::json!({"task": task})));
                                     }
                                 }
                                 _ => {} // unknown notifications are ignored (spec §8)
@@ -651,7 +784,7 @@ impl Supervisor {
                                 task_of_call.insert(id, task);
                                 call_of_task.insert(task, id);
                             } else {
-                                let _ = items.send(StreamItem::End(Err(stopped_err()))).await;
+                                items.finish(Err(stopped_err()));
                             }
                         }
                         Command::Cancel { task, respond } => {
@@ -672,14 +805,17 @@ impl Supervisor {
                         Command::Retry => {
                             // Only meaningful from Failed — already serving.
                         }
-                        Command::Shutdown => {
+                        Command::Shutdown { ack } => {
+                            self.shutdown_acks.push(ack);
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
                             send_frame(&io, &body);
-                            let _ = timeout(self.config.shutdown_grace, &mut io.exited).await;
-                            // io.exited may already be consumed by the grace
-                            // wait — fire the kill signal without re-polling it.
-                            let _ = io.kill.try_send(());
+                            // Graceful exit within the grace window consumes
+                            // `exited`; on timeout it is still pollable, so
+                            // kill the tree and wait for the reap.
+                            if timeout(self.config.shutdown_grace, &mut io.exited).await.is_err() {
+                                kill_and_reap(&mut io).await;
+                            }
                             fail_all(&mut pending, proto::RUNTIME_UNAVAILABLE, "shutdown").await;
                             return ExitCause::CleanShutdown;
                         }
@@ -730,12 +866,28 @@ impl Supervisor {
                     return ExitCause::Crashed(detail);
                 }
             }
-            for id in stalled_calls.drain(..) {
-                pending.remove(&id);
-                if let Some(t) = task_of_call.remove(&id) {
-                    call_of_task.remove(&t);
-                }
-            }
+        }
+    }
+}
+
+/// Answer a command immediately when there is no runtime to run it.
+fn fail_command_fast(c: Command, why: &str) {
+    let err = || ErrorObj {
+        code: proto::RUNTIME_UNAVAILABLE,
+        message: why.into(),
+        data: None,
+    };
+    match c {
+        Command::Call { respond, .. } => {
+            let _ = respond.send(Err(err()));
+        }
+        Command::CallStream { items, .. } => items.finish(Err(err())),
+        Command::Cancel { respond, .. } => {
+            let _ = respond.send(false);
+        }
+        Command::GrantCredit { .. } | Command::Retry => {}
+        Command::Shutdown { ack } => {
+            let _ = ack.send(());
         }
     }
 }
@@ -762,9 +914,7 @@ async fn fail_all(pending: &mut HashMap<u64, PendingKind>, code: i64, msg: &str)
             PendingKind::Call(tx) => {
                 let _ = tx.send(Err(err));
             }
-            PendingKind::Stream(tx) => {
-                let _ = tx.send(StreamItem::End(Err(err))).await;
-            }
+            PendingKind::Stream(sink) => sink.finish(Err(err)),
             PendingKind::Cancel { respond } => {
                 let _ = respond.send(false);
             }
@@ -827,12 +977,22 @@ async fn spawn_child(
     // Job Object handle must outlive the child — held by the monitor task.
     #[cfg(windows)]
     let job = assign_to_job_object(pid);
+    #[cfg(windows)]
+    if job.is_none() {
+        let _ = events.try_send(RuntimeEvent::Stderr(
+            "pylair: could not place the runtime in a Job Object; falling back to \
+             taskkill /T for cleanup (descendants may survive a hard host exit)"
+                .into(),
+        ));
+    }
+    #[cfg(windows)]
+    let tree_pid = pid;
 
     // monitor: owns the child, awaits exit or kill signal
     let (exit_tx, exit_rx) = oneshot::channel();
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     #[cfg(windows)]
-    tokio::spawn(monitor_child(child, kill_rx, exit_tx, job));
+    tokio::spawn(monitor_child(child, kill_rx, exit_tx, job, tree_pid));
     #[cfg(not(windows))]
     tokio::spawn(monitor_child(child, kill_rx, exit_tx));
 
@@ -936,13 +1096,33 @@ async fn monitor_child(
     mut kill_rx: mpsc::Receiver<()>,
     exit_tx: oneshot::Sender<io::Result<std::process::ExitStatus>>,
 ) {
+    #[cfg(unix)]
+    let pgid = child.id();
     tokio::select! {
-        status = child.wait() => { let _ = exit_tx.send(status); }
+        status = child.wait() => {
+            // The leader exiting on its own must not leave group members
+            // (workers, user subprocesses) running with no supervisor.
+            #[cfg(unix)]
+            if let Some(pgid) = pgid {
+                reap_group(pgid);
+            }
+            let _ = exit_tx.send(status);
+        }
         _ = kill_rx.recv() => {
             kill_tree(&mut child).await;
             let status = child.wait().await;
             let _ = exit_tx.send(status);
         }
+    }
+}
+
+/// SIGKILL every remaining member of the process group `pgid` we created.
+/// ESRCH (already empty) and EPERM (group id recycled by an unrelated
+/// process) are both "nothing of ours left to kill".
+#[cfg(unix)]
+fn reap_group(pgid: u32) {
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGKILL);
     }
 }
 
@@ -953,11 +1133,21 @@ async fn monitor_child(
     exit_tx: oneshot::Sender<io::Result<std::process::ExitStatus>>,
     // Holding this keeps the Job Object alive; it closes when the monitor
     // task ends (after the child exits), which also kills any survivors.
-    _job: Option<JobHandle>,
+    job: Option<JobHandle>,
+    tree_pid: Option<u32>,
 ) {
     tokio::select! {
         status = child.wait() => { let _ = exit_tx.send(status); }
         _ = kill_rx.recv() => {
+            if job.is_none() {
+                // No Job Object: taskkill /T is the only way to reach the tree.
+                if let Some(pid) = tree_pid {
+                    let _ = tokio::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output()
+                        .await;
+                }
+            }
             let _ = child.start_kill(); // Job Object also reaps on handle close
             let status = child.wait().await;
             let _ = exit_tx.send(status);

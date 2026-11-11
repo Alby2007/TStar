@@ -160,6 +160,7 @@ fn fast_config() -> SupervisorConfig {
         breaker_window: Duration::from_secs(60),
         shutdown_grace: Duration::from_secs(2),
         initial_stream_credit: 8,
+        stream_buffer: 256,
         max_frame: proto::max_frame(),
         restart_trigger: None,
     }
@@ -482,4 +483,190 @@ async fn restart_trigger_respawns_cleanly() {
     assert_eq!(out, json!({"after": "restart"}));
     h.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- stream consumer failure (audit P1-5) ----
+
+async fn produced(h: &Handle) -> i64 {
+    timeout(T, h.call("produced_count", json!({})))
+        .await
+        .expect("produced_count timed out")
+        .unwrap()
+        .as_i64()
+        .unwrap()
+}
+
+/// Lots of credit + a tiny buffer + a consumer that never drains: the
+/// supervisor must stay live, the stream must still receive an explicit
+/// terminal error (not hang), and the producer must be stopped.
+#[tokio::test]
+async fn stalled_consumer_gets_terminal_error_and_producer_stops() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.initial_stream_credit = 100_000;
+    cfg.stream_buffer = 4;
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    let (_task, mut items) = timeout(T, h.call_stream("infinite_counted", json!({})))
+        .await
+        .expect("call_stream timed out")
+        .unwrap();
+    // Do not drain. The supervisor must keep serving other calls meanwhile.
+    sleep(Duration::from_millis(500)).await;
+    let out = timeout(T, h.call("add", json!({"a": 1, "b": 2})))
+        .await
+        .expect("supervisor wedged behind a stalled stream");
+    assert_eq!(out.unwrap(), json!(3));
+
+    // Producer was cancelled: its counter stops moving.
+    let a = produced(&h).await;
+    sleep(Duration::from_millis(400)).await;
+    let b = produced(&h).await;
+    assert_eq!(a, b, "producer kept running after its consumer stalled");
+
+    // Late consumer: gets the buffered chunks, then the terminal error.
+    let mut end = None;
+    while let Some(item) = timeout(T, items.recv()).await.expect("recv timed out") {
+        if let tauri_plugin_pylair::supervisor::StreamItem::End(r) = item {
+            end = Some(r);
+            break;
+        }
+    }
+    let err = end.expect("stream never delivered a terminal").unwrap_err();
+    assert!(err.message.contains("stalled"), "{err:?}");
+    assert!(timeout(T, items.recv()).await.unwrap().is_none());
+}
+
+/// Receiver dropped (consumer vanished): the producer must be cancelled.
+#[tokio::test]
+async fn vanished_consumer_cancels_the_producer() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.initial_stream_credit = 100_000;
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    let (_task, items) = timeout(T, h.call_stream("infinite_counted", json!({})))
+        .await
+        .expect("call_stream timed out")
+        .unwrap();
+    sleep(Duration::from_millis(200)).await;
+    drop(items);
+    sleep(Duration::from_millis(500)).await;
+    let a = produced(&h).await;
+    sleep(Duration::from_millis(400)).await;
+    let b = produced(&h).await;
+    assert_eq!(a, b, "producer kept running after its consumer vanished");
+}
+
+// ---- process containment (audit P1-6) ----
+
+/// A fake runtime that spawns a heartbeat grandchild, then behaves like
+/// FAKE_READY (or, with `crash`, exits right after hello). The heartbeat
+/// file only keeps growing while the grandchild is alive.
+fn runtime_with_grandchild(beat: &std::path::Path, crash: bool) -> String {
+    let path = beat.to_string_lossy().replace('\\', "/");
+    format!(
+        r#"
+import sys, struct, json, subprocess, time
+def w(o):
+    b = json.dumps(o).encode()
+    sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
+subprocess.Popen([sys.executable, "-c",
+    "import time\nf = open('{path}', 'a')\nwhile True:\n    f.write('x'); f.flush(); time.sleep(0.1)"])
+w({{"jsonrpc":"2.0","method":"hello","params":{{"protocol":1,"exposes":[]}}}})
+if {crash}:
+    time.sleep(0.5)
+    sys.exit(3)
+while True:
+    h = sys.stdin.buffer.read(4)
+    if len(h) < 4: break
+    n, = struct.unpack(">I", h)
+    m = json.loads(sys.stdin.buffer.read(n))
+    if m["method"] == "ping":
+        w({{"jsonrpc":"2.0","method":"pong","params":{{"seq": m["params"]["seq"]}}}})
+    elif m["method"] == "shutdown":
+        w({{"jsonrpc":"2.0","id": m["id"],"result": None}}); break
+"#,
+        path = path,
+        crash = if crash { "True" } else { "False" },
+    )
+}
+
+fn beat_len(p: &std::path::Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+async fn assert_heartbeat_stopped(beat: &std::path::Path, what: &str) {
+    sleep(Duration::from_millis(500)).await;
+    let a = beat_len(beat);
+    sleep(Duration::from_millis(700)).await;
+    let b = beat_len(beat);
+    assert_eq!(a, b, "grandchild kept running after {what}");
+}
+
+fn beat_file(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("pylair-beat-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+#[tokio::test]
+async fn shutdown_resolves_only_after_the_whole_tree_is_gone() {
+    let beat = beat_file("shutdown");
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn_h(
+        spec(&runtime_with_grandchild(&beat, false)),
+        fast_config(),
+        ev,
+    );
+    wait_state(&h, State::Ready).await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(beat_len(&beat) > 0, "grandchild never started");
+
+    timeout(T, h.shutdown())
+        .await
+        .expect("shutdown never resolved");
+    // The ack means cleanup finished: the grandchild must already be dead.
+    let a = beat_len(&beat);
+    sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        a,
+        beat_len(&beat),
+        "shutdown() resolved with a live descendant"
+    );
+    let _ = std::fs::remove_file(&beat);
+}
+
+#[tokio::test]
+async fn runtime_exiting_on_its_own_does_not_leave_descendants() {
+    let beat = beat_file("crash");
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.breaker_crashes = 2;
+    let h = spawn_h(spec(&runtime_with_grandchild(&beat, true)), cfg, ev);
+    wait_state(&h, State::Failed).await;
+    assert!(
+        beat_len(&beat) > 0,
+        "grandchild never started — the test would pass vacuously"
+    );
+    assert_heartbeat_stopped(&beat, "the runtime crashed").await;
+    let _ = std::fs::remove_file(&beat);
+}
+
+#[tokio::test]
+async fn shutdown_during_restart_backoff_does_not_wait_out_the_backoff() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let mut cfg = fast_config();
+    cfg.breaker_crashes = 100; // stay in Restarting, never Failed
+    cfg.backoff_base = Duration::from_secs(30);
+    cfg.backoff_cap = Duration::from_secs(30);
+    let h = spawn_h(spec(FAKE_EXIT_NOW), cfg, ev);
+    wait_state(&h, State::Restarting).await;
+    let t0 = std::time::Instant::now();
+    timeout(Duration::from_secs(5), h.shutdown())
+        .await
+        .expect("shutdown blocked behind the restart backoff");
+    assert!(t0.elapsed() < Duration::from_secs(5));
 }

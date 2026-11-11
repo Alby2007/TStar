@@ -7,6 +7,7 @@ credit-flow guarantees.
 
 import os
 import queue
+import signal
 import struct
 import subprocess
 import sys
@@ -219,6 +220,35 @@ def test_cancel_isolated_kills_sigterm_immune_grandchild(runtime, tmp_path):
         time.sleep(0.1)
     else:
         pytest.fail(f"grandchild {gpid} survived the group kill")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="posix process groups")
+def test_runtime_killed_hard_reaps_isolated_worker_and_grandchildren(runtime, tmp_path):
+    """Workers live in their own session, outside the runtime's process
+    group, so a forced kill of the runtime (what the host does) cannot reach
+    them. The worker must reap its own group when its parent disappears."""
+    runtime.recv()
+    pidfile = tmp_path / "grandchild.pid"
+    runtime.send(call(1, "orphan_maker", task=1, input={"pidfile": str(pidfile)}))
+    deadline = time.time() + 15
+    while not pidfile.exists():
+        assert time.time() < deadline, "grandchild never spawned"
+        time.sleep(0.1)
+    gpid = int(pidfile.read_text().strip())
+    os.kill(gpid, 0)  # alive, and it ignores SIGTERM
+
+    runtime.proc.kill()  # SIGKILL the runtime only — no cleanup runs
+    runtime.proc.wait(timeout=10)
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(gpid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+    os.kill(gpid, signal.SIGKILL)  # don't leak it from the test itself
+    pytest.fail(f"grandchild {gpid} outlived a hard kill of the runtime")
 
 
 # ---- lifecycle --------------------------------------------------------------

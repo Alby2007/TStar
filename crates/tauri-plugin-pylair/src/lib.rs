@@ -279,6 +279,22 @@ impl<R: Runtime> Builder<R> {
                 });
                 Ok(())
             })
+            .on_event(|app, event| {
+                // Block exit until the runtime's process tree is gone: the
+                // async drop below may never get to run once the process ends.
+                if let tauri::RunEvent::Exit = event {
+                    if let Some(rt) = app.try_state::<PyRuntime>() {
+                        let handle = rt.0.clone();
+                        tauri::async_runtime::block_on(async move {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                handle.shutdown(),
+                            )
+                            .await;
+                        });
+                    }
+                }
+            })
             .on_drop(|app| {
                 if let Some(rt) = app.try_state::<PyRuntime>() {
                     let handle = rt.0.clone();

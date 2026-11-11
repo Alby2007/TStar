@@ -60,6 +60,27 @@ async def infinite():
         i += 1
 
 
+_produced = 0
+
+
+@expose
+async def infinite_counted() -> AsyncGenerator[int, None]:
+    """Infinite producer that counts what it yields — lets a test prove the
+    producer actually STOPPED (not just that the consumer stopped reading)."""
+    global _produced
+    i = 0
+    while True:
+        _produced += 1
+        yield i
+        i += 1
+        await asyncio.sleep(0)
+
+
+@expose
+def produced_count() -> int:
+    return _produced
+
+
 @expose
 async def sleep_forever() -> None:
     await asyncio.sleep(3600)

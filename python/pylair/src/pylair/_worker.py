@@ -14,14 +14,44 @@ from __future__ import annotations
 
 import importlib
 import os
+import signal
 import sys
+import threading
+import time
 import traceback
 
 from pylair import _json
 from pylair import _protocol as proto
 
 
+def _exit_with_parent() -> None:
+    """Reap this worker's whole process group if the runtime disappears.
+
+    Workers run in their own session (so a single task can be cancelled by
+    killing exactly its group), which means a hard kill of the runtime's own
+    process group cannot reach them. When the parent is gone the worker is
+    re-parented; SIGKILL the group (worker + any grandchildren, SIGTERM
+    ignorers included) rather than run on unsupervised. On Windows the host's
+    Job Object already contains workers.
+    """
+    if sys.platform == "win32":
+        return
+    parent = os.getppid()
+
+    def watch() -> None:
+        while True:
+            time.sleep(0.5)
+            if os.getppid() != parent:
+                try:
+                    os.killpg(0, signal.SIGKILL)
+                finally:
+                    os._exit(1)
+
+    threading.Thread(target=watch, daemon=True, name="pylair-parent-watch").start()
+
+
 def main() -> int:
+    _exit_with_parent()
     if len(sys.argv) != 3:
         print("usage: python -m pylair._worker <module> <fn>", file=sys.stderr)
         return 2
