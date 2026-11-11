@@ -1,0 +1,114 @@
+name: Publish to PyPI
+
+# Manual dispatch only. No long-lived tokens: each job uses OIDC trusted
+# publishing through a protected environment.
+#
+# One-time setup (repo Settings → Environments, then pypi.org):
+#   - create environments `pypi` and `pypi-ollama` (add required-reviewers
+#     rules for extra safety)
+#   - on pypi.org → Account → Publishing, add a trusted publisher per
+#     package: owner PylairHQ, repo Pylair, workflow release.yml,
+#     environment pypi (for `pylair`) / pypi-ollama (for `pylair-ollama`)
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Which package to publish"
+        type: choice
+        options: [pylair, pylair-ollama, both]
+        required: true
+      version:
+        description: "Version to publish (e.g. 0.1.0 or 0.1.0rc1)"
+        required: true
+      dry_run:
+        description: "Build + check only, do not upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # commit the version bump + tag on real publishes
+
+jobs:
+  publish-pylair:
+    if: ${{ inputs.package == 'pylair' || inputs.package == 'both' }}
+    environment: pypi
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write # OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel + sdist
+        run: |
+          cd python/pylair
+          sed -i.bak 's/^version = ".*"/version = "${{ inputs.version }}"/' pyproject.toml
+          rm -f pyproject.toml.bak
+          grep '^version' pyproject.toml
+          uv build
+
+      - name: Check the distribution
+        run: uvx twine check python/pylair/dist/*
+
+      - name: Commit the version bump
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: pylair v${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/pylair/dist
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag -a "pylair-v${{ inputs.version }}" -m "pylair ${{ inputs.version }}"
+          git push origin "pylair-v${{ inputs.version }}"
+
+  publish-ollama:
+    if: ${{ inputs.package == 'pylair-ollama' || inputs.package == 'both' }}
+    environment: pypi-ollama
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write # OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build wheel + sdist
+        run: |
+          cd integrations/ollama
+          sed -i.bak 's/^version = ".*"/version = "${{ inputs.version }}"/' pyproject.toml
+          rm -f pyproject.toml.bak
+          grep '^version' pyproject.toml
+          uv build
+
+      - name: Check the distribution
+        run: uvx twine check integrations/ollama/dist/*
+
+      - name: Commit the version bump
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: pylair-ollama v${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: integrations/ollama/dist
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag -a "pylair-ollama-v${{ inputs.version }}" -m "pylair-ollama ${{ inputs.version }}"
+          git push origin "pylair-ollama-v${{ inputs.version }}"

@@ -1,0 +1,75 @@
+name: Publish npm packages
+
+# Manual dispatch only. Publishes @pylair/client, pylair-cli and
+# create-pylair in dependency order. Requires the NPM_TOKEN repo secret
+# (npm granular access token with publish on the three packages — create
+# it AFTER registering the @pylair scope, or use an automation token).
+# Runs inside the `npm` environment if you create one (recommended:
+# required reviewers before any registry write).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for all three packages (e.g. 0.1.0 or 0.1.0-rc.1)"
+        required: true
+      dry_run:
+        description: "Pack only, do not upload"
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    environment: npm
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # version bump + tag
+      id-token: write # --provenance attestations
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - name: Bump all three package versions
+        run: |
+          for p in packages/client packages/cli packages/create-pylair; do
+            sed -i.bak 's/"version": ".*"/"version": "${{ inputs.version }}"/' "$p/package.json"
+            rm -f "$p/package.json.bak"
+            grep '"version"' "$p/package.json" | head -1
+          done
+
+      - name: Dry-run pack (always)
+        run: |
+          for p in packages/client packages/cli packages/create-pylair; do
+            (cd "$p" && npm publish --access public --dry-run)
+          done
+
+      - name: Commit the version bump
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: npm packages v${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Publish to npm
+        if: ${{ !inputs.dry_run }}
+        run: |
+          # client first — cli and create-pylair may reference it.
+          for p in packages/client packages/cli packages/create-pylair; do
+            (cd "$p" && npm publish --access public --provenance)
+          done
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag -a "npm-v${{ inputs.version }}" -m "npm packages ${{ inputs.version }}"
+          git push origin "npm-v${{ inputs.version }}"
