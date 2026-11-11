@@ -1,9 +1,12 @@
 name: Publish npm packages
 
-# Manual dispatch only. Publishes @pylair/client, pylair-cli and
-# create-pylair in dependency order. Requires the NPM_TOKEN repo secret
-# (npm granular access token with publish on the three packages — create
-# it AFTER registering the @pylair scope, or use an automation token).
+# Manual dispatch only. Publishes @pylair/client, @pylair/cli and
+# create-pylair in dependency order under the `next` dist-tag, so
+# `npm create pylair` keeps resolving `latest` (nothing) until a stable
+# release. RC users run `npm create pylair@next` / `npm i @pylair/client@next`.
+# Requires the NPM_TOKEN repo secret (npm granular access token with
+# publish on the three packages — create it AFTER registering the
+# @pylair scope, or use an automation token).
 # Runs inside the `npm` environment if you create one (recommended:
 # required reviewers before any registry write).
 on:
@@ -60,8 +63,9 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           # client first — cli and create-pylair may reference it.
+          # --tag next: RCs must not become `latest`.
           for p in packages/client packages/cli packages/create-pylair; do
-            (cd "$p" && npm publish --access public --provenance)
+            (cd "$p" && npm publish --access public --provenance --tag next)
           done
 
       - name: Tag the release

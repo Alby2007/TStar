@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "pylair-cli": "file:../../packages/cli",
+    "@pylair/cli": "file:../../packages/cli",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^5",

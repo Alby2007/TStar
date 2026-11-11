@@ -1,8 +1,16 @@
 {
   "name": "create-pylair",
-  "version": "0.0.0",
+  "version": "0.1.0-rc.1",
   "description": "Scaffold a new Pylair project (npx create-pylair my-app)",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PylairHQ/Pylair",
+    "directory": "packages/create-pylair"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "create-pylair": "./dist/index.js"

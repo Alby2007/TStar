@@ -21,6 +21,9 @@ importers:
         specifier: ^19
         version: 19.3.1(react@19.3.1)
     devDependencies:
+      '@pylair/cli':
+        specifier: file:../../packages/cli
+        version: file:../../packages/cli
       '@tauri-apps/cli':
         specifier: ^2
         version: 2.12.4
@@ -33,9 +36,6 @@ importers:
       '@vitejs/plugin-react':
         specifier: ^5
         version: 5.2.0(vite@7.3.8)
-      pylair-cli:
-        specifier: file:../../packages/cli
-        version: file:../../packages/cli
       typescript:
         specifier: ^5.6
         version: 5.9.3
@@ -299,6 +299,10 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@pylair/cli@file:../../packages/cli':
+    resolution: {directory: ../../packages/cli, type: directory}
+    hasBin: true
 
   '@pylair/client@file:../../packages/client':
     resolution: {directory: ../../packages/client, type: directory}
@@ -636,10 +640,6 @@ packages:
     resolution: {integrity: sha512-LJlKCCAUFKOuZxipUdYw1NzIITEsPcgyOG9LkvRJvuKj/bRzbuRY0ARXvL0pWGpsZvn8jku+LMep2eU0seHp8g==}
     engines: {node: ^10 || ^12 || >=14}
 
-  pylair-cli@file:../../packages/cli:
-    resolution: {directory: ../../packages/cli, type: directory}
-    hasBin: true
-
   react-dom@19.3.1:
     resolution: {integrity: sha512-Y0bARz53lhEC1NMCASs0/j+faB/zqt3R8hpvg1e8+61ZVJ4UL0UdC4cBbXfZMcIuhrfgeILTLe+ZeBCavQPtKQ==}
     peerDependencies:
@@ -938,6 +938,8 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
+  '@pylair/cli@file:../../packages/cli': {}
+
   '@pylair/client@file:../../packages/client':
     dependencies:
       '@tauri-apps/api': 2.12.4
@@ -1201,8 +1203,6 @@ snapshots:
       nanoid: 3.3.20
       picocolors: 1.1.1
       source-map-js: 1.2.2
-
-  pylair-cli@file:../../packages/cli: {}
 
   react-dom@19.3.1(react@19.3.1):
     dependencies:

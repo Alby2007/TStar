@@ -37,7 +37,7 @@ test("scaffolds a complete app skeleton", () => {
   assert.equal(conf.identifier, "com.example.myapp");
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
-  assert.match(py, /pylair>=0\.1/);
+  assert.match(py, /pylair==0\.1\.0rc1/);
   rmSync(dir, { recursive: true });
 });
 

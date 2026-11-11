@@ -1,8 +1,16 @@
 {
-  "name": "pylair-cli",
-  "version": "0.0.0",
+  "name": "@pylair/cli",
+  "version": "0.1.0-rc.1",
   "description": "Pylair CLI: dev, build, doctor, codegen",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PylairHQ/Pylair",
+    "directory": "packages/cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "bin": {
     "pylair": "./dist/cli.js"
