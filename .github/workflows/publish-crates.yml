@@ -22,7 +22,7 @@ jobs:
     # ci.yml already compiles the crate on all three OSes.
     runs-on: macos-latest
     permissions:
-      contents: write # commit the version bump + tag on real publishes
+      contents: write # tag after a successful upload — never commits to main
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -30,28 +30,25 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Set crate version
+      - name: Check version matches Cargo.toml
+        # The version lives in the repo, bumped by a normal commit — the
+        # job only verifies it, never pushes to main.
         run: |
-          cd crates/tauri-plugin-pylair
-          sed -i.bak 's/^version = ".*"/version = "${{ inputs.version }}"/' Cargo.toml
-          rm -f Cargo.toml.bak
-          grep '^version' Cargo.toml
-
-      - name: Commit the version bump to main
-        if: ${{ !inputs.dry_run }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "release: tauri-plugin-pylair v${{ inputs.version }}"
-          git push origin HEAD:main
+          repo_ver=$(grep '^version = ' crates/tauri-plugin-pylair/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          [ "$repo_ver" = "${{ inputs.version }}" ] || {
+            echo "input '${{ inputs.version }}' != Cargo.toml '$repo_ver' — bump the version in a normal commit first"
+            exit 1
+          }
 
       - name: Package + verify (always, even for real publishes)
-        run: cargo publish -p tauri-plugin-pylair --dry-run --allow-dirty
+        run: cargo publish -p tauri-plugin-pylair --dry-run
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry_run }}
-        run: cargo publish -p tauri-plugin-pylair --allow-dirty
+        run: cargo publish -p tauri-plugin-pylair
 
+      # Tag only runs if the upload above succeeded — a failed publish
+      # leaves nothing behind.
       - name: Tag the release
         if: ${{ !inputs.dry_run }}
         run: |

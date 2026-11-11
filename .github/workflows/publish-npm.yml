@@ -22,7 +22,7 @@ jobs:
     environment: npm
     runs-on: ubuntu-22.04
     permissions:
-      contents: write # version bump + tag
+      contents: write # tag after a successful upload — never commits to main
       id-token: write # --provenance attestations
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -38,12 +38,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
-      - name: Bump all three package versions
+      - name: Check all three versions match the input
+        # Versions live in the repo, bumped by a normal commit — the job
+        # only verifies, never pushes to main.
         run: |
           for p in packages/client packages/cli packages/create-pylair; do
-            sed -i.bak 's/"version": ".*"/"version": "${{ inputs.version }}"/' "$p/package.json"
-            rm -f "$p/package.json.bak"
-            grep '"version"' "$p/package.json" | head -1
+            repo_ver=$(grep '"version":' "$p/package.json" | head -1 | sed 's/.*"\([0-9][^"]*\)".*/\1/')
+            [ "$repo_ver" = "${{ inputs.version }}" ] || {
+              echo "input '${{ inputs.version }}' != $p/package.json '$repo_ver' — bump versions in a normal commit first"
+              exit 1
+            }
           done
 
       - name: Dry-run pack (always)
@@ -51,14 +55,6 @@ jobs:
           for p in packages/client packages/cli packages/create-pylair; do
             (cd "$p" && npm publish --access public --dry-run)
           done
-
-      - name: Commit the version bump
-        if: ${{ !inputs.dry_run }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "release: npm packages v${{ inputs.version }}"
-          git push origin HEAD:main
 
       - name: Publish to npm
         if: ${{ !inputs.dry_run }}
