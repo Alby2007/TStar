@@ -4,11 +4,11 @@ Exercises the compat matrix: page load, text input, file upload +
 download, an SSE stream, and an external link.
 """
 
+import json
 import os
 
 from fastapi import FastAPI, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel
 
 app = FastAPI()
 MARKER = "W0-WRAP-MARKER"
@@ -27,35 +27,43 @@ def index():
 <script>
 const es = new EventSource("/stream");
 es.onmessage = (e) => document.getElementById("log").textContent += e.data + " ";
-// IPC-leak probe: report the Tauri surface this origin can actually see.
-fetch("/ipc-probe", {{method: "POST", headers: {{"Content-Type": "application/json"}},
-  body: JSON.stringify({{
+// IPC-leak probe: the question isn't whether __TAURI_INTERNALS__ exists on
+// a remote origin — it's whether invoke() actually works. Try a core
+// command, two plugin commands (incl. shutdown — the dangerous one), and
+// a bogus baseline. Report every result.
+(async () => {{
+  const inv = window.__TAURI_INTERNALS__?.invoke?.bind(window.__TAURI_INTERNALS__);
+  const report = {{
     tauri: typeof window.__TAURI__,
     internals: typeof window.__TAURI_INTERNALS__,
-    invoke: typeof window.__TAURI_INTERNALS__?.invoke,
+    invoke: typeof inv,
     ua: navigator.userAgent,
-  }})}}).catch(() => {{}});
+    attempts: {{}},
+  }};
+  const tries = {{
+    "core:event|emit": ["plugin:event|emit", {{event: "w0-probe", payload: 1}}],
+    "plugin:pylair|python_call": ["plugin:pylair|python_call", {{function: "x", args: []}}],
+    "plugin:pylair|python_shutdown": ["plugin:pylair|python_shutdown", {{}}],
+    "plugin:pylair|does_not_exist": ["plugin:pylair|does_not_exist", {{}}],
+  }};
+  for (const [name, [cmd, args]] of Object.entries(tries)) {{
+    if (!inv) {{ report.attempts[name] = "no-invoke"; continue; }}
+    try {{ await inv(cmd, args); report.attempts[name] = "RESOLVED"; }}
+    catch (e) {{ report.attempts[name] = "REJECTED: " + String(e && e.message || e).slice(0, 200); }}
+  }}
+  fetch("/ipc-probe", {{method: "POST", headers: {{"Content-Type": "application/json"}},
+    body: JSON.stringify(report)}}).catch(() => {{}});
+}})();
 </script>
 </body></html>"""
 
 
-class Probe(BaseModel):
-    tauri: str
-    internals: str
-    invoke: str
-    ua: str
-
-
 @app.post("/ipc-probe")
-def ipc_probe(p: Probe):
+def ipc_probe(p: dict):
     # Lands in stderr → forwarded by the supervisor → visible in app logs.
-    print(
-        f"IPC-PROBE tauri={p.tauri} internals={p.internals} "
-        f"invoke={p.invoke} ua={p.ua}",
-        flush=True,
-    )
+    print("IPC-PROBE " + json.dumps(p), flush=True)
     with open("/tmp/w0-ipc.json", "w") as fh:
-        fh.write(p.model_dump_json())
+        json.dump(p, fh, indent=2)
     return {"ok": True}
 
 

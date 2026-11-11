@@ -46,26 +46,62 @@ python-multipart) in the spike-local `.venv`.
 - Design finding: the server must share the launcher's process group
   (no setsid) or a supervisor-side killpg can't reach it.
 - `os._exit` after kill_tree — daemon stdin reader holds the buffer lock
-  at shutdown; sys.exit deadlocks.
+  at shutdown; sys.exit deadlocks (all exit paths after the reader
+  thread starts use it).
 - `cargo check` clean for the Tauri spike against the real plugin.
 - IPC-leak probe wired into the fastapi page (page POSTs the Tauri
   surface it sees to /ipc-probe → stderr + /tmp/w0-ipc.json); real
   webview run still pending — see CHECKLIST.md.
 
+## macOS real-webview runs (arm64, tauri dev)
+
+All three apps launched under the real supervisor and navigated to their
+loopback URL. Findings that matter beyond the spike:
+
+- **Plugin bug found and fixed** (crates commit): `supervisor::spawn`
+  used bare `tokio::spawn` inside plugin `setup`, which runs on the main
+  thread with no reactor entered — every app panicked at launch
+  ("there is no reactor running"). `spawn` now returns
+  `(Handle, actor)` and the caller drives the future via
+  `tauri::async_runtime`. Scaffolded apps would have hit the same panic.
+- **Event payloads arrive JSON-quoted**: `emit(event, line)` serializes
+  the String, so `Event::payload()` is `"READY ..."` with literal
+  quotes. Strip or deserialize before matching (spike fix).
+- **IPC probe — hard pass.** From the remote page:
+  `__TAURI__` undefined; `__TAURI_INTERNALS__.invoke` exists but every
+  attempt is REJECTED — `plugin:event|emit`: "not allowed on ... URL:
+  http://127.0.0.1:PORT/ (allowed on: URL: local)"; `python_call`,
+  `python_shutdown` and a bogus baseline: "pylair.X not allowed.
+  Plugin not found". Remote origins get zero usable IPC; capabilities
+  only ever scope to local URLs. Recorded in /tmp/w0-ipc.json.
+- **kill -9 the server** → `launcher: server exited` → supervisor
+  restart → new port → READY → window re-navigates. Full cycle seconds.
+- **App quit (SIGTERM/quit event)** → stdin EOF → launcher kill_tree →
+  zero survivors (verified fastapi + streamlit).
+- **SSE** (fastapi `/stream`): EventSource connection held, ticks
+  rendered.
+- **Streamlit**: `_stcore` websocket transport live (6+ established
+  conns), zero health-probe misses.
+- **Gradio**: page loads, multi-connection session live. One
+  health-probe miss during first paint (recovered, never reached 3) —
+  W1 should probe a cheap path or tolerate a slow first minute.
+- Launch→ready ≈ 1-3s per app after the one-time cargo build.
+
 ## Compatibility matrix
 
 | check | fastapi mac | fastapi win | fastapi linux | gradio mac | gradio win | gradio linux | streamlit mac | streamlit win | streamlit linux |
 |---|---|---|---|---|---|---|---|---|---|
-| page load + WS/SSE stays connected | | | | | | | | | |
+| page load + WS/SSE stays connected | pass (SSE held) | | | pass (session conns) | | | pass (ws conns) | | |
 | text input + long streamed output | | | | | | | | | |
 | file upload dialog + drag-drop | | | | | | | | | |
 | file download (save dialog, destination) | | | | | | | | | |
-| mic/camera permission prompts | | | | | | | | | |
+| mic/camera permission prompts | | | | n/a in sample | | | | | |
 | clipboard copy/paste | | | | | | | | | |
 | external link → system browser | | | | | | | | | |
-| window close kills server tree | | | | | | | | | |
-| kill -9 → restarting page → recover | | | | | | | | | |
-| launch→ready time | | | | | | | | | |
+| window close kills server tree | pass (0 survivors) | | | pass* | | | pass (0 survivors) | | |
+| kill -9 → restarting page → recover | pass (re-nav) | | | | | | | | |
+| IPC from remote page | pass (all REJECTED) | | | (same origin policy) | | | (same) | | |
+| launch→ready time | ~1-3s | | | ~2s | | | ~2s | | |
 | installer size / memory | | | | | | | | | |
 
 Fill with pass / works-with-fix / fails + notes; results and the go/no-go

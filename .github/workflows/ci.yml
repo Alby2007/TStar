@@ -87,6 +87,10 @@ jobs:
           uv run ruff check src tests
           uv run ruff format --check src tests
           uv run pytest -q
+      # W0 wrap spike: the launcher's kill_tree must reap a SIGTERM-ignoring
+      # grandchild (process group on posix, taskkill /T on Windows).
+      - working-directory: spikes/w0-wrap
+        run: uv run --no-project python test_kill_tree.py
 
   # M0 feasibility spike: build installers bundling python-build-standalone
   # + a uv-locked env on all three OSes, then prove the bundled payload runs

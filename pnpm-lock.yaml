@@ -49,6 +49,12 @@ importers:
         specifier: ^2.12.4
         version: 2.12.4
 
+  spikes/w0-wrap:
+    devDependencies:
+      '@tauri-apps/cli':
+        specifier: ^2.12.4
+        version: 2.12.4
+
 packages:
 
   '@tauri-apps/api@2.12.4':

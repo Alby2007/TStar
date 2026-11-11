@@ -85,7 +85,8 @@ fn resources_from_exe() -> Option<PathBuf> {
 
 async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
-    let h = spawn_supervisor(spec, SupervisorConfig::default(), tx);
+    let (h, actor) = spawn_supervisor(spec, SupervisorConfig::default(), tx);
+    tokio::spawn(actor);
     let mut rx = h.subscribe_state();
     let ready = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         while *rx.borrow() != State::Ready {
@@ -216,7 +217,10 @@ impl<R: Runtime> Builder<R> {
             .setup(move |app, _api| {
                 let spec = self.lazy.as_ref().map(|f| f(app)).unwrap_or_else(|| self.spec.clone());
                 let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(256);
-                let handle = spawn_supervisor(spec, self.config.clone(), ev_tx);
+                // setup runs on the main thread with no reactor entered —
+                // spawn the actor via tauri's runtime, not bare tokio::spawn.
+                let (handle, actor) = spawn_supervisor(spec, self.config.clone(), ev_tx);
+                tauri::async_runtime::spawn(actor);
                 app.manage(PyRuntime(handle));
 
                 let app_handle = app.clone();

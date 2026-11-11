@@ -266,32 +266,36 @@ fn stopped_err() -> ErrorObj {
     }
 }
 
-/// Spawn the supervisor actor. `events` receives lifecycle/log events.
+/// Create the supervisor actor. Returns the handle plus the actor future —
+/// the CALLER drives it (tokio::spawn / tauri::async_runtime::spawn) because
+/// bare `tokio::spawn` panics outside an entered runtime, and plugin `setup`
+/// runs on the main thread where no reactor is entered.
 pub fn spawn(
     spec: SpawnSpec,
     config: SupervisorConfig,
     events: mpsc::Sender<RuntimeEvent>,
-) -> Handle {
+) -> (Handle, impl std::future::Future<Output = ()> + Send + 'static) {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (state_tx, state_rx) = watch::channel(State::Starting);
-    tokio::spawn(
-        Supervisor {
-            spec,
-            config,
-            events,
-            cmd_rx,
-            state_tx,
-            generation: 0,
-            next_id: AtomicU64::new(1),
-            next_task: AtomicU64::new(1),
-            ready_since: None,
-        }
-        .run(),
-    );
-    Handle {
-        cmd: cmd_tx,
-        state: state_rx,
+    let actor = Supervisor {
+        spec,
+        config,
+        events,
+        cmd_rx,
+        state_tx,
+        generation: 0,
+        next_id: AtomicU64::new(1),
+        next_task: AtomicU64::new(1),
+        ready_since: None,
     }
+    .run();
+    (
+        Handle {
+            cmd: cmd_tx,
+            state: state_rx,
+        },
+        actor,
+    )
 }
 
 struct Supervisor {

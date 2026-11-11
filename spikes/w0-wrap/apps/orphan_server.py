@@ -5,9 +5,13 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MARKER = "W0-WRAP-MARKER"
+ORPHAN_FILE = os.environ.get(
+    "W0_ORPHAN_FILE", os.path.join(tempfile.gettempdir(), "w0-orphan.txt")
+)
 
 
 def spawn_orphan():
@@ -16,7 +20,7 @@ def spawn_orphan():
     code = (
         "import signal,time,os\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        f"f=open({os.environ.get('W0_ORPHAN_FILE', '/tmp/w0-orphan.txt')!r},'w')\n"
+        f"f=open({ORPHAN_FILE!r},'w')\n"
         "while True: f.write('x'); f.flush(); time.sleep(0.5)\n"
     )
     subprocess.Popen([sys.executable, "-c", code])

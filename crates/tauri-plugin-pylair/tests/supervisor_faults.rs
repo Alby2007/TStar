@@ -14,6 +14,18 @@ use tokio::time::{sleep, timeout};
 
 const T: Duration = Duration::from_secs(15);
 
+/// spawn() now returns (Handle, actor future) — tests drive the actor on
+/// the test runtime.
+fn spawn_h(
+    spec: SpawnSpec,
+    config: SupervisorConfig,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> Handle {
+    let (h, actor) = spawn(spec, config, events);
+    tokio::spawn(actor);
+    h
+}
+
 // ---- fake runtime scripts (stdin/stdout frame protocol, python) ----
 
 /// Well-behaved: hello, echo calls, pong pings, exit on shutdown.
@@ -167,7 +179,7 @@ async fn wait_state(h: &Handle, want: State) {
 #[tokio::test]
 async fn hello_echo_pong_shutdown() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_READY), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_READY), fast_config(), ev);
     wait_state(&h, State::Ready).await;
     let out = h.call("echo", json!({"x": 1})).await.unwrap();
     assert_eq!(out, json!({"x": 1}));
@@ -179,14 +191,14 @@ async fn hello_echo_pong_shutdown() {
 async fn startup_hang_is_killed_and_fails() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
     // breaker_crashes = 2 -> after two failed startups, state Failed
-    let h = spawn(spec(FAKE_HANG), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_HANG), fast_config(), ev);
     wait_state(&h, State::Failed).await;
 }
 
 #[tokio::test]
 async fn stray_stdout_is_protocol_violation() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_STRAY_STDOUT), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_STRAY_STDOUT), fast_config(), ev);
     wait_state(&h, State::Failed).await;
     // drain events: expect a Restarting transition (first crash) at least
     let mut saw_restart = false;
@@ -205,14 +217,14 @@ async fn stray_stdout_is_protocol_violation() {
 #[tokio::test]
 async fn malformed_frame_is_protocol_violation() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_MALFORMED), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_MALFORMED), fast_config(), ev);
     wait_state(&h, State::Failed).await;
 }
 
 #[tokio::test]
 async fn wedged_runtime_killed_on_missed_pongs() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_WEDGED), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_WEDGED), fast_config(), ev);
     wait_state(&h, State::Ready).await;
     // wedged: hello sent, never pongs -> Unresponsive -> killed -> restart cycle
     wait_state(&h, State::Failed).await;
@@ -221,7 +233,7 @@ async fn wedged_runtime_killed_on_missed_pongs() {
 #[tokio::test]
 async fn kill_during_call_fails_caller_with_crashed() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_DIE_ON_CALL), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_DIE_ON_CALL), fast_config(), ev);
     wait_state(&h, State::Ready).await;
     let err = h.call("boom", json!({})).await.unwrap_err();
     assert_eq!(err.code, proto::RUNTIME_CRASHED);
@@ -230,7 +242,7 @@ async fn kill_during_call_fails_caller_with_crashed() {
 #[tokio::test]
 async fn crash_loop_breaker_trips() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_EXIT_NOW), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_EXIT_NOW), fast_config(), ev);
     wait_state(&h, State::Failed).await;
     let mut restarts = 0;
     while let Ok(e) = rx.try_recv() {
@@ -261,7 +273,7 @@ async fn crash_loop_breaker_trips() {
 #[tokio::test]
 async fn e2e_real_runtime_full_flow() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(real_runtime_spec(), fast_config(), ev);
+    let h = spawn_h(real_runtime_spec(), fast_config(), ev);
 
     wait_state(&h, State::Ready).await;
     eprintln!("e2e: ready");
@@ -341,7 +353,7 @@ async fn e2e_real_runtime_full_flow() {
 #[tokio::test]
 async fn version_mismatch_goes_straight_to_failed() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_BAD_VERSION), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_BAD_VERSION), fast_config(), ev);
     wait_state(&h, State::Failed).await;
     // Fatal is not a crash: zero Restarting transitions must have occurred.
     let mut restarts = 0;
@@ -363,7 +375,7 @@ async fn version_mismatch_goes_straight_to_failed() {
 #[tokio::test]
 async fn retry_respawns_after_failed() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_EXIT_NOW), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_EXIT_NOW), fast_config(), ev);
     wait_state(&h, State::Failed).await;
     h.retry().await.unwrap();
     // Retry must leave Failed: expect a Starting transition next.
@@ -389,7 +401,7 @@ async fn retry_respawns_after_failed() {
 #[tokio::test]
 async fn healthy_runtime_never_flaps_unresponsive() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(FAKE_READY), fast_config(), ev);
+    let h = spawn_h(spec(FAKE_READY), fast_config(), ev);
     wait_state(&h, State::Ready).await;
     // sit through several ping intervals with a pinging runtime
     sleep(Duration::from_millis(600)).await;
@@ -416,7 +428,7 @@ sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush(
 time.sleep(0.3)
 "#;
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
-    let h = spawn(spec(NOISY), fast_config(), ev);
+    let h = spawn_h(spec(NOISY), fast_config(), ev);
     wait_state(&h, State::Ready).await;
     sleep(Duration::from_millis(400)).await;
     let mut lines = vec![];
@@ -441,7 +453,7 @@ async fn restart_trigger_respawns_cleanly() {
     let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(64);
     let mut cfg = fast_config();
     cfg.restart_trigger = Some(trigger.clone());
-    let h = spawn(spec(FAKE_READY), cfg, ev);
+    let h = spawn_h(spec(FAKE_READY), cfg, ev);
     wait_state(&h, State::Ready).await;
 
     // Rewrite past the mtime granularity of the first write.

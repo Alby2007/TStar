@@ -138,7 +138,7 @@ def main():
             if proc.poll() is not None:
                 note("launcher: server exited")
                 kill_tree(proc)
-                sys.exit(1)
+                os._exit(1)  # daemon reader is live — sys.exit can deadlock
             if time.time() - last_probe >= HEALTH_EVERY:
                 last_probe = time.time()
                 if probe_health(url):

@@ -8,10 +8,15 @@ use tauri_plugin_pylair::{events, SpawnSpec};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_py = std::env::var("W0_APP").unwrap_or_else(|_| "fastapi".into());
+    let spike_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    // The venv interpreter — `python` alone would resolve to whatever PATH
+    // finds, not the pinned env.
+    let py = spike_dir.join(".venv/bin/python");
+    let pys = py.to_string_lossy().to_string();
     let cmd: Vec<String> = match app_py.as_str() {
-        "gradio" => vec!["python".into(), "apps/gradio_app.py".into()],
+        "gradio" => vec![pys.clone(), "apps/gradio_app.py".into()],
         "streamlit" => vec![
-            "python".into(),
+            pys.clone(),
             "-m".into(),
             "streamlit".into(),
             "run".into(),
@@ -26,14 +31,14 @@ pub fn run() {
             "none".into(),
         ],
         _ => vec![
-            "python".into(),
+            pys.clone(),
             "apps/fastapi_app.py".into(),
         ],
     };
 
     // args = [launcher.py, --, cmd...]
     let mut spec = SpawnSpec {
-        program: "python".into(),
+        program: py,
         args: std::iter::once("launcher.py".into())
             .chain(std::iter::once("--".into()))
             .chain(cmd.into_iter())
@@ -52,9 +57,13 @@ pub fn run() {
             let win = app.get_webview_window("main").expect("main window");
             let app_handle = app.handle().clone();
             app.listen(events::STDERR, move |ev| {
-                if let Some(url) = ev.payload().strip_prefix("READY ") {
+                // emit() JSON-serializes the line — payload() arrives quoted.
+                let line = ev.payload().trim_matches('"');
+                eprintln!("W0-EVENT: {line}");
+                if let Some(url) = line.strip_prefix("READY ") {
                     let url = url.trim().to_string();
                     if let Ok(parsed) = url.parse::<url::Url>() {
+                        eprintln!("W0-NAVIGATE {parsed}");
                         let _ = win.navigate(parsed);
                     }
                     let _ = app_handle.emit("w0://ready", url);
