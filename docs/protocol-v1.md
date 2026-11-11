@@ -17,10 +17,25 @@ hang or OOM the host.
 - Behind a `Transport` trait in Rust and a matching abstraction in
   Python, so unix sockets / Windows named pipes can replace stdio later
   without touching message semantics.
-- **stdout carries frames and nothing else.** Any byte on stdout that is
-  not a well-formed frame is a protocol violation → the host treats the
-  runtime as crashed (kill + restart). `tauri_plus` runtime code must
-  never `print()`; logging goes to stderr.
+- **stdout carries frames and nothing else.** Any byte on the frame
+  channel that is not a well-formed frame is a protocol violation → the
+  host treats the runtime as crashed (kill + restart). But libraries
+  `print()`, and native code can write straight to fd 1, so the runtime
+  does not rely on discipline — it performs **stdout hygiene at startup,
+  before any third-party import can run**:
+  - `dup()` the real stdout to a private fd — that fd is the frame
+    channel;
+  - `dup2(stderr, 1)` — fd 1 now points at stderr, so stray writes
+    (Python `print`, C-extension `fwrite`, anything) land in the log
+    stream instead of corrupting frames;
+  - on Windows, both stdin and the frame fd are put in binary mode
+    (`_setmode(..., O_BINARY)`) — CRLF translation would otherwise
+    corrupt length-prefixed frames.
+- **The host drains stderr continuously** on a dedicated task/thread.
+  A full stderr pipe deadlocks the child, so draining is unconditional,
+  not tied to diagnostics being enabled; if consumers are slow the host
+  drops oldest lines with a `[dropped N lines]` marker rather than let
+  the pipe fill.
 
 ## 2. Framing
 
@@ -31,10 +46,16 @@ hang or OOM the host.
 ```
 
 - Big-endian length prefix, then exactly that many bytes of UTF-8 JSON.
-- `MAX_FRAME = 16 MiB`. A length prefix above the cap → protocol
-  violation → runtime killed and restarted (it is either buggy or hostile).
+- `MAX_FRAME` defaults to **16 MiB**, configurable via
+  `TAURI_PLUS_MAX_FRAME` (bytes). A length prefix above the cap →
+  protocol violation → runtime killed and restarted (it is either buggy
+  or hostile). The cap is not meant for data throughput — large binary
+  payloads (images, audio) currently travel base64-in-JSON (+33% size);
+  a temp-file-handle transport for bulk data is the documented future
+  escape hatch (`docs/ideas.md`).
 - A peer that goes silent mid-frame is just slow; no read timeout on
-  frames. Startup has its own deadline (§4).
+  frames. Startup has its own deadline (§4) and steady-state liveness is
+  covered by ping/pong (§5).
 
 ## 3. Message shapes
 
@@ -44,9 +65,10 @@ All messages carry `"jsonrpc": "2.0"`.
 
 | method | params | response result |
 |---|---|---|
-| `call` | `{fn, input, task}` | fn's return value (JSON) |
+| `call` | `{fn, input, task}` | fn's return value (JSON); for generator fns, see §3.1 |
 | `cancel` | `{task}` | `{cancelled: true/false, reason?}` |
 | `shutdown` | `{grace_ms}` | `{}` then process exits 0 |
+| `ping` | `{seq}` | must produce a `pong {seq}` notification — see §5 |
 
 - `fn`: name registered via `@expose`. Anything else →
   `FUNCTION_NOT_FOUND`. There is no way to reach unexposed callables —
@@ -66,24 +88,53 @@ All messages carry `"jsonrpc": "2.0"`.
 `id` echoes the request. `error.data` may carry a Python traceback and
 a `type` string (the Python exception class) for diagnostics.
 
-### Notifications (runtime → host, no `id`)
+### Notifications
 
-| method | params | meaning |
-|---|---|---|
-| `hello` | see §4 | handshake — first frame on stdout, once |
-| `stream.chunk` | `{task, seq, value}` | one item of an async-generator result |
-| `stream.end` | `{task}` | generator finished normally |
-| `log` | `{level, msg}` | structured log line (also goes to stderr) |
+| method | dir | params | meaning |
+|---|---|---|---|
+| `hello` | runtime→host | see §4 | handshake — first frame, once |
+| `stream.chunk` | runtime→host | `{task, seq, value}` | one item of an async-generator result |
+| `stream.credit` | host→runtime | `{task, n}` | consumer grants the producer n chunks of credit |
+| `pong` | runtime→host | `{seq}` | liveness reply to `ping` |
+| `log` | runtime→host | `{level, msg}` | structured log line (also goes to stderr) |
 
-Streams: for a call whose Python result is an async generator, the
-runtime sends `stream.chunk` notifications (ordered by `seq`, starting 0)
-then exactly one terminal message: `stream.end`, or a response-shaped
-error notification `{method:"stream.error", params:{task, error:{...}}}`.
-The host reassembles them into the `AsyncIterable` the TS client exposes.
+### 3.1 Calls and streaming
 
-### Requests (runtime → host)
+A `call` request always gets **exactly one response**.
 
-None in v1. The runtime never initiates calls into the host.
+- Non-streaming functions: the response is the return value
+  (`result` or `error`), as usual.
+- Streaming functions (`kind: "generator"` in `hello.exposes`): the
+  `call`'s response **is the stream's terminal message** — it arrives
+  after the last `stream.chunk` and carries either
+  `result: {"done": true}` or an `error` (e.g. `TASK_CANCELLED`,
+  `INTERNAL` raised mid-generation). The front end knows a call streams
+  from the handshake allowlist metadata, not from message-shape
+  inference — `python.<fn>` for a generator always yields an
+  `AsyncIterable` whose items are the `stream.chunk` values and whose
+  end/error is the call response.
+
+**Flow control is pull-based and mandatory.** Async generators are
+pull-based, so the wire is too: the runtime may only call `__anext__`
+on a generator while it holds credit for that task.
+
+- The consumer grants credit with `stream.credit {task, n}`. Credit is
+  in *chunks*; each `stream.chunk` sent decrements outstanding credit
+  by one.
+- On stream open the host grants an initial credit of
+  `INITIAL_STREAM_CREDIT` (default 64). The TS client replenishes as
+  items are consumed — a throttled or backgrounded webview simply stops
+  granting, and the generator pauses at the next `__anext__`. The
+  stream stalls, it does not die.
+- Safety cap for misbehaving producers: sending a `stream.chunk` with
+  no outstanding credit, or buffering more than `MAX_STREAM_BUFFER`
+  (default 8 MiB) of un-granted data, aborts the task with
+  `PROTOCOL_VIOLATION` and counts as a protocol violation. This is the
+  only remaining abort path — a well-behaved producer can never hit a
+  limit by streaming "too fast"; it can only run out of credit, which
+  pauses it.
+- `cancel` is independent of credit: a task is cancellable whether it
+  is producing, waiting on credit, or fully drained.
 
 ## 4. Handshake and lifecycle
 
@@ -101,7 +152,48 @@ Host-side states (emitted to the UI as events):
 4. `protocol` mismatch → `failed` immediately (no restart — retrying
    can't fix a version skew). Error message names both versions.
 
-## 5. Supervisor policy (host-side, not on the wire)
+## 5. Liveness
+
+Supervision based on process exit alone misses the most common real
+failure: a runtime **wedged** in native code (a C extension spinning, a
+deadlock) never crashes, so it never restarts.
+
+- The host sends `ping {seq}` every `PING_INTERVAL` (default 5s).
+  The runtime answers with a `pong {seq}` notification within
+  `PING_TIMEOUT` (default 10s) — the reply is emitted by the event
+  loop's frame handler, so it proves the loop is alive.
+- A missed deadline → state `unresponsive` (event emitted). The host
+  keeps pinging.
+- `MAX_MISSES` consecutive misses (default 3) → treated as `crashed`:
+  killed and the restart policy applies.
+- **Known limit:** a C extension holding the GIL starves the frame loop
+  too, so `pong` can be late during legitimate long native calls. That
+  is exactly why the spec pushes CPU-heavy work to `isolated=True`
+  workers — whose liveness is process exit, not pong. `unresponsive`
+  is a warning state so the UI can show "backend busy/stuck" before the
+  supervisor gives up.
+- `ping`/`pong` carries no data; `seq` matching just guards staleness.
+
+## 6. Orphan prevention
+
+"No child process outlives the host" needs an actual mechanism, per
+platform:
+
+- **stdin EOF is the portable guarantee.** The runtime's frame loop
+  exits when stdin reaches EOF (host dead → pipe closed), and it kills
+  its isolated workers first. Workers likewise exit on their own
+  control-channel EOF. The host therefore only has to *stop* cleanly;
+  if it dies, everything downstream notices within one pipe read.
+- **Windows:** "process group" doesn't exist — the host puts the
+  runtime in a **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
+  when the host's last job handle closes (clean or crash), the kernel
+  kills everything in the job. The runtime does the same for workers.
+- **POSIX:** runtime and workers get their own process group; the
+  supervisor kills `-pgid`, and on Linux `PR_SET_PDEATHSIG` is set as a
+  belt-and-suspenders. macOS has no parent-death signal — stdin EOF is
+  the mechanism there (and everywhere, really).
+
+## 7. Supervisor policy (host-side, not on the wire)
 
 - Restart backoff: exponential, `250ms → 8s` cap, `×2` factor, `±20%`
   jitter.
@@ -114,7 +206,7 @@ Host-side states (emitted to the UI as events):
   calls (no idempotency guarantees in Python user code).
 - Graceful `shutdown` → `grace_ms` deadline → SIGTERM → 5s → SIGKILL.
 
-## 6. Error codes
+## 8. Error codes
 
 JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 
@@ -128,24 +220,22 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 | -32001 | TASK_NOT_FOUND | cancel/shutdown for unknown `task` |
 | -32010 | TASK_CANCELLED | task ended via cancel (also stream terminus) |
 | -32011 | WORKER_DIED | isolated worker subprocess exited non-zero |
-| -32020 | BACKPRESSURE_LIMIT | stream exceeded buffer cap |
+| -32012 | RUNTIME_WEDGED | liveness deadline exceeded `MAX_MISSES` times |
 | -32030 | RUNTIME_UNAVAILABLE | host-side: not `ready`, restarting, or dead |
 | -32031 | RUNTIME_CRASHED | process died mid-call |
-| -32032 | PROTOCOL_VIOLATION | garbage on stdout / bad hello |
+| -32032 | PROTOCOL_VIOLATION | garbage on frame fd / bad hello / credit overrun |
 
-## 7. Concurrency, ordering, backpressure
+## 9. Concurrency and ordering
 
 - Multiple `call`s may be in flight; `task` ids are unique per process
   lifetime and never reused.
 - `stream.chunk` ordering is guaranteed **per task only** (seq-ordered);
   chunks from different tasks may interleave.
-- v0.1 backpressure: the runtime buffers per task up to
-  `min(1024 chunks, 8 MiB)`. Exceeding → task aborted with
-  `BACKPRESSURE_LIMIT`, error surfaces on the TS side. Credit-based flow
-  control is a later optimization (docs/ideas.md) — the wire shape
-  supports it without change (a `stream.credit {task, n}` notification).
+- Flow control is credit-based (§3.1), not buffer-cap-based — producers
+  are paused, never aborted for streaming "too much". The byte-wise
+  `MAX_STREAM_BUFFER` remains only as a misbehavior tripwire.
 
-## 8. Versioning
+## 10. Versioning
 
 - `protocol` is a single integer. Host accepts exact match only in v1
   (a minor-version field can be added when there's a second version to
@@ -155,10 +245,15 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 - The Python runtime refuses to start for an incompatible host the same
   way (host sends its version in an env var `TAURI_PLUS_PROTOCOL=1`).
 
-## 9. What this does not cover (yet)
+## 11. What this does not cover (yet)
 
 - Type/schema details of `exposes[].signature` — M2 codegen doc.
 - Cancellation *guarantees* per execution mode — `docs/cancellation.md`.
+- Bulk binary transport (temp-file handles) — `docs/ideas.md`; base64
+  in JSON is the v1 answer.
+- Warm/model-persistent isolated workers — the `worker` option on
+  `@expose` is reserved now (see `docs/cancellation.md`); v1 isolated
+  workers are per-call.
 - Auth/attestation of the child — the child is spawned by the host with
-  stdio wired directly; nothing else can write its stdout by design.
+  stdio wired directly; nothing else can write its frame fd by design.
   Threat model in `docs/security.md`.

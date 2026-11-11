@@ -41,20 +41,35 @@ at `@expose` time, not at cancel time.
 
 ### Isolated sync functions (`isolated=True`)
 
-- Each call runs in a dedicated worker subprocess (spawned per call,
-  pooled later if profiling says so — v1 is per-call, which is the only
-  mode with a clean kill story).
+- Each call runs in a dedicated worker subprocess (spawned per call).
 - Cancel → `terminate()` (SIGTERM/SIGKILL-equivalent), 3s grace →
   `kill()`. Wire result: `TASK_CANCELLED` (or `WORKER_DIED` if the worker
   already died on its own).
 - **Guarantee:** the worker *will* die — the supervisor owns its process
-  handle and kills the whole process group, so children the function
-  spawned die too (no leaked grandchildren — M3 test asserts this).
+  handle and kills the whole process group (POSIX) / job object
+  (Windows), so children the function spawned die too (no leaked
+  grandchildren — M3 test asserts this).
 - **Partial results:** discarded. An isolated call returns a value only
   on normal completion; cancelled calls deliver nothing.
 - **Cleanup:** `finally` blocks in the worker run during the SIGTERM
   grace only. After `kill()` nothing in the worker runs again — files
   it wrote stay written (documented; cleanup is the app's business).
+
+> **Cost warning — read before using `isolated=True`.**
+> A per-call worker re-imports its modules and rebuilds its world *on
+> every call*. With torch-class imports that is seconds per call, and
+> for anything holding a loaded model it makes `isolated=True`
+> effectively unusable. The intended fix is a **warm worker**: a
+> persistent, lazily-spawned subprocess that keeps its imports/model
+> resident and is only *killed* (not per-call spawned) on cancel, then
+> lazily re-initialized on the next call. To keep that addition
+> non-breaking, `@expose` reserves a `worker` option now:
+> `@expose(worker={...})` — v1 accepts only `{mode: "process"}` (the
+> per-call default implied by `isolated=True`); `mode: "warm"` lands
+> when warm workers do. On the wire, `exposes[].kind` reports
+> `"isolated"` either way; worker config rides inside `signature.meta`.
+
+### Inline sync functions (non-isolated)
 
 ### Inline sync functions (non-isolated)
 
@@ -89,15 +104,27 @@ at `@expose` time, not at cancel time.
 ## Leak guarantees (what the M3 tests assert)
 
 - No child processes outlive the host or a cancelled isolated call.
+  Mechanisms (protocol §6): children exit on stdin/control-channel EOF;
+  Windows uses Job Objects (`KILL_ON_JOB_CLOSE`), POSIX uses process
+  groups (+`PR_SET_PDEATHSIG` on Linux).
 - No `asyncio.Task` objects leak after cancel (runtime-side assertion
   via task accounting).
-- Every cancelled stream emits exactly one terminal message
-  (`TASK_CANCELLED` or `stream.end` if it finished first — race is
-  resolved task-side, both orders are legal).
+- The host's stderr drain is unconditional — a full stderr pipe must
+  never be what makes a task hang.
+- Every cancelled stream produces exactly one terminal message — the
+  `call` response carrying `TASK_CANCELLED` (or a normal
+  `{done: true}` if the generator finished first; the race is resolved
+  task-side and both orders are legal).
+- Fault-injection tests must include: **a stray fd-1 write** (library
+  `print` / native `fwrite` must not corrupt the frame channel nor kill
+  the runtime) and **a wedged runtime** (event loop starved in native
+  code — ping/pong misses → `unresponsive` → restart).
 
 ## Wire summary
 
 - `cancel {task}` → `{cancelled: bool, reason?}` or `TASK_NOT_FOUND`.
-- Task end states observable by caller: `result`, `INTERNAL`,
-  `TASK_CANCELLED`, `RUNTIME_CRASHED`, `WORKER_DIED`,
-  `BACKPRESSURE_LIMIT`. Exactly one, always.
+- A `call` always produces exactly one response; for streaming calls
+  that response is the terminal message (protocol §3.1).
+- Task end states observable by caller: `result`/`{done: true}`,
+  `INTERNAL`, `TASK_CANCELLED`, `RUNTIME_CRASHED`, `RUNTIME_WEDGED`,
+  `WORKER_DIED`, `PROTOCOL_VIOLATION`. Exactly one, always.
