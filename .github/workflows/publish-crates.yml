@@ -1,0 +1,55 @@
+name: Publish crates
+
+# Manual dispatch only: publishing is a deliberate act. Requires the
+# CARGO_REGISTRY_TOKEN repo secret (crates.io API token). The first
+# publish of a crate needs a token; switch to trusted publishing after it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Crate version to publish (e.g. 0.1.0 or 0.1.0-rc.1)"
+        required: true
+      dry_run:
+        description: "Package + verify only, do not upload"
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write # commit the version bump + tag on real publishes
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set crate version
+        run: |
+          cd crates/tauri-plugin-pylair
+          sed -i.bak 's/^version = ".*"/version = "${{ inputs.version }}"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          grep '^version' Cargo.toml
+
+      - name: Commit the version bump to main
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "release: tauri-plugin-pylair v${{ inputs.version }}"
+          git push origin HEAD:main
+
+      - name: Package + verify (always, even for real publishes)
+        run: cargo publish -p tauri-plugin-pylair --dry-run --allow-dirty
+
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run }}
+        run: cargo publish -p tauri-plugin-pylair --allow-dirty
+
+      - name: Tag the release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag -a "tauri-plugin-pylair-v${{ inputs.version }}" -m "tauri-plugin-pylair ${{ inputs.version }}"
+          git push origin "tauri-plugin-pylair-v${{ inputs.version }}"

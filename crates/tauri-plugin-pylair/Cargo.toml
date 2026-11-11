@@ -3,9 +3,13 @@ name = "tauri-plugin-pylair"
 version = "0.0.0"
 description = "Tauri plugin: Python runtime supervisor, IPC bridge, and permissions for Pylair apps"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Alby2007/Pylair"
+homepage = "https://github.com/Alby2007/Pylair"
+readme = "README.md"
+keywords = ["tauri", "python", "pylair", "desktop"]
+categories = ["development-tools", "gui", "os"]
 edition.workspace = true
 rust-version.workspace = true
-publish = false
 links = "tauri-plugin-pylair"
 
 [lib]
