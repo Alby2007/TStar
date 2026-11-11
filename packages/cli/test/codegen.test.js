@@ -31,8 +31,8 @@ test("emits plain call wrappers", () => {
     ]),
     "myapp",
   );
-  assert.match(ts, /export function addThem\(a: number, b: number, opts\?: CallOptions\): Promise<number>/);
-  assert.match(ts, /call<number>\("add_them", \{ "a": a, "b": b \}, opts\)/);
+  assert.match(ts, /export function addThem\(a: number, b: number, opts\?: PylairCallOptions\): Promise<number>/);
+  assert.match(ts, /pylairCall<number>\("add_them", \{ "a": a, "b": b \}, opts\)/);
   // no wire helpers pasted into generated files — they live in the client
   assert.doesNotMatch(ts, /_toWire|_fromWire|_mapStream|b64encode/);
 });
@@ -58,7 +58,7 @@ test("generators emit stream + async generator", () => {
     "m",
   );
   assert.match(ts, /AsyncGenerator<number, void, void>/);
-  assert.match(ts, /stream<number>\("ticks"/);
+  assert.match(ts, /pylairStream<number>\("ticks"/);
 });
 
 test("dataclasses dedupe into interfaces", () => {
@@ -143,7 +143,181 @@ test("docs become jsdoc, manifest errors throw", () => {
 test("snake_case names stay the wire name", () => {
   const ts = emit(M([FN({ name: "make_thing" })]), "m");
   assert.match(ts, /export function makeThing\(/);
-  assert.match(ts, /call<null>\("make_thing", \{\}, opts\)/);
+  assert.match(ts, /pylairCall<null>\("make_thing", \{\}, opts\)/);
+});
+
+// ---- P2-11: signatures that used to be wrong or illegal -------------------
+
+test("union members inside list get parens", () => {
+  const ts = emit(
+    M([
+      FN({
+        params: [
+          {
+            name: "xs",
+            kind: "P",
+            required: true,
+            schema: {
+              type: "list",
+              items: { type: "union", opts: [{ type: "int" }, { type: "str" }] },
+            },
+          },
+        ],
+      }),
+    ]),
+    "m",
+  );
+  assert.match(ts, /xs: \(number \| string\)\[\]/);
+  assert.doesNotMatch(ts, /number \| string\[\]/);
+});
+
+test("optional param before a required one becomes T | undefined", () => {
+  // Python allows `def f(a=1, *, b)` — TS forbids `a?: T, b: U`.
+  const ts = emit(
+    M([
+      FN({
+        params: [
+          { name: "a", kind: "P", required: false, schema: { type: "int" } },
+          { name: "b", kind: "KEYWORD_ONLY", required: true, schema: { type: "str" } },
+        ],
+      }),
+    ]),
+    "m",
+  );
+  assert.match(ts, /a: number \| undefined, b: string/);
+  assert.doesNotMatch(ts, /a\?: number, b: string/);
+});
+
+test("a python param named opts does not clobber CallOptions", () => {
+  const ts = emit(
+    M([
+      FN({
+        params: [{ name: "opts", kind: "P", required: true, schema: { type: "str" } }],
+      }),
+    ]),
+    "m",
+  );
+  assert.match(ts, /opts: string, opts_\?: PylairCallOptions/);
+  assert.match(ts, /, opts_\)/); // CallOptions passed through, not the string
+});
+
+test("python functions named call/stream can't shadow the imports", () => {
+  const ts = emit(
+    M([FN({ name: "call" }), FN({ name: "stream" }), FN({ name: "CallOptions" })]),
+    "m",
+  );
+  assert.match(ts, /pylairCall<null>\("call"/);
+  assert.match(ts, /pylairCall<null>\("stream"/);
+  assert.doesNotMatch(ts, /[^a-zA-Z]call<null>\("call"/); // would be infinite recursion
+});
+
+test("names colliding after camelCase dedupe", () => {
+  const ts = emit(M([FN({ name: "foo_bar" }), FN({ name: "fooBar" })]), "m");
+  assert.match(ts, /export function fooBar\(/);
+  assert.match(ts, /export function fooBar_\(/);
+  assert.match(ts, /\("foo_bar"/);
+  assert.match(ts, /\("fooBar"/);
+});
+
+test("param idents colliding after cleaning dedupe", () => {
+  const ts = emit(
+    M([
+      FN({
+        params: [
+          { name: "foo_bar", kind: "P", required: true, schema: { type: "int" } },
+          { name: "foo-bar", kind: "P", required: true, schema: { type: "str" } },
+        ],
+      }),
+    ]),
+    "m",
+  );
+  assert.match(ts, /foo_bar: number, foo_bar_: string/);
+  assert.match(ts, /"foo-bar": foo_bar_/); // wire name keeps the real param name
+});
+
+test("*args/**kwargs are dropped — they can't cross the bridge", () => {
+  const ts = emit(
+    M([
+      FN({
+        params: [
+          { name: "x", kind: "P", required: true, schema: { type: "int" } },
+          { name: "args", kind: "VAR_POSITIONAL", required: true, schema: { type: "any" } },
+          { name: "kwargs", kind: "VAR_KEYWORD", required: true, schema: { type: "any" } },
+        ],
+      }),
+    ]),
+    "m",
+  );
+  assert.match(ts, /export function f\(x: number, opts\?/);
+  assert.doesNotMatch(ts, /args:|kwargs:/);
+});
+
+// The audit's requirement: generated output must actually compile. Emit a
+// fixture exercising every tricky case and typecheck it with the real
+// @pylair/client types.
+test("generated fixture compiles under tsc --strict", () => {
+  const dataclass = {
+    type: "dataclass",
+    name: "Point",
+    fields: [
+      { name: "x", required: true, schema: { type: "float" } },
+      { name: "y", required: false, schema: { type: "float" } },
+    ],
+  };
+  const ts = emit(
+    M([
+      FN({
+        name: "mixed_params",
+        params: [
+          { name: "a", kind: "P", required: false, schema: { type: "int" } },
+          { name: "b", kind: "KEYWORD_ONLY", required: true, schema: { type: "str" } },
+          { name: "opts", kind: "KEYWORD_ONLY", required: false, schema: { type: "str" } },
+          {
+            name: "xs",
+            kind: "P",
+            required: true,
+            schema: {
+              type: "list",
+              items: { type: "union", opts: [{ type: "int" }, { type: "str" }] },
+            },
+          },
+          { name: "p", kind: "P", required: true, schema: dataclass },
+        ],
+        returns: { type: "union", opts: [dataclass, { type: "none" }] },
+      }),
+      FN({ name: "call" }),
+      FN({ name: "stream", kind: "generator", returns: { type: "bytes" } }),
+      FN({ name: "foo_bar" }),
+      FN({ name: "fooBar" }),
+    ]),
+    "fixture",
+  );
+  const root = new URL("../../../", import.meta.url).pathname;
+  const dir = mkdtempSync(path.join(tmpdir(), "pylair-tsc-"));
+  writeFileSync(path.join(dir, "fixture.ts"), ts);
+  writeFileSync(
+    path.join(dir, "tsconfig.json"),
+    JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        noEmit: true,
+        target: "es2022",
+        module: "esnext",
+        moduleResolution: "bundler",
+        skipLibCheck: true,
+        paths: { "@pylair/client": [`${root}packages/client/dist/index.d.ts`] },
+      },
+      files: ["fixture.ts"],
+    }),
+  );
+  const tsc = `${root}packages/cli/node_modules/typescript/bin/tsc`;
+  const r = execFileSync(process.execPath, [tsc, "-p", "tsconfig.json"], {
+    cwd: dir,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  // execFileSync throws on non-zero exit; reaching here means it compiled.
+  assert.equal(r.trim(), "");
 });
 
 // ---- golden: the emitted file is reviewable in-repo ------------------------

@@ -37,6 +37,24 @@
             }
         },
         {
+            "name": "block_loop",
+            "kind": "async",
+            "doc": null,
+            "params": [
+                {
+                    "name": "seconds",
+                    "kind": "POSITIONAL_OR_KEYWORD",
+                    "required": true,
+                    "schema": {
+                        "type": "float"
+                    }
+                }
+            ],
+            "returns": {
+                "type": "str"
+            }
+        },
+        {
             "name": "counter",
             "kind": "generator",
             "doc": null,
@@ -87,6 +105,15 @@
             "params": [],
             "returns": {
                 "type": "any"
+            }
+        },
+        {
+            "name": "infinite_counted",
+            "kind": "generator",
+            "doc": "Infinite producer that counts what it yields \u2014 lets a test prove the\nproducer actually STOPPED (not just that the consumer stopped reading).",
+            "params": [],
+            "returns": {
+                "type": "int"
             }
         },
         {
@@ -333,6 +360,15 @@
             ],
             "returns": {
                 "type": "str"
+            }
+        },
+        {
+            "name": "produced_count",
+            "kind": "sync",
+            "doc": null,
+            "params": [],
+            "returns": {
+                "type": "int"
             }
         },
         {
