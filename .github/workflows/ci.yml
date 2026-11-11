@@ -220,9 +220,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: app-under-test/src-tauri
       - name: Linux Tauri dependencies
         if: runner.os == 'Linux'
         run: |
@@ -238,6 +235,12 @@ jobs:
           # The app lives inside this repo's checkout; without its own
           # workspace root pnpm installs the monorepo instead of the app.
           echo "packages: []" > app-under-test/pnpm-workspace.yaml
+      # After scaffolding: restoring the cache earlier creates
+      # app-under-test/src-tauri/target, and the scaffolder rightly refuses a
+      # non-empty target directory.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-under-test/src-tauri
       - name: Install app deps
         working-directory: app-under-test
         run: pnpm install --no-frozen-lockfile && uv sync
@@ -256,7 +259,7 @@ jobs:
           # Tauri loop/GTK init. It must spawn the bundled interpreter.
           docker run --rm -v /tmp/approot:/r:ro ubuntu:22.04 bash -c '
             set -e; export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
+            for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates >/dev/null
             /r/usr/bin/app-under-test --self-test'
       - name: Self-test installed app (Linux GUI path, deb + AppImage)
@@ -276,7 +279,7 @@ jobs:
           # directly fails to find WebKitNetworkProcess).
           docker run --rm -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
             set -e; export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
+            for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates xvfb libfuse2 >/dev/null
             echo "── deb layout (resource_dir path)"
             PYLAIR_SELF_TEST_GUI=1 xvfb-run -a /r/usr/bin/app-under-test
