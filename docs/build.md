@@ -12,8 +12,9 @@ pyproject.toml [tool.pylair] + src-tauri/tauri.conf.json
         │
         ▼
 1. fetch python-build-standalone CPython for the HOST triple
-   (SHA256-verified against the release's SHA256SUMS; tarball cached in
-   .pylair/cache/ between builds)
+   (SHA256-verified against hashes committed in the CLI — a checksum
+   fetched from the same release only catches corruption; tarball
+   cached in .pylair/cache/ between builds)
 2. uv export --frozen from uv.lock → uv pip install --target
    src-tauri/resources/site-packages using the bundled interpreter —
    the SAME locked, hashed set `pylair dev` syncs (requirements.txt is

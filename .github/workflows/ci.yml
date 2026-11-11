@@ -245,12 +245,35 @@ jobs:
             apt-get update -qq
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates >/dev/null
             /r/usr/bin/app-under-test --self-test'
+      - name: Self-test installed app (Linux GUI path, deb + AppImage)
+        if: runner.os == 'Linux'
+        working-directory: app-under-test
+        run: |
+          DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
+          dpkg -x "$DEB" /tmp/approot
+          APPIMAGE=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -1)
+          cp "$APPIMAGE" /tmp/app.AppImage && chmod +x /tmp/app.AppImage
+          for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
+          # The GUI variant runs the REAL app under xvfb and makes the call
+          # through app.path().resource_dir() — the code path users hit.
+          # Checked for both deb and AppImage layouts (they mount differently).
+          docker run --rm -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
+            set -e; export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates xvfb libfuse2 >/dev/null
+            echo "── deb layout (resource_dir path)"
+            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a /r/usr/bin/app-under-test
+            echo "── appimage layout"
+            cd /tmp && cp /app.AppImage . && chmod +x app.AppImage
+            ./app.AppImage --appimage-extract >/dev/null
+            PYLAIR_SELF_TEST_GUI=1 xvfb-run -a ./squashfs-root/usr/bin/app-under-test'
       - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
         working-directory: app-under-test
         run: |
           APP=$(find src-tauri/target/release/bundle/macos -name '*.app' | head -1)
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/app-under-test" --self-test
+          env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/app-under-test"
       - name: Self-test installed app (Windows)
         if: runner.os == 'Windows'
         working-directory: app-under-test
