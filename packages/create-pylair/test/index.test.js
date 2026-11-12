@@ -44,7 +44,7 @@ test("scaffolds a complete app skeleton", () => {
   assert.match(py, /pylair==0\.1\.0rc4/);
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
-  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.4"/);
+  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.5"/);
   rmSync(dir, { recursive: true });
 });
 
