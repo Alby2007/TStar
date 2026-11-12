@@ -145,10 +145,10 @@ async fn task_cap_rejects_then_recovers() {
     // Two in-flight tasks.
     let ct1 = h.call_task("sleep_forever", json!({}), None).unwrap();
     let ct2 = h.call_task("sleep_forever", json!({}), None).unwrap();
+    // ct.task resolves when the actor registers the task — the cap is
+    // counted on the Rust side, so this IS the registration barrier.
     let t1 = timeout(T, ct1.task).await.unwrap().unwrap();
     let t2 = timeout(T, ct2.task).await.unwrap().unwrap();
-    // Let the calls actually register in the runtime.
-    sleep(Duration::from_millis(300)).await;
 
     let err = h.call("add", json!({"a": 1, "b": 2}), None).await.unwrap_err();
     assert_limit(&err, "max_concurrent_tasks");
@@ -197,8 +197,12 @@ async fn full_command_queue_is_limit_error_not_stopped() {
     let h = spawn_h(spec(FAKE_WEDGED), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    // The wedged runtime never exits on `shutdown`, so the actor blocks in
-    // the grace window — a guaranteed queue-not-draining window.
+    // The wedged runtime never exits on `shutdown`, so once the spawned
+    // shutdown command is dequeued the actor parks in the grace window —
+    // a guaranteed queue-not-draining window. The sleep gives the spawn
+    // a head start on that dequeue; it only has to beat the 3s grace
+    // period, which it does by a wide margin. (No observable exists for
+    // "actor parked on shutdown" — this is the one wall-clock wait left.)
     let sh = h.clone();
     tokio::spawn(async move { sh.shutdown().await });
     sleep(Duration::from_millis(200)).await;
@@ -262,9 +266,27 @@ async fn credit_cap_rejects_overgrant() {
 
 // ---- stream_buffer_bytes (per stream) ----
 
+/// The cap trip emits a Stderr diagnostic from the actor — waiting for
+/// it is the event-driven form of "let the buffer fill": no sleeps,
+/// and it can't fire before the trip actually happens.
+async fn wait_for_diag(rx: &mut mpsc::Receiver<RuntimeEvent>, needle: &str) {
+    timeout(T, async {
+        while let Some(e) = rx.recv().await {
+            if let RuntimeEvent::Stderr(l) = e {
+                if l.contains(needle) {
+                    return;
+                }
+            }
+        }
+        panic!("event channel closed before {needle:?}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("diagnostic {needle:?} never arrived"));
+}
+
 #[tokio::test]
 async fn per_stream_byte_cap_ends_stream_with_limit_error() {
-    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
     let mut cfg = fast_config();
     cfg.limits.stream_buffer_bytes = 128; // ~30 int chunks
     cfg.initial_stream_credit = 100_000;
@@ -274,9 +296,9 @@ async fn per_stream_byte_cap_ends_stream_with_limit_error() {
 
     let (task, mut items) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
     // Don't drain while the flood accumulates — every recv releases a
-    // byte lease, so draining first would hide the cap. Give the producer
-    // time to fill the buffer and trip it.
-    sleep(Duration::from_millis(800)).await;
+    // byte lease, so draining first would hide the cap. The diagnostic
+    // fires exactly when the cap trips.
+    wait_for_diag(&mut rx, "over the byte cap").await;
     let mut end = None;
     let mut chunks = 0;
     while let Ok(Some(item)) = timeout(T, items.recv()).await {
@@ -303,7 +325,7 @@ async fn per_stream_byte_cap_ends_stream_with_limit_error() {
 
 #[tokio::test]
 async fn total_byte_cap_trips_across_streams() {
-    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
     let mut cfg = fast_config();
     // The total cap can only bind BELOW the per-stream cap (validation
     // raises total >= per) — so it takes multiple streams jointly
@@ -318,8 +340,8 @@ async fn total_byte_cap_trips_across_streams() {
     let (_t1, mut s1) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
     let (_t2, mut s2) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
     let (_t3, mut s3) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
-    // Let the floods accumulate before draining (leases release on recv).
-    sleep(Duration::from_millis(800)).await;
+    // Don't drain before the trip — the diagnostic fires exactly then.
+    wait_for_diag(&mut rx, "over the shared byte cap").await;
     // Whichever stream's chunk pushes the shared total over the cap gets
     // the terminal; assert at least one names the shared limit.
     let mut saw = false;
