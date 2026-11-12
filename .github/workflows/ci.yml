@@ -342,7 +342,11 @@ jobs:
             echo "── webview self-test: deb"
             PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/$APP_BIN
             echo "── webview self-test: appimage"
-            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun'
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun
+            # WindowDestroyed runs on the main thread — the rc.3 window-close
+            # crash lived there; open+close under xvfb keeps it covered.
+            echo "── window-close self-test"
+            PYLAIR_SELF_TEST_WINDOW_CLOSE=1 timeout 90 xvfb-run -a /r/usr/bin/$APP_BIN'
       - name: Self-test installed app (macOS)
         if: runner.os == 'macOS'
         working-directory: ${{ env.APP_DIR }}
@@ -352,6 +356,8 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/$APP_BIN"
           # Webview self-test through the real bridge, run from outside the checkout.
           cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN"
+          # WindowDestroyed on the main thread — the rc.3 window-close panic.
+          env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WINDOW_CLOSE=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN"
       - name: Self-test installed app (Windows)
         if: runner.os == 'Windows'
         working-directory: ${{ env.APP_DIR }}
@@ -373,3 +379,10 @@ jobs:
           $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:TEMP -PassThru
           if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Error 'webview self-test timed out'; exit 1 }
           if ($p.ExitCode -ne 0) { Write-Error "webview self-test exit $($p.ExitCode)"; exit 1 }
+          # WindowDestroyed on the main thread — the rc.3 window-close panic
+          # was found by manual dogfood; cover it in CI on every leg.
+          $env:PYLAIR_SELF_TEST_WEBVIEW = $null
+          $env:PYLAIR_SELF_TEST_WINDOW_CLOSE = '1'
+          & $exe.FullName
+          if ($LASTEXITCODE -ne 0) { Write-Error "window-close self-test exit $LASTEXITCODE"; exit 1 }
+          $env:PYLAIR_SELF_TEST_WINDOW_CLOSE = $null

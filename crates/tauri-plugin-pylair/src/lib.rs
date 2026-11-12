@@ -376,8 +376,13 @@ impl<R: Runtime> Builder<R> {
                 {
                     app.state::<Registry>().lock().unwrap().drop_label(label);
                     // Its tasks die with it — nobody left to see the results.
+                    // Window events run on the main thread with no reactor
+                    // entered — spawn the send on Tauri's runtime, exactly
+                    // like the actor/Exit/on_drop paths below.
                     if let Some(rt) = app.try_state::<PyRuntime>() {
-                        rt.0.cancel_owner(label.to_string());
+                        let h = rt.0.clone();
+                        let owner = label.to_string();
+                        tauri::async_runtime::spawn(async move { h.cancel_owner(owner).await });
                     }
                 }
                 // Block exit until the runtime's process tree is gone: the

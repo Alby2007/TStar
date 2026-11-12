@@ -463,13 +463,14 @@ impl Handle {
     }
 
     /// Cancel every task owned by `owner` — used when a window is destroyed.
-    /// Delivers from a spawned task so a momentarily-full command queue
-    /// cannot silently drop it (the window's tasks would run on orphaned).
-    pub fn cancel_owner(&self, owner: String) {
-        let cmd = self.cmd.clone();
-        tokio::spawn(async move {
-            let _ = cmd.send(Command::CancelOwned { owner }).await;
-        });
+    /// Async so the CALLER picks the executor — the same rule as `spawn`
+    /// below. Window events run on the main thread where no reactor is
+    /// entered; a `tokio::spawn` inside this method panicked there. The
+    /// awaited send keeps the non-dropping guarantee: a momentarily-full
+    /// command queue cannot silently lose it (the window's tasks would
+    /// run on orphaned).
+    pub async fn cancel_owner(&self, owner: String) {
+        let _ = self.cmd.send(Command::CancelOwned { owner }).await;
     }
 
     /// Grant more stream pull-credit to `task` as `caller`.

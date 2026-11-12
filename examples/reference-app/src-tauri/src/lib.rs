@@ -3,7 +3,11 @@
 //!
 //! `--self-test` / PYLAIR_SELF_TEST: headless release-path check (no window).
 //! PYLAIR_SELF_TEST_GUI: same check inside setup(), through resource_dir().
+//! PYLAIR_SELF_TEST_WINDOW_CLOSE: open the window, close it after a beat —
+//! exercises WindowEvent::Destroyed on the main thread (the rc.3 crash
+//! path) and exits 0 only if teardown stays panic-free.
 
+use tauri::Manager;
 use tauri_plugin_pylair::{app_spawn_spec, self_test_gui, self_test_headless, self_test_requested};
 
 const APP_MODULE: &str = "backend.app";
@@ -15,6 +19,7 @@ pub fn run() {
         std::process::exit(self_test_headless(APP_MODULE, SOURCE_DIR));
     }
     let gui_test = std::env::var("PYLAIR_SELF_TEST_GUI").is_ok();
+    let close_test = std::env::var("PYLAIR_SELF_TEST_WINDOW_CLOSE").is_ok();
     tauri::Builder::default()
         .plugin(
             tauri_plugin_pylair::Builder::new_with(|app| {
@@ -29,6 +34,27 @@ pub fn run() {
                     let code = self_test_gui(&handle, APP_MODULE, SOURCE_DIR).await;
                     handle.exit(code);
                 });
+            }
+            if close_test {
+                // Window::close dispatches to the main loop internally —
+                // safe from this bare thread. The Destroyed arm then runs
+                // on the main thread; a panic there fails the process.
+                if let Some(w) = app.get_webview_window("main") {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let _ = w.close();
+                    });
+                    // Watchdog: a panic is instant, but a swallowed close
+                    // (an OS keeping the app resident) must fail loudly
+                    // instead of hanging the CI leg.
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        std::process::exit(5);
+                    });
+                } else {
+                    // Close mode armed but no window — fail now, don't hang.
+                    std::process::exit(4);
+                }
             }
             Ok(())
         })
