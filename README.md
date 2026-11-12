@@ -38,6 +38,9 @@ The first `pylair dev` compiles the Rust/Tauri side from source —
 expect a few minutes before the window appears; later runs reuse the
 build cache and start in seconds.
 
+(`pylair` 0.1.0rc2 may print a cosmetic `writer dropped a frame` line
+to stderr at shutdown — harmless; the fix lands in the next RC.)
+
 Milestones: `M0` packaging spike → `M1` supervisor/protocol → `M2` typed
 bridge → `M3` streaming/cancellation → `M4` CLI/scaffolder → `M5` Ollama
 integration → `M6` reference app + RC.

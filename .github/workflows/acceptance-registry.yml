@@ -61,6 +61,10 @@ jobs:
           # post-job cache save fails the whole leg.
           cache: ${{ (inputs.source || 'pack') == 'pack' && 'pnpm' || '' }}
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Matrix legs race on a shared cache key — the loser logs a
+          # warning, not a failure. Per-leg suffixes keep saves quiet.
+          cache-suffix: ${{ matrix.os }}-${{ matrix.build_shell }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.92.0"
