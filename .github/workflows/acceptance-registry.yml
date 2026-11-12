@@ -36,7 +36,7 @@ env:
 
 jobs:
   acceptance:
-    name: registry-acceptance (${{ matrix.os }}, ${{ env.SOURCE }})
+    name: registry-acceptance (${{ matrix.os }}, ${{ inputs.source || 'pack' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -60,13 +60,13 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Build workspace packages
-        if: env.SOURCE == 'pack'
+        if: ${{ (inputs.source || 'pack') == 'pack' }}
         run: |
           pnpm install --frozen-lockfile
           pnpm -r build
 
       - name: npm-pack the three packages
-        if: env.SOURCE == 'pack'
+        if: ${{ (inputs.source || 'pack') == 'pack' }}
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/packs"
@@ -76,7 +76,7 @@ jobs:
           ls -la "$RUNNER_TEMP/packs"
 
       - name: Scaffold from the packed create-pylair tarball
-        if: env.SOURCE == 'pack'
+        if: ${{ (inputs.source || 'pack') == 'pack' }}
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/cp-src"
@@ -84,7 +84,7 @@ jobs:
           node "$RUNNER_TEMP/cp-src/package/dist/index.js" app-under-test
 
       - name: Scaffold from the registry (@next)
-        if: env.SOURCE == 'registry'
+        if: ${{ inputs.source == 'registry' }}
         run: npx -y create-pylair@next app-under-test
 
       - name: Install app deps
