@@ -75,13 +75,18 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+      # bash everywhere: pwsh doesn't abort a step when a native command
+      # mid-block exits non-zero — a failed `ruff format --check` was
+      # masked by a later `pytest` pass (CI #91 Windows leg). bash runs -e.
       - working-directory: python/pylair
+        shell: bash
         run: |
           uv sync --frozen
           uv run ruff check src tests
           uv run ruff format --check src tests
           uv run pytest -q
       - working-directory: integrations/ollama
+        shell: bash
         run: |
           uv sync --frozen
           uv run ruff check src tests
@@ -177,8 +182,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
-          Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
+          if (-not $installer) { Write-Error 'nsis installer not found'; exit 1 }
+          # Start-Process does not propagate the installer's exit code — a
+          # failed /S install would be silently masked. Check it explicitly.
+          $inst = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($inst.ExitCode -ne 0) { Write-Error "nsis install exit $($inst.ExitCode)"; exit 1 }
           # Locate the bundled interpreter wherever NSIS put the install dir.
           $py = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
                 -Recurse -Filter 'python.exe' -Depth 4 -ErrorAction SilentlyContinue |
@@ -243,13 +253,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Build workspace packages (client + cli + scaffolder dists)
+        # pwsh would mask a failed pnpm install if build passed anyway —
+        # bash -e aborts on the first failing command.
+        shell: bash
         run: |
           pnpm install --frozen-lockfile
           pnpm -r build
       - name: Scaffold app (local dep wiring)
         if: matrix.app == 'scaffold'
+        shell: bash
         run: |
-          node packages/create-pylair/dist/index.js app-under-test --local "$PWD"
+          # --local . resolves to the checkout root on every OS; under
+          # git-bash "$PWD" is an MSYS path (/d/a/...) that node's
+          # path.resolve() misinterprets on Windows.
+          node packages/create-pylair/dist/index.js app-under-test --local .
           # The app lives inside this repo's checkout; without its own
           # workspace root pnpm installs the monorepo instead of the app.
           echo "packages: []" > app-under-test/pnpm-workspace.yaml
@@ -264,12 +281,18 @@ jobs:
       - name: Add a native-wheel dependency (numpy)
         if: matrix.app == 'scaffold'
         working-directory: app-under-test
+        shell: bash
         run: |
+          # If `uv add` failed, `printf` would still succeed and the
+          # native-wheel coverage would be silently lost under pwsh.
           uv add numpy
           printf '\nimport numpy  # native wheel must load inside the bundle\n' >> backend/app.py
       - name: Install app deps
         working-directory: ${{ env.APP_DIR }}
-        run: pnpm install --no-frozen-lockfile && uv sync
+        shell: bash
+        run: |
+          pnpm install --no-frozen-lockfile
+          uv sync
       - name: pylair build (stages interpreter, env, prunes, tauri build)
         working-directory: ${{ env.APP_DIR }}
         run: pnpm exec pylair build --bundles ${{ matrix.bundles }}
@@ -334,8 +357,11 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $i = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
-          Start-Process -FilePath $i.FullName -ArgumentList '/S' -Wait
+          if (-not $i) { Write-Error 'nsis installer not found'; exit 1 }
+          $inst = Start-Process -FilePath $i.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($inst.ExitCode -ne 0) { Write-Error "nsis install exit $($inst.ExitCode)"; exit 1 }
           $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles" `
                 -Recurse -Filter "$env:APP_BIN.exe" -Depth 3 -ErrorAction SilentlyContinue |
                 Select-Object -First 1

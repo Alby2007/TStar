@@ -76,6 +76,9 @@ jobs:
 
       - name: Build workspace packages
         if: ${{ (inputs.source || 'pack') == 'pack' }}
+        # bash, not the Windows-default pwsh: a failed native command
+        # mid-block does not fail a pwsh step unless it's the last one.
+        shell: bash
         run: |
           pnpm install --frozen-lockfile
           pnpm -r build
@@ -162,8 +165,11 @@ jobs:
         shell: pwsh
         working-directory: app-under-test
         run: |
+          $ErrorActionPreference = 'Stop'
           $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
-          Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
+          if (-not $installer) { Write-Error 'nsis installer not found'; exit 1 }
+          $inst = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($inst.ExitCode -ne 0) { Write-Error "nsis install exit $($inst.ExitCode)"; exit 1 }
           $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
                 -Recurse -Filter 'app-under-test.exe' -Depth 4 -ErrorAction SilentlyContinue |
                 Select-Object -First 1
