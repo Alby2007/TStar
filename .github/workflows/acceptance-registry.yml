@@ -1,0 +1,138 @@
+name: Registry acceptance
+
+# Scaffolds an app from the SHIPPED artifacts and proves the whole path:
+# npm install → uv sync → pylair build → --self-test (real bridge call
+# through the bundled interpreter, no display needed).
+#
+# Two modes:
+#   source=pack     (default): npm-pack the three packages, scaffold from
+#                    the packed create-pylair tarball, and install the app
+#                    deps from the packed tarballs — catches what WOULD
+#                    ship (missing files, bad names) before it can't be
+#                    changed. Run after bumping versions, before publish.
+#   source=registry: scaffold via `npx create-pylair@next` — post-publish
+#                    verification of what users actually get.
+#
+# Registry-mode prerequisite: the pylair PyPI package and
+# tauri-plugin-pylair crate versions pinned by the scaffolder must
+# already be published — publish the crate first, then npm.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Install deps from packed tarballs or the live registry"
+        type: choice
+        options: [pack, registry]
+        default: pack
+  push:
+    paths:
+      - "packages/client/**"
+      - "packages/cli/**"
+      - "packages/create-pylair/**"
+      - ".github/workflows/acceptance-registry.yml"
+
+env:
+  SOURCE: ${{ inputs.source || 'pack' }}
+
+jobs:
+  acceptance:
+    name: registry-acceptance (${{ matrix.os }}, ${{ env.SOURCE }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+      - name: Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Build workspace packages
+        if: env.SOURCE == 'pack'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm -r build
+
+      - name: npm-pack the three packages
+        if: env.SOURCE == 'pack'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/packs"
+          for p in packages/client packages/cli packages/create-pylair; do
+            (cd "$p" && npm pack --pack-destination "$RUNNER_TEMP/packs" >/dev/null)
+          done
+          ls -la "$RUNNER_TEMP/packs"
+
+      - name: Scaffold from the packed create-pylair tarball
+        if: env.SOURCE == 'pack'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/cp-src"
+          tar -xzf "$RUNNER_TEMP"/packs/create-pylair-*.tgz -C "$RUNNER_TEMP/cp-src"
+          node "$RUNNER_TEMP/cp-src/package/dist/index.js" app-under-test
+
+      - name: Scaffold from the registry (@next)
+        if: env.SOURCE == 'registry'
+        run: npx -y create-pylair@next app-under-test
+
+      - name: Install app deps
+        working-directory: app-under-test
+        shell: bash
+        run: |
+          if [ "$SOURCE" = pack ]; then
+            # Tarballs FIRST — the scaffolded pins point at versions that
+            # aren't on the registry yet, so a bare npm install 404s.
+            npm install "$RUNNER_TEMP"/packs/pylair-client-*.tgz "$RUNNER_TEMP"/packs/pylair-cli-*.tgz
+          fi
+          npm install
+          uv sync
+
+      - name: pylair build
+        working-directory: app-under-test
+        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || 'deb' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app-under-test/src-tauri
+
+      - name: Self-test installed app (Linux, clean container, no Python)
+        if: runner.os == 'Linux'
+        working-directory: app-under-test
+        run: |
+          DEB=$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)
+          dpkg -x "$DEB" /tmp/approot
+          for i in 1 2 3; do docker pull ubuntu:22.04 && break || sleep 15; done
+          # Bare ubuntu:22.04 has NO python — --self-test exits before the
+          # Tauri loop/GTK init but still needs its linked system libs.
+          docker run --rm -v /tmp/approot:/r:ro ubuntu:22.04 bash -c '
+            set -e; export DEBIAN_FRONTEND=noninteractive
+            for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
+            apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates >/dev/null
+            /r/usr/bin/app-under-test --self-test'
+
+      - name: Self-test installed app (Windows, silent NSIS install)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: app-under-test
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait
+          $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
+                -Recurse -Filter 'app-under-test.exe' -Depth 4 -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+          if (-not $exe) { Write-Error 'installed app-under-test.exe not found'; exit 1 }
+          Write-Output "installed app: $($exe.FullName)"
+          & $exe.FullName --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

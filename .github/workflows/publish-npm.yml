@@ -76,6 +76,11 @@ jobs:
             else
               (cd "$p" && npm publish --access public --provenance --tag next)
             fi
+            # `latest` must move to every new release or `npm create pylair`
+            # keeps handing out the first (buggier) RC — while there's no
+            # stable, newest RC is what we want latest to mean. Idempotent,
+            # so it also heals a tag left behind by a partial run.
+            npm dist-tag add "$name@${{ inputs.version }}" latest
           done
 
       - name: Tag the release
