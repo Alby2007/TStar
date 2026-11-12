@@ -108,6 +108,10 @@ class TaskRegistry:
             self._pending_cancels.discard(task_id)
             if task.asyncio_task is not None and not task.asyncio_task.done():
                 task.asyncio_task.cancel()
+                # Same guarantee as cancel(): a task cancelled before its
+                # first step never enters a handler, so nothing would emit
+                # TASK_CANCELLED — the call's terminal would be lost.
+                asyncio.create_task(self._ensure_terminal(task))
 
     # ---- execution modes -------------------------------------------------
 

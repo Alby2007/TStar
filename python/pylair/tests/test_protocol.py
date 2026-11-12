@@ -167,6 +167,25 @@ def test_cancel_stream(runtime):
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
 
 
+def test_cancel_before_registration_still_terminates(runtime):
+    """A cancel that lands BEFORE its call (control frames can overtake
+    the data lane) is held in _pending_cancels and applied at
+    registration. A task cancelled before its first step never enters a
+    handler — without the finisher the call's terminal would be lost.
+    RC.8B found this exact hang."""
+    runtime.recv()
+    # cancel first, call second — both queued in the same pipe order.
+    runtime.send(proto.request(9, "cancel", {"task": 9}))
+    runtime.send(call(3, "sleep_forever", task=9))
+    # The cancel ack reports not-found (the task didn't exist yet)...
+    ack = runtime.recv_until(lambda m: m.get("id") == 9)
+    assert ack["result"]["cancelled"] is False
+    # ...but the call's terminal must still arrive, and it must be the
+    # cancelled outcome — never a hang or a completed result.
+    terminal = runtime.recv_until(lambda m: m.get("id") == 3)
+    assert terminal["error"]["code"] == proto.TASK_CANCELLED
+
+
 def test_isolated_call(runtime):
     runtime.recv()
     runtime.send(call(1, "isolated_add", task=1, input={"a": 4, "b": 5}))
