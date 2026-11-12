@@ -22,7 +22,7 @@ import {
 } from "node:fs";
 import { get } from "node:https";
 import { arch, platform, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
 import { DEFAULT_PRUNE, prune } from "./prune.js";
@@ -114,7 +114,15 @@ async function fetchPython(
   const dest = join(resources, "python");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
-  execFileSync("tar", ["-xzf", tarball, "-C", dest, "--strip-components=1"], { stdio: "inherit" });
+  // GNU tar (Git Bash) parses "D:\..." as a remote host:file spec and
+  // dies; BSD tar (System32, macOS) has no --force-local to guard it.
+  // Give tar only relative paths — cwd at the tarball, archive by
+  // basename, -C by relative path — and no tar can misparse anything.
+  execFileSync(
+    "tar",
+    ["-xzf", basename(tarball), "-C", relative(dirname(tarball), dest), "--strip-components=1"],
+    { cwd: dirname(tarball), stdio: "inherit" },
+  );
   const py = join(dest, isWin ? "python.exe" : "bin/python3");
   if (!existsSync(py)) throw new Error(`expected interpreter at ${py}`);
   return py;
