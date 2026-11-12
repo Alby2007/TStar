@@ -41,7 +41,7 @@ test("scaffolds a complete app skeleton", () => {
   assert.equal(conf.identifier, "com.example.myapp");
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
-  assert.match(py, /pylair==0\.1\.0rc4/);
+  assert.match(py, /pylair==0\.1\.0rc5/);
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
   assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.5"/);
