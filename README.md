@@ -73,6 +73,14 @@ integration → `M6` reference app + RC.
   runtime is killed via missed pongs instead. `loop_stall_kill` can make
   loop stalls fatal sooner — it's off by default because legitimate
   blocking work (multi-GB model loads) can stall the loop for minutes.
+- **A wedged runtime can survive an abrupt host kill on macOS.** If the
+  app dies while Python can't read stdin (blocked in native code), the
+  stdin-EOF fallback never reaches it and macOS has no parent-death
+  signal — the runtime may be left running. On Linux
+  `PR_SET_PDEATHSIG` and on Windows the Job Object kill the runtime
+  even then — those paths are exercised by the abrupt-kill tests on the
+  Windows and Linux CI legs; macOS coverage is stdin-EOF (healthy
+  runtimes) plus the isolated worker's own parent watcher.
 - **`isolated=True` respawns a worker per call.** Each call re-imports
   its modules — fine for short calls, seconds each with torch-class
   imports. A warm persistent worker (`worker={'mode': 'warm'}`) is

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command as TokioCommand};
+use tokio::process::Child;
+#[cfg(not(target_os = "linux"))]
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, timeout};
 
@@ -1249,19 +1251,25 @@ fn jitter(d: Duration) -> Duration {
 
 // ---- process spawning & kill plumbing ----
 
-async fn spawn_child(
-    spec: &SpawnSpec,
-    config: &SupervisorConfig,
-    events: &mpsc::Sender<RuntimeEvent>,
-) -> io::Result<ChildIo> {
-    // Simplify a canonicalized (Windows \\?\-prefixed) program path so the
-    // child sees a plain sys.executable — dev-mode callers may pass one too.
-    let mut cmd = TokioCommand::new(dunce::simplified(&spec.program));
+/// Linux: spawn the child FROM a dedicated thread that then parks for the
+/// process's lifetime. PR_SET_PDEATHSIG is bound to the *thread* that
+/// forked the child — not the process — so spawning on a transient
+/// executor thread (e.g. a spawn_blocking worker at its ~10s keepalive)
+/// would SIGKILL a perfectly healthy runtime. The anchor can only die
+/// with the whole process, so the signal means exactly "the host is gone".
+///
+/// `Child::from_std` has no kill_on_drop, but the monitor task below owns
+/// the child and kills/reaps it explicitly on every exit path — the drop
+/// backstop was redundant with that ownership.
+#[cfg(target_os = "linux")]
+fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(dunce::simplified(&spec.program));
     cmd.args(&spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .process_group(0);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
     }
@@ -1269,26 +1277,64 @@ async fn spawn_child(
         cmd.env_remove(k);
     }
     cmd.envs(spec.env.iter().cloned());
-    #[cfg(unix)]
-    {
-        // Own process group so killpg can reach grandchildren (protocol §10).
-        cmd.process_group(0);
-        // Linux: if the host dies abruptly (SIGKILL), our cleanup paths —
-        // kill_on_drop, the monitor task, kill_and_reap — all die with it.
-        // PR_SET_PDEATHSIG asks the kernel to deliver SIGKILL to the child
-        // the moment its parent is gone, covering exactly that case.
-        #[cfg(target_os = "linux")]
-        unsafe {
-            cmd.as_std_mut().pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+    let (tx, rx) = std::sync::mpsc::channel::<io::Result<std::process::Child>>();
+    std::thread::Builder::new()
+        .name("pylair-pdeath-anchor".into())
+        .spawn(move || {
+            // The JoinHandle detaches on return — the thread lives until
+            // the process does.
+            let _ = tx.send(cmd.spawn());
+            loop {
+                std::thread::park();
+            }
+        })?;
+    let std_child = rx
+        .recv()
+        .map_err(|_| io::Error::other("pdeathsig anchor died before spawn"))??;
+    Child::from_std(std_child)
+}
 
-    let mut child = cmd.spawn()?;
+async fn spawn_child(
+    spec: &SpawnSpec,
+    config: &SupervisorConfig,
+    events: &mpsc::Sender<RuntimeEvent>,
+) -> io::Result<ChildIo> {
+    // Simplify a canonicalized (Windows \\?\-prefixed) program path so the
+    // child sees a plain sys.executable — dev-mode callers may pass one too.
+    // On Linux the spawn happens on a dedicated anchor thread instead —
+    // see spawn_via_pdeathsig_anchor.
+    #[cfg(not(target_os = "linux"))]
+    let mut child = {
+        let mut cmd = TokioCommand::new(dunce::simplified(&spec.program));
+        cmd.args(&spec.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
+        for k in &spec.env_remove {
+            cmd.env_remove(k);
+        }
+        cmd.envs(spec.env.iter().cloned());
+        #[cfg(unix)]
+        {
+            // Own process group so killpg can reach grandchildren (§10).
+            cmd.process_group(0);
+        }
+        cmd.spawn()?
+    };
+    #[cfg(target_os = "linux")]
+    let mut child = spawn_via_pdeathsig_anchor(spec)?;
     #[cfg(windows)]
     let pid = child.id();
     let stdin = child.stdin.take().expect("piped");

@@ -283,26 +283,32 @@ async fn cancel_not_dropped_when_frame_queue_full() {
         .expect("task id timed out")
         .unwrap();
 
-    // Flood the data lane until try_send reports it full (RUNTIME_CRASHED
-    // on a Call is the loud signal).
+    // Flood the data lane until try_send reports it full. Frames that DID
+    // queue never get a response, so awaiting each result would burn the
+    // whole timeout per call; instead a drainer task watches results for
+    // the loud RUNTIME_CRASHED that means try_send failed.
     let big = "x".repeat(16 * 1024);
-    let mut queue_full = false;
+    let (full_tx, mut full_rx) = mpsc::channel::<()>(1);
     for _ in 0..400 {
         match h.call_task("echo", json!({"input": big}), None) {
             Ok(ct) => {
-                if let Ok(Ok(Err(e))) = timeout(T, ct.result).await {
-                    if e.code == proto::RUNTIME_CRASHED {
-                        queue_full = true;
-                        break;
+                let tx = full_tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(Err(e)) = ct.result.await {
+                        if e.code == proto::RUNTIME_CRASHED {
+                            let _ = tx.send(()).await;
+                        }
                     }
-                }
+                });
             }
-            Err(_) => {
-                queue_full = true;
-                break;
-            }
+            Err(_) => break,
         }
+        tokio::task::yield_now().await;
     }
+    let queue_full = timeout(Duration::from_secs(10), full_rx.recv())
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
     assert!(queue_full, "never managed to fill the frame queue");
 
     // The cancel still leaves on the control lane — the wedged runtime
@@ -609,4 +615,37 @@ async fn host_sigkill_does_not_orphan_isolated_worker() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+// ---- the pdeathsig anchor must not fire early ----
+
+/// PR_SET_PDEATHSIG is bound to the THREAD that forked the child. If the
+/// runtime were spawned on a transient executor thread (a spawn_blocking
+/// worker exits at ~10s idle), a healthy runtime would be SIGKILLed
+/// shortly after spawn. The spawn happens on a dedicated parked thread
+/// instead — this test proves a runtime survives well past the thread-
+/// lifetime cliff the mechanism was protecting against.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pdeathsig_does_not_kill_a_healthy_runtime_early() {
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
+    let h = spawn_h(real_runtime_spec(), fast_config(), ev);
+    wait_state(&h, State::Ready).await;
+
+    // spawn_blocking keepalive is ~10s; 35s proves the anchor, not a
+    // borrowed thread, owns the parent-death binding.
+    sleep(Duration::from_secs(35)).await;
+    assert_eq!(
+        h.state(),
+        State::Ready,
+        "runtime died within 35s of spawn — pdeathsig fired on a healthy runtime"
+    );
+
+    // And it must still serve a call — "alive" means functioning.
+    let out = timeout(T, h.call("add", json!({"a": 1, "b": 2}), None))
+        .await
+        .expect("call timed out")
+        .expect("call failed after the wait");
+    assert_eq!(out, json!(3));
+    h.shutdown().await;
 }
