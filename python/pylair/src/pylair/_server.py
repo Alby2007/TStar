@@ -385,10 +385,18 @@ class Server:
             except asyncio.CancelledError:
                 pass
         await self._drain(grace_s=3.0)
-        self._out.put(_STOP)
-        self._channel.close_write()
+        self._out.close()
+        # _STOP is appended after every queued frame, so the writer exits
+        # only once the queue is empty. Join it BEFORE closing the fd —
+        # closing first makes write_frame fail on the closed stream and
+        # every final frame (shutdown ack, TASK_CANCELLEDs) is dropped.
         writer.join(timeout=2)
+        self._channel.close_write()
 
 
 def run(channel: FrameChannel) -> None:
-    asyncio.run(Server(channel).run())
+    try:
+        asyncio.run(Server(channel).run())
+    except BaseException as e:
+        _log(f"fatal: {type(e).__name__}: {e}\n{traceback.format_exc(limit=15)}")
+        raise

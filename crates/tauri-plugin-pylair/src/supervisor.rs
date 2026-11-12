@@ -1416,6 +1416,12 @@ impl Supervisor {
                                 ShutdownOutcome::Incomplete
                             };
                             self.shutdown_outcome = Some(outcome);
+                            // The runtime may have written final responses
+                            // (TASK_CANCELLED, results) before exiting —
+                            // deliver them so callers get what actually
+                            // happened, then sweep the rest.
+                            drain_exited_inbox(&mut io, &mut pending, &mut tasks,
+                                               &mut task_of_call, &mut done_tasks).await;
                             fail_all(&mut pending, proto::RUNTIME_UNAVAILABLE, "shutdown").await;
                             return ExitCause::CleanShutdown;
                         }
@@ -1462,6 +1468,10 @@ impl Supervisor {
                         Ok(Err(e)) => format!("wait error: {e}"),
                         Err(_) => "monitor dropped".into(),
                     };
+                    // Same last-words delivery as the shutdown path: a dying
+                    // runtime's queued responses resolve their own calls.
+                    drain_exited_inbox(&mut io, &mut pending, &mut tasks,
+                                       &mut task_of_call, &mut done_tasks).await;
                     fail_all(&mut pending, proto::RUNTIME_CRASHED, &detail).await;
                     return ExitCause::Crashed(detail);
                 }
@@ -1563,6 +1573,56 @@ fn cancel_outcome(out: &Result<Value, ErrorObj>) -> CancelOutcome {
         // task_not_found from the runtime = it finished before we asked.
         Ok(_) => CancelOutcome::Completed,
         Err(_) => CancelOutcome::TerminationUncertain,
+    }
+}
+
+/// Deliver every response the runtime managed to write before it exited.
+/// `wait()` can report the exit while bytes still sit unread in the pipe —
+/// without this drain, `fail_all` would overwrite the runtime's actual
+/// last words (TASK_CANCELLED, real results) with a generic code.
+/// Bounded: at most 250ms of parsing whatever the pipe still holds.
+async fn drain_exited_inbox(
+    io: &mut ChildIo,
+    pending: &mut HashMap<u64, PendingKind>,
+    tasks: &mut HashMap<u64, TaskMeta>,
+    task_of_call: &mut HashMap<u64, u64>,
+    done_tasks: &mut HashSet<u64>,
+) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let msg = match timeout(left, io.msg_in.recv()).await {
+            Ok(Some(m)) => m,
+            _ => return, // channel closed (reader hit EOF) or nothing left
+        };
+        let Ok(InMsg::Response { id, result, error }) = msg else {
+            continue; // notifications from a dead runtime are moot
+        };
+        let out = match (result, error) {
+            (_, Some(e)) => Err(e),
+            (r, None) => Ok(r.unwrap_or(Value::Null)),
+        };
+        if let Some(kind) = pending.remove(&id) {
+            match kind {
+                PendingKind::Call(tx) => {
+                    let _ = tx.send(out);
+                }
+                PendingKind::Stream(sink) => sink.finish(out),
+                PendingKind::Cancel { respond } => {
+                    let _ = respond.send(cancel_outcome(&out));
+                }
+            }
+        }
+        if let Some(task) = task_of_call.remove(&id) {
+            tasks.remove(&task);
+            if done_tasks.len() >= 1024 {
+                done_tasks.clear();
+            }
+            done_tasks.insert(task);
+        }
     }
 }
 

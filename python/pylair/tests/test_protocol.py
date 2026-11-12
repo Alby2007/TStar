@@ -311,3 +311,32 @@ def test_oversized_frame_rejected():
     # runtime should exit (violation -> EOF path), not hang waiting for 64 MiB
     rc = proc.wait(timeout=10)
     assert rc is not None
+
+
+def test_shutdown_emits_ack_and_task_terminals(runtime):
+    """Shutdown while a stream is live: the ack AND a TASK_CANCELLED for the
+    task must both reach the wire before the process exits. Regression: the
+    drain used to close the frame fd before the writer thread flushed, and
+    cancel_all never gave the terminal-emitting finishers a loop turn —
+    every final frame was silently dropped."""
+    runtime.recv()  # hello
+    runtime.send(call(1, "infinite_counted", task=7))
+    runtime.send(proto.request(2, "shutdown", None))
+
+    msgs = []
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            msgs.append(runtime.recv(timeout=max(0.1, deadline - time.time())))
+        except queue.Empty:
+            break
+        if "__io_error__" in msgs[-1]:
+            break
+    runtime.proc.wait(timeout=10)
+
+    by_id = {m.get("id"): m for m in msgs if "id" in m}
+    assert by_id[2].get("result") == {}, "shutdown ack missing or wrong"
+    err = by_id[1].get("error") or {}
+    assert err.get("code") == proto.TASK_CANCELLED, (
+        f"stream terminal across shutdown was {msgs!r}"
+    )

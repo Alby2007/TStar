@@ -384,6 +384,27 @@ class TaskRegistry:
         for task in self._tasks.values():
             if not task.done:
                 await self.cancel(task.id)
+        # cancel() only SCHEDULES the terminal-emitting finisher. On
+        # shutdown the loop closes right after this returns, so wait for
+        # the cancelled tasks to end — the finishers emit TASK_CANCELLED
+        # while the writer thread is still alive to carry them.
+        waiters = [
+            t.asyncio_task
+            for t in self._tasks.values()
+            if t.asyncio_task is not None and not t.asyncio_task.done()
+        ]
+        try:
+            if waiters:
+                await asyncio.wait(waiters)
+        finally:
+            for task in self._tasks.values():
+                if not task.done:
+                    self._finish(
+                        task,
+                        proto.error_response(
+                            task.call_id, proto.TASK_CANCELLED, "task cancelled"
+                        ),
+                    )
 
     def _finish(self, task: Task, terminal: dict) -> None:
         if task.done:
