@@ -38,6 +38,23 @@ const KEYMAP: Record<string, keyof PylairConfig> = {
   bundles: "bundles",
 };
 
+/** Interpreter for parsing [tool.pylair]: the app venv when `uv sync` ran
+ * (guaranteed >=3.12 by the template), else a system probe. tomllib needs
+ * >=3.11 — Ubuntu 22.04's python3 is 3.10, and user machines may have no
+ * python3 at all, so "python3 exists and is new enough" is never safe. */
+export function appPython(appDir: string): string {
+  const venv = join(
+    appDir,
+    ".venv",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+  );
+  if (existsSync(venv)) return venv;
+  for (const c of ["python3", "python"]) {
+    if (spawnSync(c, ["--version"]).status === 0) return c;
+  }
+  throw new Error(`no Python interpreter for ${appDir} — run \`uv sync\` first`);
+}
+
 /** Parse [tool.pylair] via the interpreter's own tomllib — no npm TOML dep. */
 export function loadConfig(appDir: string, python: string): PylairConfig {
   const pyproject = join(appDir, "pyproject.toml");
