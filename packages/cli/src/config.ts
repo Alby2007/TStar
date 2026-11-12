@@ -27,6 +27,9 @@ export interface TauriConfig {
   productName: string;
   identifier: string;
   version: string;
+  /** bundle.macOS.signingIdentity — a configured identity means Tauri
+   * signs for real during bundling; pylair must not ad-hoc over it. */
+  macSigningIdentity?: string;
 }
 
 const KEYMAP: Record<string, keyof PylairConfig> = {
@@ -82,6 +85,7 @@ export function loadTauriConfig(appDir: string): TauriConfig {
     productName: raw.productName ?? "app",
     identifier: raw.identifier ?? "com.example.app",
     version: raw.version ?? "0.1.0",
+    macSigningIdentity: raw.bundle?.macOS?.signingIdentity ?? undefined,
   };
 }
 

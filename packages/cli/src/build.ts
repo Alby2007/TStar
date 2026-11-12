@@ -12,6 +12,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -185,7 +186,14 @@ function isMachO(p: string): boolean {
  * exactly that. Verify with --deep --strict; if it fails, the build
  * fails — a broken signature must not ship silently.
  */
-function adHocSign(tauriDir: string): void {
+function codesignVerify(path: string): string | null {
+  const v = spawnSync("codesign", ["--verify", "--deep", "--strict", path], {
+    encoding: "utf-8",
+  });
+  return v.status === 0 ? null : (v.stderr ?? "").trim();
+}
+
+function adHocSign(tauriDir: string, productName: string): void {
   const bundleDir = join(tauriDir, "target", "release", "bundle", "macos");
   if (!existsSync(bundleDir)) return; // --bundles skipped app — nothing to sign
   const app = readdirSync(bundleDir).find((n) => n.endsWith(".app"));
@@ -209,14 +217,47 @@ function adHocSign(tauriDir: string): void {
   for (const p of machos) run("codesign", ["--force", "--sign", "-", p], appPath);
   run("codesign", ["--force", "--sign", "-", appPath], bundleDir);
 
-  const v = spawnSync(
-    "codesign",
-    ["--verify", "--deep", "--strict", appPath],
-    { encoding: "utf-8" },
-  );
-  if (v.status !== 0)
-    throw new Error(`ad-hoc signing produced an invalid bundle:\n${v.stderr}`);
+  const err = codesignVerify(appPath);
+  if (err) throw new Error(`ad-hoc signing produced an invalid bundle:\n${err}`);
   console.log(`ad-hoc signed ${app} — ${machos.length} nested binaries, codesign --verify clean`);
+
+  // A dmg built in the same `tauri build` already captured the
+  // PRE-signing .app — signing after bundling can't reach inside a
+  // compressed image. Repackage each dmg from the signed app and verify
+  // the shipped artifact itself, not just the staged copy. The rebuilt
+  // image is plain (app + /Applications link) — Tauri's cosmetic layout
+  // returns once real signing is configured and repackaging stops.
+  const dmgDir = join(tauriDir, "target", "release", "bundle", "dmg");
+  if (!existsSync(dmgDir)) return;
+  for (const dmg of readdirSync(dmgDir).filter((n) => n.endsWith(".dmg"))) {
+    const dmgPath = join(dmgDir, dmg);
+    const staging = mkdtempSync(join(tmpdir(), "pylair-dmg-"));
+    try {
+      run("ditto", [appPath, join(staging, app)], tauriDir);
+      run("ln", ["-s", "/Applications", join(staging, "Applications")], tauriDir);
+      run(
+        "hdiutil",
+        ["create", "-volname", productName, "-srcfolder", staging, "-ov", "-format", "UDZO", dmgPath],
+        tauriDir,
+      );
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+
+    // Verify the app INSIDE the shipped dmg — mount read-only at a fixed
+    // point, verify, always detach, then judge.
+    const mount = mkdtempSync(join(tmpdir(), "pylair-mnt-"));
+    run("hdiutil", ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmgPath], tauriDir);
+    let inDmg: string | null = null;
+    try {
+      inDmg = codesignVerify(join(mount, app));
+    } finally {
+      spawnSync("hdiutil", ["detach", mount, "-quiet"], { stdio: "inherit" });
+      rmSync(mount, { recursive: true, force: true });
+    }
+    if (inDmg) throw new Error(`${dmg} contains an invalidly-signed app:\n${inDmg}`);
+    console.log(`repackaged ${dmg} with the signed app — verified inside the image`);
+  }
 }
 
 /** Shipped bundles must carry the licenses of what they embed. Collects:
@@ -388,17 +429,28 @@ export async function build(opts: BuildOptions): Promise<void> {
     );
 
   // ── tauri build ────────────────────────────────────────────────────
+  // Signing is per-platform: only macOS creds (env OR tauri.conf
+  // signingIdentity) mean this Mac build gets a real signature — a Windows
+  // thumbprint on its own must not suppress the ad-hoc pass.
   // NOTE: TAURI_SIGNING_PRIVATE_KEY signs *updater* artifacts, not the app —
   // it must NOT silence the unsigned warning.
-  const hasSigning = !!(
+  const appleSigned = !!(
     process.env.APPLE_SIGNING_IDENTITY ||
     process.env.APPLE_CERTIFICATE ||
-    process.env.WINDOWS_CERTIFICATE_THUMBPRINT
+    tconf.macSigningIdentity
   );
+  const hasSigning =
+    platform() === "darwin"
+      ? appleSigned
+      : platform() === "win32"
+        ? !!process.env.WINDOWS_CERTIFICATE_THUMBPRINT
+        : true; // no signing concept on Linux — don't warn
   run(process.execPath, [tauriCliEntry(appDir), "build", ...(opts.tauriArgs ?? [])], appDir);
   // Unsigned macOS builds get a full-bundle ad-hoc signature — better
-  // than the linker stub Tauri leaves on just the main binary.
-  if (platform() === "darwin" && !hasSigning) adHocSign(tauriDir);
+  // than the linker stub Tauri leaves on just the main binary. Skipped
+  // entirely when a real identity is configured: ad-hoc must never run
+  // over a proper signature.
+  if (platform() === "darwin" && !appleSigned) adHocSign(tauriDir, tconf.productName);
   if (!hasSigning) {
     console.warn(`
 ╔══════════════════════════════════════════════════════════════════╗

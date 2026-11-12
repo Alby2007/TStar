@@ -112,7 +112,13 @@ jobs:
 
       - name: pylair build
         working-directory: app-under-test
-        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || runner.os == 'macOS' && 'app' || 'deb' }}
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Windows) npx pylair build --bundles nsis ;;
+            macOS)   npx pylair build ;;  # default bundles: .app + .dmg — exercises the dmg repackage
+            *)       npx pylair build --bundles deb ;;
+          esac
 
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
@@ -149,12 +155,20 @@ jobs:
         working-directory: app-under-test
         run: |
           set -e
-          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
-          test -n "$APP" || { echo "no .app under bundle/macos"; exit 1; }
+          # Take the app from the DMG — the artifact a user downloads,
+          # not the intermediate under bundle/macos. Proves the signed
+          # app is what ships in the image.
+          DMG=$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
+          test -n "$DMG" || { echo "no .dmg under bundle/dmg"; exit 1; }
+          mkdir -p dmg-mnt
+          hdiutil attach -nobrowse -readonly -mountpoint dmg-mnt "$DMG"
+          APP=$(find dmg-mnt -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP" || { echo "no .app inside the dmg"; hdiutil detach dmg-mnt -quiet; exit 1; }
           # Isolate: delete the project venv and copy the bundle out, so
           # the app cannot lean on the workspace's Python by path.
           rm -rf .venv
-          cp -R "$APP" ../isolated-app.app
+          ditto "$APP" ../isolated-app.app
+          hdiutil detach dmg-mnt -quiet
           ISOLATED="$(cd .. && pwd)/isolated-app.app"
           PYBIN="$ISOLATED/Contents/Resources/python/bin/python3"
           test -x "$PYBIN" || { echo "bundled interpreter missing: $PYBIN"; exit 1; }
