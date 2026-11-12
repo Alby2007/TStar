@@ -33,6 +33,19 @@ from typing import Any
 
 _B64_TAG = "$b64"
 
+# JS Number.MAX_SAFE_INTEGER — the largest int that survives JSON.parse.
+_SAFE_INT = (1 << 53) - 1
+
+
+def _guard_int(tok: str) -> int:
+    v = int(tok)
+    if abs(v) > _SAFE_INT:
+        raise ValueError(
+            f"integer {v} exceeds the JSON safe-integer range (±2^53-1); "
+            "return it as a string — $bigint tagging is tracked in docs/ideas.md"
+        )
+    return v
+
 
 class InvalidParams(Exception):
     """Incoming params couldn't be coerced by annotation.
@@ -70,7 +83,14 @@ def dumps(obj: Any) -> str:
     # allow_nan=False: a bare NaN/Infinity token is invalid JSON to the
     # Rust host (serde_json rejects it as a malformed frame) — surface
     # it as a serialization error for this call instead.
-    return json.dumps(obj, default=_default, separators=(",", ":"), allow_nan=False)
+    s = json.dumps(obj, default=_default, separators=(",", ":"), allow_nan=False)
+    # The wire text keeps full int precision; the loss happens when JS
+    # JSON.parse reads it back as a double. Re-parse and reject integers
+    # JS can't represent exactly — a wrong number is worse than a failed
+    # call. Validates the emitted text, so dataclass/enum conversions in
+    # _default are covered too. Until $bigint tagging lands (ideas.md).
+    json.loads(s, parse_int=_guard_int)
+    return s
 
 
 def loads(raw: str | bytes) -> Any:

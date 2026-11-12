@@ -32,13 +32,17 @@ integration → `M6` reference app + RC.
 
 ## Known limitations
 
-- **No invocation authorization between windows.** Event *delivery* is
-  scoped — streams reach only the webview that started them, runtime
-  events only webviews that have used the bridge — but *invocation* is
-  not gated: any webview that reaches Tauri's IPC can call every
-  `@expose`d function. There is no per-window ACL or origin check yet
-  (planned with wrap mode). Don't load untrusted remote content in a
-  Pylair window today.
+- **No authorization finer than Tauri capabilities.** A webview can
+  only call `python_call` if a capability grants it `pylair:*`
+  permissions — the template grants them to `windows: ["main"]` only,
+  and remote origins get no IPC access at all unless a capability adds
+  `remote.urls`. But within a granted capability, every covered webview
+  can call *every* `@expose`d function — Pylair adds no per-window or
+  per-function ACL on top. Event delivery is scoped (streams reach only
+  their owning window); invocation scoping beyond capabilities is
+  planned with wrap mode. The exposure exists only if you widen a
+  capability (more windows, `remote.urls`) or load untrusted content in
+  a privileged window.
 - **Inline sync functions can't be interrupted.** A non-isolated sync
   `def` keeps running after cancel; the caller still gets
   `TASK_CANCELLED` immediately and the result is discarded, but the
@@ -53,9 +57,11 @@ integration → `M6` reference app + RC.
   its modules — fine for short calls, seconds each with torch-class
   imports. A warm persistent worker (`worker={'mode': 'warm'}`) is
   reserved in the API but not implemented yet.
-- **Ints beyond ±2^53 lose precision.** JSON has no bigint; large
-  Python ints round on the wire. `{"$bigint"}` tagging is planned —
-  return big values as strings for now.
+- **Ints beyond ±2^53 can't cross the bridge.** The call fails with
+  `INTERNAL: integer … exceeds the JSON safe-integer range` — an
+  explicit error rather than a silently rounded value. Return large
+  integers as strings until `{"$bigint"}` tagging lands
+  (`docs/ideas.md`).
 
 ## Layout
 

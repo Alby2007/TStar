@@ -97,10 +97,12 @@ modes:
   rejects them at encode time — a model returning a NaN score fails
   that one call with `INTERNAL`, never the runtime (protocol §2). Use
   `Optional[float]` and return `None` for missing scores.
-- **Python `int` is unbounded; JS `number` is not.** Values beyond
-  ±2^53 lose precision on the wire (JSON has no bigint). If your API
-  moves exact big integers (ids, counts), annotate `str` and format in
-  Python. `{"$bigint"}` tagging is tracked in `docs/ideas.md`.
+- **Python `int` is unbounded; JS `number` is not.** Integers beyond
+  ±2^53 fail the call with `INTERNAL` — the wire keeps full precision,
+  but `JSON.parse` would round silently, so the codec rejects them
+  first. If your API moves exact big integers (ids, counts), annotate
+  `str` and format in Python. `{"$bigint"}` tagging is tracked in
+  `docs/ideas.md`.
 - Non-serializable results (numpy values, torch tensors, open objects)
   fail the *call* with `INTERNAL` — serialize to list/dict/bytes first.
 

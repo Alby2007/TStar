@@ -17,8 +17,9 @@ from this file — promote to a milestone or a decision doc first.
   workers reload everything — seconds with torch — so this is what
   makes `isolated=True` usable for AI apps.
 - `{"$bigint": "<decimal>"}` tagging for Python ints beyond ±2^53 —
-  emitted as `bigint` in generated TS. Documented limitation for now
-  (docs/codegen.md): annotate `str` for exact big integers.
+  emitted as `bigint` in generated TS. Until then the codec rejects
+  out-of-range ints with a clear error (docs/codegen.md): annotate
+  `str` for exact big integers.
 - Richer loop diagnostics: event-loop lag is currently a stderr line
   (`event loop lag Ns`, forwarded to the UI). Could become a typed
   notification + a heartbeat timestamp in `pong` params so the host can
