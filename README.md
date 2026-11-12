@@ -30,6 +30,33 @@ Milestones: `M0` packaging spike → `M1` supervisor/protocol → `M2` typed
 bridge → `M3` streaming/cancellation → `M4` CLI/scaffolder → `M5` Ollama
 integration → `M6` reference app + RC.
 
+## Known limitations
+
+- **No invocation authorization between windows.** Event *delivery* is
+  scoped — streams reach only the webview that started them, runtime
+  events only webviews that have used the bridge — but *invocation* is
+  not gated: any webview that reaches Tauri's IPC can call every
+  `@expose`d function. There is no per-window ACL or origin check yet
+  (planned with wrap mode). Don't load untrusted remote content in a
+  Pylair window today.
+- **Inline sync functions can't be interrupted.** A non-isolated sync
+  `def` keeps running after cancel; the caller still gets
+  `TASK_CANCELLED` immediately and the result is discarded, but the
+  Python work runs to completion. Mark anything long-running
+  `@expose(isolated=True)` — see [docs/cancellation.md](docs/cancellation.md).
+- **Async cancel is cooperative.** A coroutine blocked in native code
+  can't be preempted until control returns to the event loop; a wedged
+  runtime is killed via missed pongs instead. `loop_stall_kill` can make
+  loop stalls fatal sooner — it's off by default because legitimate
+  blocking work (multi-GB model loads) can stall the loop for minutes.
+- **`isolated=True` respawns a worker per call.** Each call re-imports
+  its modules — fine for short calls, seconds each with torch-class
+  imports. A warm persistent worker (`worker={'mode': 'warm'}`) is
+  reserved in the API but not implemented yet.
+- **Ints beyond ±2^53 lose precision.** JSON has no bigint; large
+  Python ints round on the wire. `{"$bigint"}` tagging is planned —
+  return big values as strings for now.
+
 ## Layout
 
 | Path | What |
