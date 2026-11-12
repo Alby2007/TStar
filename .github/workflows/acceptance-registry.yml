@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]
+        os: [ubuntu-22.04, windows-latest, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
@@ -109,7 +109,7 @@ jobs:
 
       - name: pylair build
         working-directory: app-under-test
-        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || 'deb' }}
+        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || runner.os == 'macOS' && 'app' || 'deb' }}
 
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
@@ -140,3 +140,33 @@ jobs:
           Write-Output "installed app: $($exe.FullName)"
           & $exe.FullName --self-test
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Self-test installed app (macOS, isolated .app, scrubbed env)
+        if: runner.os == 'macOS'
+        working-directory: app-under-test
+        run: |
+          set -e
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP" || { echo "no .app under bundle/macos"; exit 1; }
+          # Isolate: delete the project venv and copy the bundle out, so
+          # the app cannot lean on the workspace's Python by path.
+          rm -rf .venv
+          cp -R "$APP" ../isolated-app.app
+          ISOLATED="$(cd .. && pwd)/isolated-app.app"
+          PYBIN="$ISOLATED/Contents/Resources/python/bin/python3"
+          test -x "$PYBIN" || { echo "bundled interpreter missing: $PYBIN"; exit 1; }
+          echo "== signing status (informational — unsigned RCs expected) =="
+          codesign -dv "$ISOLATED" 2>&1 || true
+          codesign --verify --deep --strict "$ISOLATED" 2>&1 || true
+          codesign -dv "$PYBIN" 2>&1 || true
+          # /usr/bin/python3 exists on runners — a scrubbed PATH alone
+          # proves nothing; the interpreter itself must report its home
+          # inside THIS copy's Resources.
+          EXE=$(env -i PATH=/usr/bin:/bin "$PYBIN" -c 'import sys; print(sys.executable)')
+          echo "bundled sys.executable: $EXE"
+          case "$EXE" in
+            "$ISOLATED/Contents/Resources/"*) ;;
+            *) echo "bundled interpreter reports outside Resources: $EXE"; exit 1 ;;
+          esac
+          echo "== --self-test: real bridge call through bundled runtime =="
+          env -i PATH=/usr/bin:/bin "$ISOLATED/Contents/MacOS/$(basename "$APP" .app)" --self-test
