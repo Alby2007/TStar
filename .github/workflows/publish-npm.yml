@@ -9,6 +9,13 @@ name: Publish npm packages
 # @pylair scope, or use an automation token).
 # Runs inside the `npm` environment if you create one (recommended:
 # required reviewers before any registry write).
+#
+# Auth is OIDC trusted publishing, not NPM_TOKEN: `npm publish` exchanges
+# the job's id-token for a short-lived credential (needs npm >= 11.5.1 —
+# installed below; Node 22 ships npm 10). Each package must have a
+# Trusted Publisher configured on npmjs.com for repo PylairHQ/Pylair,
+# workflow publish-npm.yml, environment `npm` (the environment MUST be
+# listed there because this job declares one).
 on:
   workflow_dispatch:
     inputs:
@@ -27,8 +34,6 @@ jobs:
     permissions:
       contents: write # tag after a successful upload — never commits to main
       id-token: write # --provenance attestations
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -40,6 +45,9 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+
+      - name: npm >= 11.5.1 for OIDC trusted publishing
+        run: npm install -g npm@11
 
       - name: Check all three versions match the input
         # Versions live in the repo, bumped by a normal commit — the job
@@ -80,6 +88,11 @@ jobs:
             # keeps handing out the first (buggier) RC — while there's no
             # stable, newest RC is what we want latest to mean. Idempotent,
             # so it also heals a tag left behind by a partial run.
+            # CAVEAT: `npm publish` does the OIDC exchange transparently,
+            # but npm may not exchange for non-publish commands. If this
+            # fails with an auth error under trusted publishing, the fix
+            # is a granular per-package token scoped to this step only —
+            # check before deciding trusted publishing is done.
             npm dist-tag add "$name@${{ inputs.version }}" latest
           done
 
