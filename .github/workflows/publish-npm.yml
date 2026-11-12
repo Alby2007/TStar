@@ -99,18 +99,20 @@ jobs:
       - name: Verify all three are installable
         if: ${{ !inputs.dry_run }}
         # A green publish must mean installable. Registry propagation
-        # lags a bit, so poll each package until it resolves or the
-        # budget runs out — then fail instead of tagging a phantom release.
+        # lags — npm docs replicate per-package and a fresh version can
+        # 404 for minutes (run #9: client lagged ~2min, cli longer).
+        # Poll ~10min before failing, and say plainly that a red here
+        # means lag, not a failed publish.
         run: |
           for p in packages/client packages/cli packages/create-pylair; do
             name=$(node -p "require('./$p/package.json').name")
-            for i in $(seq 1 20); do
+            for i in $(seq 1 60); do
               if npm view "$name@${{ inputs.version }}" version --prefer-online >/dev/null 2>&1; then
                 echo "$name@${{ inputs.version }} live on the registry"
                 break
               fi
-              [ "$i" = 20 ] && { echo "::error::$name@${{ inputs.version }} not resolvable after ~2min"; exit 1; }
-              sleep 6
+              [ "$i" = 60 ] && { echo "::error::$name@${{ inputs.version }} published but not yet visible on the registry after ~10min — registry lag, not a failed publish"; exit 1; }
+              sleep 10
             done
           done
 
