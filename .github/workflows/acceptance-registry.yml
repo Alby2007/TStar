@@ -84,7 +84,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p cp-src
-          tar --force-local -xzf packs/create-pylair-*.tgz -C cp-src
+          # Plain tar — all paths are relative so there's no colon for
+          # GNU tar to misparse, and --force-local doesn't exist on
+          # macOS's BSD tar.
+          tar -xzf packs/create-pylair-*.tgz -C cp-src
           node cp-src/package/dist/index.js app-under-test
 
       - name: Scaffold from the registry (@next)
