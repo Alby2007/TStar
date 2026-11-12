@@ -8,7 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { appPython, importRoot, loadConfig, tauriCliEntry } from "./config.js";
+import { importRoot, loadConfig, tauriCliEntry } from "./config.js";
 import { emit } from "./codegen.js";
 import { loadManifest } from "./manifest.js";
 
@@ -43,15 +43,14 @@ function runCodegen(appDir: string, cfgModule: string, out: string): boolean {
 
 export async function dev(opts: { appDir: string }): Promise<number> {
   const { appDir } = opts;
-  // Sync first so the venv exists before we need an interpreter — the
-  // config parse uses tomllib (>=3.11), which system python3 may lack.
+  const cfg = loadConfig(appDir);
+
+  // Sync so the venv exists before codegen/dev need the interpreter.
   const sync = spawnSync("uv", ["sync"], { cwd: appDir, stdio: "inherit" });
   if (sync.error)
     throw new Error(`could not run uv: ${sync.error.message} — is uv on PATH?`);
   if (sync.status !== 0)
     throw new Error("uv sync failed — is pyproject.toml valid?");
-
-  const cfg = loadConfig(appDir, appPython(appDir));
 
   const srcDir = join(appDir, cfg.source);
   const stateDir = join(appDir, ".pylair");

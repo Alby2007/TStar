@@ -9,7 +9,7 @@ npm create pylair my-app
 
 **Release candidate:** npm sets `latest` to the first published version,
 so the command above currently hands out the RC. Pin explicitly if you
-want reproducibility — `npm create pylair@0.1.0-rc.2 my-app` — or use
+want reproducibility — `npm create pylair@0.1.0-rc.3 my-app` — or use
 the `next` tag, which tracks prereleases: `npm create pylair@next`.
 
 ## Prerequisites

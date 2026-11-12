@@ -6,6 +6,7 @@
 
 import { spawnSync } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { build } from "./build.js";
 import { emit } from "./codegen.js";
 import { dev } from "./dev.js";
@@ -53,6 +54,14 @@ function argValue(argv: string[], ...flags: string[]): string | undefined {
 
 function findPython(): string {
   if (process.env.PYTHON) return process.env.PYTHON;
+  // Prefer the app venv (uv sync guarantees >=3.12) — system python3 may
+  // be older than tomllib needs, or absent entirely on Windows.
+  const venv = join(
+    process.cwd(),
+    ".venv",
+    process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+  );
+  if (existsSync(venv)) return venv;
   for (const cand of ["python3", "python"]) {
     const res = spawnProbe(cand);
     if (res) return cand;

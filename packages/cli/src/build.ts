@@ -20,7 +20,7 @@ import { get } from "node:https";
 import { arch, platform, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { appPython, importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
+import { importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
 import { DEFAULT_PRUNE, prune } from "./prune.js";
 
 const PBS_TAG = "20251120";
@@ -271,7 +271,7 @@ export async function build(opts: BuildOptions): Promise<void> {
   const resources = join(tauriDir, "resources");
   const tconf = loadTauriConfig(appDir);
 
-  const cfg = loadConfig(appDir, appPython(appDir));
+  const cfg = loadConfig(appDir);
 
   const targetTriple = hostTriple(); // cross-compile refused by construction
   console.log(

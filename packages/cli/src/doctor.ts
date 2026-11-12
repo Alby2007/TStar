@@ -43,9 +43,9 @@ export async function doctor(appDir: string): Promise<number> {
   } catch { /* stays unsupported */ }
   add("host triple", triple !== "unsupported", `${platform()}/${arch()} → ${triple}`);
 
-  if (existsSync(join(appDir, "pyproject.toml")) && pyV) {
+  if (existsSync(join(appDir, "pyproject.toml"))) {
     try {
-      const cfg = loadConfig(appDir, py);
+      const cfg = loadConfig(appDir);
       add("[tool.pylair] config", true, `app-module=${cfg.appModule} source=${cfg.source}`);
       add("source dir", existsSync(join(appDir, cfg.source)), join(appDir, cfg.source));
       add(

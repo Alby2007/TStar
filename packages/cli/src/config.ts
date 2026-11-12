@@ -3,10 +3,10 @@
  * src-tauri/tauri.conf.json — Tauri owns it; we don't duplicate it.
  */
 
-import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { parse as parseToml } from "smol-toml";
 
 export interface PylairConfig {
   /** Python module holding the @expose functions (e.g. "app.backend"). */
@@ -38,43 +38,22 @@ const KEYMAP: Record<string, keyof PylairConfig> = {
   bundles: "bundles",
 };
 
-/** Interpreter for parsing [tool.pylair]: the app venv when `uv sync` ran
- * (guaranteed >=3.12 by the template), else a system probe. tomllib needs
- * >=3.11 — Ubuntu 22.04's python3 is 3.10, and user machines may have no
- * python3 at all, so "python3 exists and is new enough" is never safe. */
-export function appPython(appDir: string): string {
-  const venv = join(
-    appDir,
-    ".venv",
-    process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
-  );
-  if (existsSync(venv)) return venv;
-  for (const c of ["python3", "python"]) {
-    if (spawnSync(c, ["--version"]).status === 0) return c;
-  }
-  throw new Error(`no Python interpreter for ${appDir} — run \`uv sync\` first`);
-}
-
-/** Parse [tool.pylair] via the interpreter's own tomllib — no npm TOML dep. */
-export function loadConfig(appDir: string, python: string): PylairConfig {
+/** Parse [tool.pylair] with smol-toml — no Python interpreter required at
+ * build/dev time (a system python3 may be <3.11 or absent entirely). */
+export function loadConfig(appDir: string): PylairConfig {
   const pyproject = join(appDir, "pyproject.toml");
   if (!existsSync(pyproject))
     throw new Error(`no pyproject.toml in ${appDir} — is this a pylair app?`);
 
-  const res = spawnSync(
-    python,
-    [
-      "-c",
-      "import json,sys,tomllib;print(json.dumps(tomllib.load(open(sys.argv[1],'rb')).get('tool',{}).get('pylair',{})))",
-      pyproject,
-    ],
-    { encoding: "utf-8" },
-  );
-  if (res.status !== 0)
-    throw new Error(
-      `could not parse ${pyproject} with ${python} (needs >=3.11 for tomllib): ${res.stderr.trim()}`,
-    );
-  const raw = JSON.parse(res.stdout) as Record<string, unknown>;
+  let raw: Record<string, unknown>;
+  try {
+    const doc = parseToml(readFileSync(pyproject, "utf-8")) as {
+      tool?: { pylair?: Record<string, unknown> };
+    };
+    raw = doc.tool?.pylair ?? {};
+  } catch (e) {
+    throw new Error(`could not parse ${pyproject}: ${(e as Error).message}`);
+  }
 
   const cfg: PylairConfig = {
     appModule: String(raw["app-module"] ?? ""),
