@@ -101,13 +101,13 @@ jobs:
           npm install
           uv sync
 
-      - name: pylair build
-        working-directory: app-under-test
-        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || 'deb' }}
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app-under-test/src-tauri
+
+      - name: pylair build
+        working-directory: app-under-test
+        run: npx pylair build --bundles ${{ runner.os == 'Windows' && 'nsis' || 'deb' }}
 
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
