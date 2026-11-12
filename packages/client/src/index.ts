@@ -328,7 +328,10 @@ export async function* stream<T = unknown>(
       }
       // Pull-flow: top up credit in batches as the consumer pulls.
       if (++pendingCredit >= CREDIT_BATCH) {
-        void b.invoke(CMD.grantCredit, { task, n: pendingCredit });
+        // Grant can now reject loudly (task finished between grants —
+        // TASK_NOT_FOUND). A rejected grant is unremarkable: the stream
+        // is already over, so swallow it.
+        void b.invoke(CMD.grantCredit, { task, n: pendingCredit }).catch(() => {});
         pendingCredit = 0;
       }
       yield fromWire(ev.value) as T;
@@ -339,13 +342,45 @@ export async function* stream<T = unknown>(
     // Consumer walked away (break / return() / throw) before the producer
     // finished: stop it instead of leaving it running and granting credit.
     if (!finished) void b.invoke(CMD.cancel, { task }).catch(() => {});
-    else if (pendingCredit > 0) void b.invoke(CMD.grantCredit, { task, n: pendingCredit });
+    else if (pendingCredit > 0)
+      void b.invoke(CMD.grantCredit, { task, n: pendingCredit }).catch(() => {});
   }
 }
 
-/** Explicitly cancel a running task by id. */
-export async function cancel(task: number): Promise<boolean> {
-  return (await ipc()).invoke<boolean>(CMD.cancel, { task });
+/**
+ * What a cancel actually did — distinct outcomes, never an ambiguous bool.
+ * `cancelled`: runtime confirmed the work stopped.
+ * `requested_may_continue`: inline sync work can't be interrupted — the
+ *   caller sees TASK_CANCELLED but the Python may run to completion.
+ * `terminated`: an isolated worker was terminated and reaped.
+ * `termination_uncertain`: termination was requested but unconfirmed —
+ *   the work may still be running.
+ * `completed`: the task had already finished before the cancel landed.
+ * `not_found`: no such task in this runtime generation (stale id).
+ * `rejected`: this webview does not own the task.
+ * `delivery_failed`: the control frame could not be queued at all.
+ */
+export type CancelOutcome =
+  | "cancelled"
+  | "requested_may_continue"
+  | "terminated"
+  | "termination_uncertain"
+  | "completed"
+  | "not_found"
+  | "rejected"
+  | "delivery_failed";
+
+/** What shutdown actually achieved — reported, never assumed. */
+export type ShutdownOutcome =
+  | "terminated" // graceful exit inside the grace window
+  | "forced_kill" // had to SIGKILL/taskkill — the tree is confirmed dead
+  | "incomplete" // kill sent but the exit wasn't confirmed
+  | "unknown"; // runtime already gone or state unknown
+
+/** Explicitly cancel a running task by id. Only the task's own webview
+ * may cancel it — the supervisor enforces ownership server-side. */
+export async function cancel(task: number): Promise<CancelOutcome> {
+  return (await ipc()).invoke<CancelOutcome>(CMD.cancel, { task });
 }
 
 /** Retry after the supervisor reaches `failed` — respawns the runtime. */
@@ -358,9 +393,10 @@ export async function state(): Promise<RuntimeState> {
   return (await ipc()).invoke<RuntimeState>(CMD.state);
 }
 
-/** Ask the supervisor to shut the runtime down cleanly. */
-export async function shutdown(): Promise<void> {
-  await (await ipc()).invoke(CMD.shutdown);
+/** Ask the supervisor to shut the runtime down; resolves to what
+ * cleanup actually achieved, not merely that the request was queued. */
+export async function shutdown(): Promise<ShutdownOutcome> {
+  return (await ipc()).invoke<ShutdownOutcome>(CMD.shutdown);
 }
 
 /** Subscribe to lifecycle transitions; returns an unlisten function. */

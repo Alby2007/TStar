@@ -87,14 +87,27 @@ at `@expose` time, not at cancel time.
 - **Cancel during restart:** task dies with the process →
   `RUNTIME_CRASHED`, not `TASK_CANCELLED` (distinct errors matter —
   one is a user action, one is a failure).
-- **Cancel an unknown/finished task:** `TASK_NOT_FOUND` /
-  `{cancelled: false}` — never an error for the caller.
-- **Cancel ack timeout:** if the runtime doesn't confirm within 5s, the
-  host treats the call as cancelled from its side (result discarded,
-  handle released) and notes it in diagnostics. For isolated tasks the
-  worker is killed regardless of ack.
-- **Cancel is one-way and idempotent:** re-cancel is a no-op. There is
-  no un-cancel.
+- **Cancel outcomes are distinct, never ambiguous.** `cancel()` resolves
+  to `cancelled` (the runtime confirmed it stopped), `terminated`
+  (isolated worker killed and reaped), `requested_may_continue` (inline
+  sync — the work cannot be interrupted; see the warning above),
+  `termination_uncertain` (termination requested but unconfirmed — it
+  may still be running), `completed` (it had already finished),
+  `not_found` (no such task in this runtime generation — a stale id can
+  never control a new task), `rejected` (this webview does not own the
+  task), or `delivery_failed` (the control frame could not be queued).
+- **Cancel an unknown/finished task:** `not_found` / `completed` —
+  distinct outcomes, never an error for the caller.
+- **Ownership is enforced, not advisory.** Only the webview that started
+  a task can cancel it or grant it stream credit — the supervisor
+  rejects other webviews, and the owner is always Tauri's window label,
+  never a JS-passed argument. A destroyed window's tasks are cancelled.
+- **Cancel ack timeout:** if the runtime doesn't confirm within 5s
+  (`cancel_timeout`), `cancel()` rejects with `RUNTIME_WEDGED`; a
+  blocked runtime cannot be relied on to answer.
+- **Cancel is one-way and idempotent:** re-cancel on a live task is a
+  no-op (`cancelled` again); on a finished task it reports `completed`.
+  There is no un-cancel.
 - **In-flight during shutdown:** graceful shutdown drains up to
   `grace_ms`; tasks past the deadline get `TASK_CANCELLED` (async) or
   process-group kill (isolated workers are children of the runtime —

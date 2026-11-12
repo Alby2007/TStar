@@ -38,6 +38,20 @@ def _exit_with_parent() -> None:
         return
     parent = os.getppid()
 
+    # Linux: kernel-level backstop for the watcher below — PR_SET_PDEATHSIG
+    # fires even if a native call is holding the GIL (which would stall the
+    # polling thread). If the runtime died before prctl ran, getppid already
+    # changed: kill ourselves now — the race the ppid check exists for.
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+            if os.getppid() != parent:
+                os.kill(os.getpid(), signal.SIGKILL)
+        except Exception:
+            pass  # the ppid watcher below remains the fallback
+
     def watch() -> None:
         while True:
             time.sleep(0.5)

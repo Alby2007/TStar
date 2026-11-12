@@ -1,20 +1,24 @@
-//! Step 0 reproduction tests for the RC.6 hardening batch. Each test
-//! asserts the DESIRED invariant — a failure means the claim reproduces
-//! at HEAD. Do not weaken assertions to make them pass; fix the code.
+//! RC.6 acceptance tests — originally the Step 0 reproduction suite for
+//! three claims, now asserting the fixes hold. Do not weaken assertions.
 //!
-//!   1. non_owner_* — a webview that does not own a task can cancel /
-//!      grant-credit on its id and the request is honoured.
-//!   2. cancel_not_dropped_when_frame_queue_full — a cancel can be
-//!      dropped silently when the host->runtime frame queue is full.
-//!   3. host_sigkill_* — an abrupt host kill leaves the runtime (or a
-//!      grandchild worker) running.
+//!   1. non_owner_* — a webview that does not own a task cannot cancel it
+//!      or grant credit on its id. Ownership comes from the caller identity
+//!      the command layer supplies (the Tauri webview label), never from
+//!      a task-id argument.
+//!   2. cancel_not_dropped_when_frame_queue_full — control frames travel a
+//!      dedicated lane that a data flood cannot starve, and every outcome
+//!      is distinct: NotFound is not "cancel failed", a wedged runtime is
+//!      a loud error, delivery is never silently dropped.
+//!   3. host_sigkill_* — an abrupt host kill leaves no runtime and no
+//!      isolated worker running. Linux: PR_SET_PDEATHSIG. All unix: stdin
+//!      EOF drain + the worker's own parent-death watcher.
 
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri_plugin_pylair::protocol as proto;
 use tauri_plugin_pylair::supervisor::{
-    spawn, Handle, RuntimeEvent, SpawnSpec, State, SupervisorConfig,
+    spawn, CancelOutcome, Handle, RuntimeEvent, SpawnSpec, State, SupervisorConfig,
 };
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -141,60 +145,49 @@ import time
 time.sleep(600)
 "#;
 
-/// Reads stdin (so it dies on EOF like a healthy runtime) but first
-/// spawns a sleeper grandchild it never reaps — stands in for a runtime
-/// that exits without killing an in-flight isolated worker.
-#[cfg(unix)]
-const FAKE_PARENT_UNREAPED_CHILD: &str = r#"
-import sys, struct, json, subprocess
-def w(o):
-    b = json.dumps(o).encode()
-    sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
-subprocess.Popen(["sleep", "600"])
-w({"jsonrpc":"2.0","method":"hello","params":{"protocol":1,"exposes":[]}})
-while True:
-    h = sys.stdin.buffer.read(4)
-    if len(h) < 4: break
-    n, = struct.unpack(">I", h)
-    m = json.loads(sys.stdin.buffer.read(n))
-    if m["method"] == "shutdown":
-        w({"jsonrpc":"2.0","id": m["id"],"result": None}); break
-"#;
-
 // ---- claim 1: task ownership ----
+// Two webviews are two different owner labels on the same Handle — exactly
+// what the Tauri commands in lib.rs supply via window.label().
 
-/// Two cloned handles are exactly what two webviews hold: the commands
-/// in lib.rs forward only `task`, so Handle clones are indistinguishable
-/// callers. Desired invariant: a caller that did not start a task must
-/// not be able to cancel it. HEAD has no ownership check at any layer —
-/// this fails while the gap exists.
 #[tokio::test]
 async fn non_owner_cannot_cancel_another_windows_task() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
     let h = spawn_h(real_runtime_spec(), fast_config(), ev);
     wait_state(&h, State::Ready).await;
 
-    let h_window_a = h.clone();
-    let h_window_b = h.clone();
-
-    let ct = h_window_a.call_task("sleep_forever", json!({})).unwrap();
+    let ct = h
+        .call_task("sleep_forever", json!({}), Some("win-a".into()))
+        .unwrap();
     let task = timeout(T, ct.task)
         .await
         .expect("task id timed out")
         .unwrap();
 
-    let res = timeout(T, h_window_b.cancel(task))
+    // A different webview's cancel is rejected — nothing is delivered.
+    let res = timeout(T, h.cancel(task, Some("win-b".into())))
         .await
         .expect("cancel timed out")
         .unwrap();
-    assert!(
-        !res,
-        "window B cancelled window A's task — no ownership check on python_cancel"
+    assert_eq!(
+        res,
+        CancelOutcome::Rejected,
+        "window B cancelled or touched window A's task — ownership check missing"
     );
 
     // The task must still be running (owner's work untouched).
     let still_running = timeout(Duration::from_secs(2), ct.result).await.is_err();
     assert!(still_running, "window B's cancel terminated A's task");
+
+    // The real owner can still cancel — the check scopes, it doesn't block.
+    let res = timeout(T, h.cancel(task, Some("win-a".into())))
+        .await
+        .expect("owner cancel timed out")
+        .unwrap();
+    assert_eq!(
+        res,
+        CancelOutcome::Cancelled,
+        "owner's cancel was not honoured"
+    );
     h.shutdown().await;
 }
 
@@ -206,47 +199,72 @@ async fn non_owner_cannot_grant_credit_on_another_windows_stream() {
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    let h_window_b = h.clone();
-    let (_task, mut items) = timeout(T, h.call_stream("counter", json!({"n": 1_000})))
-        .await
-        .expect("call_stream timed out")
-        .unwrap();
-    let task = _task;
+    let (task, mut items) = timeout(
+        T,
+        h.call_stream("counter", json!({"n": 1_000}), Some("win-a".into())),
+    )
+    .await
+    .expect("call_stream timed out")
+    .unwrap();
 
-    let res = timeout(T, h_window_b.grant_credit(task, 10_000)).await;
+    // Drain the initial credit window first so a leak is attributable.
+    let mut seen = 0usize;
+    while let Ok(Some(item)) = timeout(Duration::from_secs(2), items.recv()).await {
+        if !matches!(
+            item,
+            tauri_plugin_pylair::supervisor::StreamItem::Chunk { .. }
+        ) {
+            break;
+        }
+        seen += 1;
+        if seen >= 2 {
+            break;
+        }
+    }
+    assert_eq!(seen, 2, "initial credit never produced its chunks");
+
+    let res = timeout(T, h.grant_credit(task, 10_000, Some("win-b".into())))
+        .await
+        .expect("grant_credit timed out");
     assert!(
         res.is_err(),
         "window B granted credit on window A's stream — no ownership check on python_grant_credit"
     );
 
-    // And B's credit must not have advanced A's stream.
-    let mut seen = 0usize;
-    while let Ok(Some(item)) = timeout(Duration::from_secs(2), items.recv()).await {
+    // B's credit must not have advanced A's stream.
+    let leaked = timeout(Duration::from_secs(2), items.recv())
+        .await
+        .map(|o| o.is_some())
+        .unwrap_or(false);
+    assert!(!leaked, "window B's credit produced chunks on A's stream");
+
+    // The owner's own credit still flows.
+    h.grant_credit(task, 4, Some("win-a".into()))
+        .await
+        .expect("owner credit errored");
+    let mut flowed = 0usize;
+    while let Ok(Some(item)) = timeout(Duration::from_secs(3), items.recv()).await {
         if matches!(
             item,
             tauri_plugin_pylair::supervisor::StreamItem::Chunk { .. }
         ) {
-            seen += 1;
+            flowed += 1;
+            if flowed >= 2 {
+                break;
+            }
         } else {
             break;
         }
     }
-    assert!(
-        seen <= 2,
-        "window B's credit produced {seen} chunks on A's stream"
-    );
+    assert!(flowed >= 2, "owner's credit failed to advance the stream");
     h.shutdown().await;
 }
 
 // ---- claim 2: reliable control delivery ----
 
-/// frame_out is a bounded (64) mpsc feeding the child's stdin; send_frame
-/// uses try_send. Fill the pipe by pointing it at a runtime that never
-/// reads stdin: once the writer blocks on a full pipe, the 64-slot queue
-/// stays full and subsequent try_sends fail. Desired invariant: a cancel
-/// that could not be delivered must surface as an error (or the control
-/// path must be unstarvable) — never an ambiguous `Ok(false)`. GrantCredit
-/// must surface failure too; today its send result is discarded entirely.
+/// The data lane is a bounded (64) mpsc; a wedged reader fills it. The
+/// control lane must still deliver — and where nothing can be delivered or
+/// acknowledged, the outcome must be loud and distinct, never ambiguous.
 #[tokio::test]
 async fn cancel_not_dropped_when_frame_queue_full() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
@@ -257,14 +275,20 @@ async fn cancel_not_dropped_when_frame_queue_full() {
     let h = spawn_h(spec(FAKE_WEDGED), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    // Flood: each Call becomes one frame in frame_out. The writer can
-    // only drain ~pipe-capacity into a dead reader, so the 64-slot queue
-    // fills; Call failures then report RUNTIME_CRASHED loudly — that is
-    // our signal the queue is full.
+    // Register a real task while the data lane is empty — its frame sits
+    // in the pipe buffer: delivered, never read by the wedged runtime.
+    let ct = h.call_task("echo", json!({}), None).unwrap();
+    let task = timeout(T, ct.task)
+        .await
+        .expect("task id timed out")
+        .unwrap();
+
+    // Flood the data lane until try_send reports it full (RUNTIME_CRASHED
+    // on a Call is the loud signal).
     let big = "x".repeat(16 * 1024);
     let mut queue_full = false;
     for _ in 0..400 {
-        match h.call_task("echo", json!({"input": big})) {
+        match h.call_task("echo", json!({"input": big}), None) {
             Ok(ct) => {
                 if let Ok(Ok(Err(e))) = timeout(T, ct.result).await {
                     if e.code == proto::RUNTIME_CRASHED {
@@ -281,26 +305,38 @@ async fn cancel_not_dropped_when_frame_queue_full() {
     }
     assert!(queue_full, "never managed to fill the frame queue");
 
-    // Now the control-plane assertion: a cancel issued against a full
-    // data queue must not be silently swallowed.
-    let res = timeout(T, h.cancel(12345))
+    // The cancel still leaves on the control lane — the wedged runtime
+    // just never acks it, so the outcome is a loud bounded error.
+    let res = timeout(T, h.cancel(task, None))
+        .await
+        .expect("cancel timed out");
+    assert!(
+        res.is_err(),
+        "cancel under a full data queue must be a loud outcome, not ambiguity"
+    );
+
+    // An unknown task gets its own distinct outcome — and the lookup
+    // never touches a queue at all, so it cannot starve.
+    let res = timeout(T, h.cancel(999_999, None))
         .await
         .expect("cancel timed out")
         .unwrap();
-    assert!(
-        res,
-        "cancel returned Ok(false) while the frame queue was full — \
-         the frame was dropped and the caller cannot tell it apart from \
-         'task already finished'"
-    );
+    assert_eq!(res, CancelOutcome::NotFound);
 
-    // grant_credit has it worse: its send result is discarded outright.
-    let res = timeout(T, h.grant_credit(12345, 8))
+    // Credit rides the control lane: delivered even with the data lane full.
+    timeout(T, h.grant_credit(task, 8, None))
+        .await
+        .expect("grant_credit timed out")
+        .expect("credit on the control lane should deliver under a data flood");
+
+    // Credit on an unknown task fails loudly, not silently.
+    let res = timeout(T, h.grant_credit(999_999, 8, None))
         .await
         .expect("grant_credit timed out");
-    assert!(
-        res.is_err(),
-        "grant_credit returned Ok(()) for a frame that was never delivered"
+    assert_eq!(
+        res.unwrap_err().code,
+        proto::TASK_NOT_FOUND,
+        "credit on an unknown task must fail with a real error"
     );
     h.shutdown().await;
 }
@@ -309,12 +345,29 @@ async fn cancel_not_dropped_when_frame_queue_full() {
 
 /// Re-exec harness: the controller spawns this same test binary filtered
 /// to this test with PYLAIR_ORPHAN_HOST set; that child plays "the app"
-/// and is killed with SIGKILL so no Rust Drop ever runs. The supervisor's
-/// children are then surveyed via pgrep.
+/// and is killed abruptly so no Rust Drop ever runs. The supervisor's
+/// children are then surveyed via the platform's process tools.
 #[cfg(unix)]
 fn children_of(pid: u32) -> Vec<u32> {
     let out = std::process::Command::new("pgrep")
         .args(["-P", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+#[cfg(windows)]
+fn children_of(pid: u32) -> Vec<u32> {
+    // CIM is the supported way to walk the parent->child edge on Windows.
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter 'ParentProcessId={pid}').ProcessId"),
+        ])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout)
@@ -332,31 +385,62 @@ fn alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    // tasklist CSV rows quote every field — the pid is the second column.
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .any(|l| l.split("\",\"").nth(1).and_then(|f| f.parse::<u32>().ok()) == Some(pid))
+}
+
+/// Abrupt host kill — SIGKILL on unix, taskkill /F on Windows. Deliberately
+/// NOT /T on Windows: if we killed the tree ourselves the Job Object test
+/// would prove nothing — the kernel must clean up the descendants.
+#[cfg(unix)]
+fn kill_host(pid: u32) {
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn kill_host(pid: u32) {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+        .unwrap();
+}
+
 /// Kill surveyed pids on drop so a failed assertion doesn't leak orphans.
-#[cfg(unix)]
 struct Reap(Vec<u32>);
-#[cfg(unix)]
 impl Drop for Reap {
     fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &p.to_string()])
-                .output();
+        for p in self.0.clone() {
+            kill_host(p);
         }
     }
 }
 
-/// Desired invariant: after an abrupt host death, the runtime's process
-/// is gone within a bound (stdin-EOF drain is the current fallback —
-/// it requires a runtime whose reader and loop are alive). FAKE_WEDGED
-/// never observes EOF: if the claim reproduces, the child survives.
-#[cfg(unix)]
+/// A wedged runtime can never observe stdin EOF — the EOF fallback cannot
+/// reach it. On Linux, PR_SET_PDEATHSIG is the kernel-level answer: the
+/// child gets SIGKILL the moment the host dies. On Windows the Job Object
+/// does the same — the kernel kills the whole job when the host's last
+/// handle closes. macOS has no pdeathsig and no jobs; the documented
+/// boundary there is EOF-only (healthy runtimes die — proven by the test
+/// below — wedged ones are the accepted gap).
+#[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
 async fn host_sigkill_does_not_orphan_wedged_runtime() {
     if std::env::var("PYLAIR_ORPHAN_HOST").is_ok() {
         // Host role: spawn the wedged runtime, then live forever until
         // killed. The wedged fake can't pong — disable the liveness kill
-        // so the child outlives the host long enough to prove orphaning.
+        // so only PDEATHSIG (or its absence) decides.
         let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
         let mut cfg = fast_config();
         cfg.missed_pongs_to_kill = 1_000_000;
@@ -390,27 +474,26 @@ async fn host_sigkill_does_not_orphan_wedged_runtime() {
     let _reap = Reap(kids.clone());
     assert!(!kids.is_empty(), "host never spawned a runtime child");
 
-    // SIGKILL the "app" — no Drop, no kill_on_drop, no graceful path.
-    std::process::Command::new("kill")
-        .args(["-9", &host_pid.to_string()])
-        .output()
-        .unwrap();
+    // Abruptly kill the "app" — no Drop, no kill_on_drop, no graceful path.
+    kill_host(host_pid);
     let _ = host.wait();
 
-    // The runtime must die within a bound (drain grace is ~3s).
+    // PDEATHSIG / Job Object cleanup is immediate — a tight bound is honest.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while kids.iter().any(|p| alive(*p)) {
         assert!(
             std::time::Instant::now() < deadline,
-            "runtime children {kids:?} survived the host's SIGKILL — orphan risk"
+            "runtime children {kids:?} survived the host's abrupt kill — \
+             PDEATHSIG/Job Object absent"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// Same assertion for a HEALTHY runtime — documents the boundary where
-/// the current fallback works (reader alive -> EOF -> exit).
-#[cfg(unix)]
+/// All-platform invariant: a HEALTHY runtime dies on stdin EOF when the
+/// host is killed — the EOF fallback is real coverage, not a fiction.
+/// On Linux/Windows the kernel mechanisms may beat EOF to the kill;
+/// either way it must be dead.
 #[tokio::test]
 async fn host_sigkill_healthy_runtime_exits_on_eof() {
     if std::env::var("PYLAIR_ORPHAN_HOST").is_ok() {
@@ -444,31 +527,36 @@ async fn host_sigkill_healthy_runtime_exits_on_eof() {
     let _reap = Reap(kids.clone());
     assert!(!kids.is_empty(), "host never spawned a runtime child");
 
-    std::process::Command::new("kill")
-        .args(["-9", &host_pid.to_string()])
-        .output()
-        .unwrap();
+    kill_host(host_pid);
     let _ = host.wait();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while kids.iter().any(|p| alive(*p)) {
         assert!(
             std::time::Instant::now() < deadline,
-            "healthy runtime children {kids:?} survived the host's SIGKILL"
+            "healthy runtime children {kids:?} survived the host's abrupt kill"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// Grandchild case: the "runtime" exits on EOF but leaves a sleeper
-/// child unreaped — the shape of an isolated worker whose runtime-side
-/// reap never ran (wedged drain).
-#[cfg(unix)]
+/// The real grandchild case: a REAL runtime with a REAL isolated worker
+/// in flight (isolated_sleep). Real workers protect themselves — the
+/// ppid watcher in _worker.py killpgs the worker group on reparent, the
+/// worker also sets PR_SET_PDEATHSIG on Linux, and on Windows the Job
+/// Object nests every descendant by default.
 #[tokio::test]
-async fn host_sigkill_does_not_orphan_grandchild_worker() {
+async fn host_sigkill_does_not_orphan_isolated_worker() {
     if std::env::var("PYLAIR_ORPHAN_HOST").is_ok() {
         let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
-        let _h = spawn_h(spec(FAKE_PARENT_UNREAPED_CHILD), fast_config(), ev);
+        let h = spawn_h(real_runtime_spec(), fast_config(), ev);
+        wait_state(&h, State::Ready).await;
+        // Start the long-running isolated task — the worker it spawns is
+        // the grandchild under test.
+        let ct = h
+            .call_task("isolated_sleep", json!({"seconds": 600}), None)
+            .expect("isolated call rejected");
+        let _ = timeout(T, ct.task).await.expect("task id timed out");
         loop {
             sleep(Duration::from_secs(60)).await;
         }
@@ -477,7 +565,7 @@ async fn host_sigkill_does_not_orphan_grandchild_worker() {
     let me = std::env::current_exe().unwrap();
     let mut host = std::process::Command::new(me)
         .args([
-            "host_sigkill_does_not_orphan_grandchild_worker",
+            "host_sigkill_does_not_orphan_isolated_worker",
             "--exact",
             "--nocapture",
         ])
@@ -486,9 +574,9 @@ async fn host_sigkill_does_not_orphan_grandchild_worker() {
         .expect("spawn host");
     let host_pid = host.id();
 
-    // Find the runtime child = the child of the host that itself has a
-    // child (the "isolated worker"). Polling only "a child of host" can
-    // catch the transient python() version probe instead.
+    // Find the runtime = the child of the host that itself has a child
+    // (the isolated worker). Polling for "a child of host" can catch the
+    // transient python() version probe instead.
     let (mut runtime_pid, mut worker_pid) = (0u32, 0u32);
     for _ in 0..100 {
         for cand in children_of(host_pid) {
@@ -507,13 +595,12 @@ async fn host_sigkill_does_not_orphan_grandchild_worker() {
     assert!(worker_pid != 0, "runtime never spawned a worker child");
 
     let _reap = Reap(vec![runtime_pid, worker_pid]);
-    std::process::Command::new("kill")
-        .args(["-9", &host_pid.to_string()])
-        .output()
-        .unwrap();
+    kill_host(host_pid);
     let _ = host.wait();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // EOF drain (macOS), PDEATHSIG + the worker's own watcher (Linux), or
+    // the Job Object (Windows): whatever the path, NOTHING may survive.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while alive(runtime_pid) || alive(worker_pid) {
         assert!(
             std::time::Instant::now() < deadline,
@@ -523,6 +610,3 @@ async fn host_sigkill_does_not_orphan_grandchild_worker() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
-
-// The Windows variant of the SIGKILL tests lands with RC.6C — the unix
-// arms cover the mechanism (no PDEATHSIG; drain requires a live loop).

@@ -8,7 +8,7 @@
 //! own process group and killpg's it (catches grandchildren); Windows needs a
 //! Job Object (process groups don't exist there).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -225,27 +225,75 @@ enum Command {
         input: Value,
         respond: oneshot::Sender<Result<Value, ErrorObj>>,
         task_out: oneshot::Sender<u64>,
+        owner: Option<String>,
     },
     CallStream {
         fn_name: String,
         input: Value,
         items: StreamSink,
         task_out: oneshot::Sender<u64>,
+        owner: Option<String>,
     },
     Cancel {
         task: u64,
-        respond: oneshot::Sender<bool>,
+        respond: oneshot::Sender<CancelOutcome>,
+        caller: Option<String>,
     },
     GrantCredit {
         task: u64,
         n: u64,
+        respond: oneshot::Sender<Result<(), ErrorObj>>,
+        caller: Option<String>,
     },
+    /// Cancel every task owned by this webview label — sent when the
+    /// window is destroyed (supervisor-initiated, not a JS caller).
+    CancelOwned { owner: String },
     /// Operator-initiated restart out of the Failed state.
     Retry,
-    /// Stop the runtime. `ack` fires only after the process tree is reaped.
+    /// Stop the runtime. `ack` fires only after the process tree is reaped,
+    /// carrying what cleanup actually achieved.
     Shutdown {
-        ack: oneshot::Sender<()>,
+        ack: oneshot::Sender<ShutdownOutcome>,
     },
+}
+
+/// What happened to a cancel request — distinct outcomes so a caller never
+/// has to guess whether its frame landed or its task stopped (RC.6B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelOutcome {
+    /// Runtime confirmed the task stopped.
+    Cancelled,
+    /// Delivered, but the work can't be interrupted (inline sync): the
+    /// caller sees TASK_CANCELLED while the Python may run to completion.
+    RequestedMayContinue,
+    /// Isolated worker was terminated and its process reaped.
+    Terminated,
+    /// Termination was requested but couldn't be confirmed — the worker
+    /// may still be running.
+    TerminationUncertain,
+    /// The task already finished before the cancel landed.
+    Completed,
+    /// No such task in this runtime generation (stale or unknown id).
+    NotFound,
+    /// The caller does not own this task.
+    Rejected,
+    /// The control frame could not be queued — nothing was delivered.
+    DeliveryFailed,
+}
+
+/// What shutdown actually achieved — reported, never assumed (RC.6C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownOutcome {
+    /// Graceful exit inside the grace window.
+    Terminated,
+    /// Had to SIGKILL/taskkill — the tree is confirmed dead.
+    ForcedKill,
+    /// Kill sent but the exit wasn't confirmed in the wait window.
+    Incomplete,
+    /// The runtime was already gone or its state unknown.
+    Unknown,
 }
 
 /// Stale-loop duration at which pongs surface an `Unresponsive` diagnostic.
@@ -274,10 +322,18 @@ fn classify_pong(stale: Duration, kill: Option<Duration>) -> PongVerdict {
     }
 }
 
+/// Per-task metadata for ownership and completion tracking (RC.6A).
+struct TaskMeta {
+    call_id: u64,
+    owner: Option<String>,
+}
+
 enum PendingKind {
     Call(oneshot::Sender<Result<Value, ErrorObj>>),
     Stream(StreamSink),
-    Cancel { respond: oneshot::Sender<bool> },
+    Cancel {
+        respond: oneshot::Sender<CancelOutcome>,
+    },
 }
 
 /// An eagerly-dispatched call: the request is already on its way when this
@@ -308,7 +364,15 @@ impl Handle {
     }
 
     /// Dispatch a call immediately (non-async, try_send) and get its task id.
-    pub fn call_task(&self, fn_name: &str, input: Value) -> Result<CallTask, ErrorObj> {
+    /// `owner` is the controlling caller's identity (a webview label from
+    /// Tauri — never a JS-supplied value); `None` marks the task unowned
+    /// (test/dev paths only — plugin commands always pass the label).
+    pub fn call_task(
+        &self,
+        fn_name: &str,
+        input: Value,
+        owner: Option<String>,
+    ) -> Result<CallTask, ErrorObj> {
         let (rtx, rrx) = oneshot::channel();
         let (ttx, trx) = oneshot::channel();
         self.cmd
@@ -317,6 +381,7 @@ impl Handle {
                 input,
                 respond: rtx,
                 task_out: ttx,
+                owner,
             })
             .map_err(|_| stopped_err())?;
         Ok(CallTask {
@@ -327,8 +392,13 @@ impl Handle {
 
     /// Call a function and await its result. For cancellation, prefer
     /// `call_task` — a pending `call` future carries no task id.
-    pub async fn call(&self, fn_name: &str, input: Value) -> Result<Value, ErrorObj> {
-        let ct = self.call_task(fn_name, input)?;
+    pub async fn call(
+        &self,
+        fn_name: &str,
+        input: Value,
+        owner: Option<String>,
+    ) -> Result<Value, ErrorObj> {
+        let ct = self.call_task(fn_name, input, owner)?;
         ct.result.await.map_err(|_| stopped_err())?
     }
 
@@ -337,6 +407,7 @@ impl Handle {
         &self,
         fn_name: &str,
         input: Value,
+        owner: Option<String>,
     ) -> Result<(u64, StreamRx), ErrorObj> {
         let (items_tx, items_rx) = stream_pair(self.stream_buffer);
         let (task_tx, task_rx) = oneshot::channel();
@@ -346,6 +417,7 @@ impl Handle {
                 input,
                 items: items_tx,
                 task_out: task_tx,
+                owner,
             })
             .await
             .map_err(|_| stopped_err())?;
@@ -361,11 +433,20 @@ impl Handle {
             .map_err(|_| stopped_err())
     }
 
-    /// Ask the supervisor to cancel `task`. Resolves to the runtime's ack.
-    pub async fn cancel(&self, task: u64) -> Result<bool, ErrorObj> {
+    /// Ask the supervisor to cancel `task` as `caller`. Resolves to a
+    /// `CancelOutcome` — never an ambiguous bool (RC.6B).
+    pub async fn cancel(
+        &self,
+        task: u64,
+        caller: Option<String>,
+    ) -> Result<CancelOutcome, ErrorObj> {
         let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(Command::Cancel { task, respond: tx })
+            .send(Command::Cancel {
+                task,
+                respond: tx,
+                caller,
+            })
             .await
             .map_err(|_| stopped_err())?;
         match timeout(self.cancel_timeout, rx).await {
@@ -381,21 +462,44 @@ impl Handle {
         }
     }
 
-    /// Grant more stream pull-credit to `task`.
-    pub async fn grant_credit(&self, task: u64, n: u64) -> Result<(), ErrorObj> {
+    /// Cancel every task owned by `owner` — used when a window is destroyed.
+    /// Delivers from a spawned task so a momentarily-full command queue
+    /// cannot silently drop it (the window's tasks would run on orphaned).
+    pub fn cancel_owner(&self, owner: String) {
+        let cmd = self.cmd.clone();
+        tokio::spawn(async move {
+            let _ = cmd.send(Command::CancelOwned { owner }).await;
+        });
+    }
+
+    /// Grant more stream pull-credit to `task` as `caller`.
+    pub async fn grant_credit(
+        &self,
+        task: u64,
+        n: u64,
+        caller: Option<String>,
+    ) -> Result<(), ErrorObj> {
+        let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(Command::GrantCredit { task, n })
+            .send(Command::GrantCredit {
+                task,
+                n,
+                respond: tx,
+                caller,
+            })
             .await
-            .map_err(|_| stopped_err())
+            .map_err(|_| stopped_err())?;
+        rx.await.map_err(|_| stopped_err())?
     }
 
     /// Stop the runtime and wait until its process tree is gone (or the
-    /// supervisor has already stopped). Resolving means cleanup finished, not
-    /// merely that the request was queued.
-    pub async fn shutdown(&self) {
+    /// supervisor has already stopped). Returns what cleanup achieved.
+    pub async fn shutdown(&self) -> ShutdownOutcome {
         let (ack, done) = oneshot::channel();
         if self.cmd.send(Command::Shutdown { ack }).await.is_ok() {
-            let _ = done.await;
+            done.await.unwrap_or(ShutdownOutcome::Unknown)
+        } else {
+            ShutdownOutcome::Unknown
         }
     }
 }
@@ -435,6 +539,7 @@ pub fn spawn(
         next_task: AtomicU64::new(1),
         ready_since: None,
         shutdown_acks: Vec::new(),
+        shutdown_outcome: None,
     }
     .run();
     (
@@ -461,13 +566,19 @@ struct Supervisor {
     /// ready period is a fresh incident, not a boot loop.
     ready_since: Option<Instant>,
     /// Waiters for a completed shutdown, released when the actor stops.
-    shutdown_acks: Vec<oneshot::Sender<()>>,
+    shutdown_acks: Vec<oneshot::Sender<ShutdownOutcome>>,
+    /// What the most recent shutdown actually achieved (RC.6C).
+    shutdown_outcome: Option<ShutdownOutcome>,
 }
 
 /// Per-child IO plumbing, owned by the per-spawn scope.
 struct ChildIo {
     /// Push raw frame bodies to write to child stdin.
     frame_out: mpsc::Sender<Vec<u8>>,
+    /// Control frames (cancel / credit / shutdown) — a separate bounded
+    /// lane the writer task always drains first, so a data flood cannot
+    /// starve or silently drop control (RC.6B).
+    ctrl_out: mpsc::Sender<Vec<u8>>,
     /// Received decoded incoming messages / transport errors.
     msg_in: mpsc::Receiver<Result<InMsg, ChildReadErr>>,
     /// Exit status of the child process.
@@ -519,8 +630,9 @@ impl Supervisor {
 
     async fn run(mut self) {
         self.run_loop().await;
+        let outcome = self.shutdown_outcome.unwrap_or(ShutdownOutcome::Unknown);
         for ack in self.shutdown_acks.drain(..) {
-            let _ = ack.send(());
+            let _ = ack.send(outcome);
         }
     }
 
@@ -689,7 +801,13 @@ impl Supervisor {
         // ---- serving ----
         let mut pending: HashMap<u64, PendingKind> = HashMap::new();
         let mut task_of_call: HashMap<u64, u64> = HashMap::new(); // call_id -> task
-        let mut call_of_task: HashMap<u64, u64> = HashMap::new(); // task -> call_id
+                                                                  // Task registry {task -> call_id, owner webview} — the ownership
+                                                                  // check for cancel/credit happens here, and the map is per-session
+                                                                  // so a stale id from a previous generation resolves to NotFound.
+        let mut tasks: HashMap<u64, TaskMeta> = HashMap::new();
+        // Recently-finished task ids — lets cancel report Completed
+        // instead of NotFound. Bounded; cleared on overflow.
+        let mut done_tasks: HashSet<u64> = HashSet::new();
         let mut pongs_outstanding: u32 = 0;
         let mut ping_seq: u64 = 0;
         let mut ping_tick = interval(self.config.ping_interval);
@@ -720,17 +838,16 @@ impl Supervisor {
                                     PendingKind::Call(tx) => { let _ = tx.send(out); }
                                     PendingKind::Stream(sink) => sink.finish(out),
                                     PendingKind::Cancel { respond } => {
-                                        let cancelled = out
-                                            .as_ref()
-                                            .ok()
-                                            .and_then(|v| v["cancelled"].as_bool())
-                                            .unwrap_or(false);
-                                        let _ = respond.send(cancelled);
+                                        let _ = respond.send(cancel_outcome(&out));
                                     }
                                 }
                             }
                             if let Some(task) = task_of_call.remove(&id) {
-                                call_of_task.remove(&task);
+                                tasks.remove(&task);
+                                if done_tasks.len() >= 1024 {
+                                    done_tasks.clear();
+                                }
+                                done_tasks.insert(task);
                             }
                         }
                         Some(Ok(InMsg::Notification { method, params })) => {
@@ -763,7 +880,7 @@ impl Supervisor {
                                     let seq = p["seq"].as_u64().unwrap_or(0);
                                     let value = p["value"].clone();
                                     let mut abandoned = None;
-                                    if let Some(&call_id) = call_of_task.get(&task) {
+                                    if let Some(call_id) = tasks.get(&task).map(|m| m.call_id) {
                                         if let Some(PendingKind::Stream(sink)) = pending.get(&call_id) {
                                             if let Err(why) = sink.chunk(seq, value) {
                                                 abandoned = Some((call_id, why));
@@ -788,12 +905,13 @@ impl Supervisor {
                                             }));
                                         }
                                         task_of_call.remove(&call_id);
-                                        call_of_task.remove(&task);
+                                        tasks.remove(&task);
                                         let cid = self.next_id.fetch_add(1, Ordering::Relaxed);
                                         let (ack, _) = oneshot::channel();
-                                        pending.insert(cid, PendingKind::Cancel { respond: ack });
-                                        send_frame(&io, &proto::request(cid, "cancel",
-                                            serde_json::json!({"task": task})));
+                                        if send_ctrl(&io, &proto::request(cid, "cancel",
+                                            serde_json::json!({"task": task}))) {
+                                            pending.insert(cid, PendingKind::Cancel { respond: ack });
+                                        }
                                     }
                                 }
                                 _ => {} // unknown notifications are ignored (spec §8)
@@ -819,11 +937,16 @@ impl Supervisor {
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
                         // all handles dropped — shut down
-                        kill_and_reap(&mut io).await;
+                        let outcome = if kill_and_reap(&mut io).await {
+                            ShutdownOutcome::ForcedKill
+                        } else {
+                            ShutdownOutcome::Incomplete
+                        };
+                        self.shutdown_outcome = Some(outcome);
                         return ExitCause::CleanShutdown;
                     };
                     match cmd {
-                        Command::Call { fn_name, input, respond, task_out } => {
+                        Command::Call { fn_name, input, respond, task_out, owner } => {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
@@ -832,14 +955,14 @@ impl Supervisor {
                                 let _ = task_out.send(task);
                                 pending.insert(id, PendingKind::Call(respond));
                                 task_of_call.insert(id, task);
-                                call_of_task.insert(task, id);
+                                tasks.insert(task, TaskMeta { call_id: id, owner });
                             } else {
                                 let _ = respond.send(Err(ErrorObj {
                                     code: proto::RUNTIME_CRASHED,
                                     message: "runtime stdin is gone".into(), data: None }));
                             }
                         }
-                        Command::CallStream { fn_name, input, items, task_out } => {
+                        Command::CallStream { fn_name, input, items, task_out, owner } => {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
@@ -851,25 +974,92 @@ impl Supervisor {
                                 send_frame(&io, &credit);
                                 pending.insert(id, PendingKind::Stream(items));
                                 task_of_call.insert(id, task);
-                                call_of_task.insert(task, id);
+                                tasks.insert(task, TaskMeta { call_id: id, owner });
                             } else {
                                 items.finish(Err(stopped_err()));
                             }
                         }
-                        Command::Cancel { task, respond } => {
-                            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                            let body = proto::request(id, "cancel",
-                                serde_json::json!({"task": task}));
-                            if send_frame(&io, &body) {
-                                pending.insert(id, PendingKind::Cancel { respond });
-                            } else {
-                                let _ = respond.send(false);
+                        Command::Cancel { task, respond, caller } => {
+                            match tasks.get(&task) {
+                                // Unknown to this generation: a completed
+                                // tombstone means the cancel raced a finish;
+                                // anything else is a stale or foreign id.
+                                None => {
+                                    let _ = respond.send(if done_tasks.contains(&task) {
+                                        CancelOutcome::Completed
+                                    } else {
+                                        CancelOutcome::NotFound
+                                    });
+                                }
+                                Some(meta) if !owner_allows(&meta.owner, &caller) => {
+                                    let _ = respond.send(CancelOutcome::Rejected);
+                                }
+                                Some(_) => {
+                                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                    let body = proto::request(id, "cancel",
+                                        serde_json::json!({"task": task}));
+                                    // Control lane: a data flood cannot starve
+                                    // this, and a failed try_send is a loud
+                                    // outcome — never a silent drop.
+                                    if send_ctrl(&io, &body) {
+                                        pending.insert(id, PendingKind::Cancel { respond });
+                                    } else {
+                                        let _ = respond.send(CancelOutcome::DeliveryFailed);
+                                    }
+                                }
                             }
                         }
-                        Command::GrantCredit { task, n } => {
-                            let body = proto::notification("stream.credit",
-                                serde_json::json!({"task": task, "n": n}));
-                            send_frame(&io, &body);
+                        Command::GrantCredit { task, n, respond, caller } => {
+                            match tasks.get(&task) {
+                                None => {
+                                    let _ = respond.send(Err(ErrorObj {
+                                        code: proto::TASK_NOT_FOUND,
+                                        message: if done_tasks.contains(&task) {
+                                            format!("task {task} already finished")
+                                        } else {
+                                            format!("no such task in this generation: {task}")
+                                        },
+                                        data: None,
+                                    }));
+                                }
+                                Some(meta) if !owner_allows(&meta.owner, &caller) => {
+                                    let _ = respond.send(Err(ErrorObj {
+                                        code: proto::INVALID_REQUEST,
+                                        message: format!("task {task} belongs to a different webview"),
+                                        data: None,
+                                    }));
+                                }
+                                Some(_) => {
+                                    let body = proto::notification("stream.credit",
+                                        serde_json::json!({"task": task, "n": n}));
+                                    let _ = respond.send(if send_ctrl(&io, &body) {
+                                        Ok(())
+                                    } else {
+                                        Err(ErrorObj {
+                                            code: proto::RUNTIME_UNAVAILABLE,
+                                            message: "control queue full — credit not delivered".into(),
+                                            data: None,
+                                        })
+                                    });
+                                }
+                            }
+                        }
+                        Command::CancelOwned { owner } => {
+                            // A window was destroyed: cancel every task it
+                            // owned. Supervisor-initiated, so the owner check
+                            // does not apply; delivery failures only lose a
+                            // cancel the dead window could never observe.
+                            for (&task, meta) in tasks.iter() {
+                                if meta.owner.as_deref() == Some(owner.as_str()) {
+                                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                    let body = proto::request(id, "cancel",
+                                        serde_json::json!({"task": task}));
+                                    let (ack, _) = oneshot::channel();
+                                    if send_ctrl(&io, &body) {
+                                        pending.insert(id, PendingKind::Cancel { respond: ack });
+                                    }
+                                }
+                            }
                         }
                         Command::Retry => {
                             // Only meaningful from Failed — already serving.
@@ -878,13 +1068,19 @@ impl Supervisor {
                             self.shutdown_acks.push(ack);
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
-                            send_frame(&io, &body);
+                            send_ctrl(&io, &body);
                             // Graceful exit within the grace window consumes
                             // `exited`; on timeout it is still pollable, so
-                            // kill the tree and wait for the reap.
-                            if timeout(self.config.shutdown_grace, &mut io.exited).await.is_err() {
-                                kill_and_reap(&mut io).await;
-                            }
+                            // kill the tree and wait for the reap. Report
+                            // what actually happened (RC.6C).
+                            let outcome = if timeout(self.config.shutdown_grace, &mut io.exited).await.is_ok() {
+                                ShutdownOutcome::Terminated
+                            } else if kill_and_reap(&mut io).await {
+                                ShutdownOutcome::ForcedKill
+                            } else {
+                                ShutdownOutcome::Incomplete
+                            };
+                            self.shutdown_outcome = Some(outcome);
                             fail_all(&mut pending, proto::RUNTIME_UNAVAILABLE, "shutdown").await;
                             return ExitCause::CleanShutdown;
                         }
@@ -952,11 +1148,14 @@ fn fail_command_fast(c: Command, why: &str) {
         }
         Command::CallStream { items, .. } => items.finish(Err(err())),
         Command::Cancel { respond, .. } => {
-            let _ = respond.send(false);
+            let _ = respond.send(CancelOutcome::NotFound);
         }
-        Command::GrantCredit { .. } | Command::Retry => {}
+        Command::GrantCredit { respond, .. } => {
+            let _ = respond.send(Err(err()));
+        }
+        Command::CancelOwned { .. } | Command::Retry => {}
         Command::Shutdown { ack } => {
-            let _ = ack.send(());
+            let _ = ack.send(ShutdownOutcome::Unknown);
         }
     }
 }
@@ -969,6 +1168,41 @@ fn send_frame(io: &ChildIo, body: &Value) -> bool {
     match serde_json::to_vec(body) {
         Ok(bytes) => io.frame_out.try_send(bytes).is_ok(),
         Err(_) => false,
+    }
+}
+
+/// Control lane: cancel / credit / shutdown frames the writer drains before
+/// data frames. Bounded — a failed try_send is a visible failure, not a drop.
+fn send_ctrl(io: &ChildIo, body: &Value) -> bool {
+    match serde_json::to_vec(body) {
+        Ok(bytes) => io.ctrl_out.try_send(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// May `caller` control a task recorded with `owner`? Unowned tasks
+/// (supervisor-direct callers, tests) are open to anyone; owned tasks only
+/// to the exact webview label Tauri reported for the invoking window.
+fn owner_allows(owner: &Option<String>, caller: &Option<String>) -> bool {
+    match owner {
+        None => true,
+        Some(o) => caller.as_deref() == Some(o.as_str()),
+    }
+}
+
+/// Map the runtime's cancel ack — `{"cancelled": bool, "status"?, "reason"?}`
+/// — to a distinct outcome. An error reply means the cancel itself failed.
+fn cancel_outcome(out: &Result<Value, ErrorObj>) -> CancelOutcome {
+    match out {
+        Ok(v) if v["cancelled"].as_bool().unwrap_or(false) => match v["status"].as_str() {
+            Some("terminated") => CancelOutcome::Terminated,
+            Some("may_continue") => CancelOutcome::RequestedMayContinue,
+            Some("termination_in_progress") => CancelOutcome::TerminationUncertain,
+            _ => CancelOutcome::Cancelled,
+        },
+        // task_not_found from the runtime = it finished before we asked.
+        Ok(_) => CancelOutcome::Completed,
+        Err(_) => CancelOutcome::TerminationUncertain,
     }
 }
 
@@ -985,17 +1219,20 @@ async fn fail_all(pending: &mut HashMap<u64, PendingKind>, code: i64, msg: &str)
             }
             PendingKind::Stream(sink) => sink.finish(Err(err)),
             PendingKind::Cancel { respond } => {
-                let _ = respond.send(false);
+                let _ = respond.send(CancelOutcome::TerminationUncertain);
             }
         }
     }
 }
 
 /// Signal the kill, then wait for the monitor to reap — the next spawn must
-/// not overlap a still-alive previous generation.
-async fn kill_and_reap(io: &mut ChildIo) {
+/// not overlap a still-alive previous generation. Returns whether the exit
+/// was confirmed inside the wait window.
+async fn kill_and_reap(io: &mut ChildIo) -> bool {
     let _ = io.kill.try_send(());
-    let _ = timeout(Duration::from_secs(5), &mut io.exited).await;
+    timeout(Duration::from_secs(5), &mut io.exited)
+        .await
+        .is_ok()
 }
 
 fn jitter(d: Duration) -> Duration {
@@ -1036,6 +1273,19 @@ async fn spawn_child(
     {
         // Own process group so killpg can reach grandchildren (protocol §10).
         cmd.process_group(0);
+        // Linux: if the host dies abruptly (SIGKILL), our cleanup paths —
+        // kill_on_drop, the monitor task, kill_and_reap — all die with it.
+        // PR_SET_PDEATHSIG asks the kernel to deliver SIGKILL to the child
+        // the moment its parent is gone, covering exactly that case.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = cmd.spawn()?;
@@ -1067,12 +1317,35 @@ async fn spawn_child(
     #[cfg(not(windows))]
     tokio::spawn(monitor_child(child, kill_rx, exit_tx));
 
-    // writer: frames -> child stdin
+    // writer: frames -> child stdin. Two lanes: control (cancel/credit/
+    // shutdown, small and always drained first) and data (calls, initial
+    // credit). A stream flood can fill the data lane; it cannot starve or
+    // silently drop a control frame (RC.6B).
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Vec<u8>>(16);
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         let mut w = stdin;
-        while let Some(body) = frame_rx.recv().await {
-            use tokio::io::AsyncWriteExt;
+        loop {
+            let body: Vec<u8> = tokio::select! {
+                biased;
+                // Ctrl always wins when both lanes have a frame; a closed
+                // ctrl channel falls through to the data lane.
+                c = ctrl_rx.recv() => match c {
+                    Some(b) => b,
+                    None => match frame_rx.recv().await {
+                        Some(b) => b,
+                        None => return,
+                    },
+                },
+                d = frame_rx.recv() => match d {
+                    Some(b) => b,
+                    None => match ctrl_rx.recv().await {
+                        Some(b) => b,
+                        None => return,
+                    },
+                },
+            };
             if w.write_all(&(body.len() as u32).to_be_bytes())
                 .await
                 .is_err()
@@ -1123,6 +1396,7 @@ async fn spawn_child(
 
     Ok(ChildIo {
         frame_out: frame_tx,
+        ctrl_out: ctrl_tx,
         msg_in: msg_rx,
         exited: exit_rx,
         kill: kill_tx,

@@ -80,7 +80,7 @@ All messages carry `"jsonrpc": "2.0"`.
 | method | params | response result |
 |---|---|---|
 | `call` | `{fn, input, task}` | fn's return value (JSON); for generator fns, see §3.1 |
-| `cancel` | `{task}` | `{cancelled: true/false, reason?}` |
+| `cancel` | `{task}` | `{cancelled: true/false, status?, reason?}` |
 | `shutdown` | `{grace_ms}` | `{}` then process exits 0 |
 | `ping` | `{seq}` | must produce a `pong {seq}` notification — see §5 |
 
@@ -224,10 +224,33 @@ removed from the subscriber set.
 
 - `cancel()` waits at most `cancel_timeout` (default 5s) for the runtime's
   acknowledgement and then fails with `RUNTIME_WEDGED`; a blocked runtime
-  cannot be relied on to answer. The client's `timeoutMs` call option is
+  cannot be relied on to answer. It resolves to a distinct outcome —
+  `cancelled`, `requested_may_continue` (inline sync work that cannot be
+  interrupted and may run to completion), `terminated` (isolated worker
+  killed and reaped), `termination_uncertain`, `completed`,
+  `not_found` (no such task in this runtime generation), `rejected`
+  (caller doesn't own the task), or `delivery_failed` — never an
+  ambiguous boolean. The client's `timeoutMs` call option is
   an application-level deadline: it cancels the task and rejects with the
   client-side code `-32013` (`DEADLINE_EXCEEDED`) without waiting for that
   acknowledgement.
+- **Task ownership is supervisor-enforced.** The supervisor records
+  `{task → call id, owner webview}` per runtime generation; `cancel` and
+  `stream.credit` from a webview that doesn't own the task are rejected
+  (outcome `rejected` / `INVALID_REQUEST`), and a task id from a dead
+  generation resolves `not_found` — it can never control a new task. The
+  owner is always the Tauri-reported window label, never a JS-supplied
+  argument. Destroying a window cancels all of its tasks.
+- **Control frames have their own lane.** `cancel`, `stream.credit`, and
+  `shutdown` are queued on a small dedicated channel the writer drains
+  before data frames — a stream flood can fill the data lane but cannot
+  starve or silently drop control; a failed queue send surfaces as an
+  explicit failure. Control can also *outrun* its call, so the runtime
+  records cancels/credit for not-yet-registered task ids and applies
+  them at registration.
+- `shutdown()` resolves to what cleanup achieved — `terminated` (grace
+  window exit), `forced_kill` (tree confirmed dead after a hard kill),
+  `incomplete` (kill sent, exit unconfirmed), or `unknown`.
 
 ## 6. Orphan prevention
 
@@ -250,9 +273,14 @@ platform:
   exactly its group), which a kill of the runtime's group cannot reach.
   Each worker therefore watches its parent and, when re-parented,
   SIGKILLs its whole group (worker plus any grandchildren, SIGTERM
-  ignorers included). Limitation: a worker wedged in native code holding
-  the GIL cannot run that watcher. There is no parent-death signal on
-  macOS, so no `PR_SET_PDEATHSIG` is used on any POSIX platform.
+  ignorers included). On Linux both levels also get a kernel backstop:
+  the runtime is spawned with `PR_SET_PDEATHSIG = SIGKILL` (the kernel
+  kills it even when the host dies before any cleanup can run), and
+  each worker sets `PR_SET_PDEATHSIG` on itself at startup — covering a
+  worker wedged in native code holding the GIL, which could stall the
+  Python watcher thread. There is no parent-death signal on macOS:
+  there, a host kill is covered only by stdin EOF + the worker's ppid
+  watcher — a wedged *runtime* on macOS is the accepted gap.
 - **Shutdown completes before it is acknowledged.** `shutdown()` resolves
   only after the runtime's process tree has been reaped, and the plugin
   blocks application exit on it (`RunEvent::Exit`). A shutdown requested

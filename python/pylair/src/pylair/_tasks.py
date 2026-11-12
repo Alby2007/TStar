@@ -38,6 +38,10 @@ class TaskRegistry:
     def __init__(self, send: Callable[[dict], None]) -> None:
         self._send = send
         self._tasks: dict[int | str, Task] = {}
+        # The host's control lane can outrun the call that registers a task:
+        # hold cancels/credit for not-yet-known ids and apply them at start.
+        self._pending_cancels: set[int | str] = set()
+        self._pending_credit: dict[int | str, int] = {}
 
     def get(self, task_id: int | str) -> Task | None:
         return self._tasks.get(task_id)
@@ -71,6 +75,16 @@ class TaskRegistry:
             )
         else:  # sync inline — uncancellable per docs/cancellation.md
             task.asyncio_task = asyncio.create_task(self._run_sync(task, fn, input))
+
+        # Control frames that beat the call here land now, not never.
+        early_credit = self._pending_credit.pop(task_id, 0)
+        if early_credit:
+            task.credit += early_credit
+            task.credit_event.set()
+        if task_id in self._pending_cancels:
+            self._pending_cancels.discard(task_id)
+            if task.asyncio_task is not None and not task.asyncio_task.done():
+                task.asyncio_task.cancel()
 
     # ---- execution modes -------------------------------------------------
 
@@ -258,6 +272,12 @@ class TaskRegistry:
     def grant_credit(self, task_id: int | str, n: int) -> bool:
         task = self._tasks.get(task_id)
         if task is None or task.done:
+            # Credit that outran its call: hold it for registration instead
+            # of losing it (control lane is independent of the data lane).
+            if len(self._pending_credit) < 4096:
+                self._pending_credit[task_id] = (
+                    self._pending_credit.get(task_id, 0) + n
+                )
             return False
         task.credit += n
         task.credit_event.set()
@@ -266,10 +286,32 @@ class TaskRegistry:
     async def cancel(self, task_id: int | str) -> dict:
         task = self._tasks.get(task_id)
         if task is None or task.done:
+            # A cancel can outrun the call that creates the task — remember
+            # it so the task is cancelled on arrival, never run untracked.
+            if len(self._pending_cancels) < 4096:
+                self._pending_cancels.add(task_id)
             return {"cancelled": False, "reason": "task_not_found"}
         if task.asyncio_task is not None and not task.asyncio_task.done():
             task.asyncio_task.cancel()
             asyncio.create_task(self._ensure_terminal(task))
+            if task.kind == "isolated":
+                # Report what ACTUALLY happened (RC.6B): wait for the
+                # terminate/force-kill/reap path within a bound, then say so.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task.asyncio_task),
+                        timeout=ISOLATED_GRACE_S + 2.0,
+                    )
+                    return {"cancelled": True, "status": "terminated"}
+                except asyncio.CancelledError:
+                    return {"cancelled": True, "status": "terminated"}
+                except BaseException:
+                    return {"cancelled": True, "status": "termination_in_progress"}
+            if task.kind == "sync":
+                # Inline sync runs on an executor thread — it cannot be
+                # interrupted. The caller sees TASK_CANCELLED; the Python
+                # may run to completion. Say so — never claim it stopped.
+                return {"cancelled": True, "status": "may_continue"}
         # Ack immediately; the terminal response follows via the task's own
         # handler or the finisher below — exactly once, _finish dedupes.
         return {"cancelled": True}

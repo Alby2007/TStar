@@ -186,10 +186,20 @@ def test_isolated_call_and_cancel_kills_worker(runtime):
     time.sleep(1.0)  # let the worker spawn
     t0 = time.time()
     runtime.send(proto.request(2, "cancel", {"task": 1}))
-    ack = runtime.recv_until(lambda m: m.get("id") == 2)
-    terminal = runtime.recv_until(lambda m: m.get("id") == 1)
+    # The ack now reports the actual kill outcome, so it waits for the
+    # terminate/reap path — the task's own terminal can arrive first.
+    # Collect both regardless of order.
+    ack = terminal = None
+    deadline = time.time() + 15
+    while ack is None or terminal is None:
+        m = runtime.recv(timeout=max(0.1, deadline - time.time()))
+        if m.get("id") == 2:
+            ack = m
+        elif m.get("id") == 1:
+            terminal = m
     elapsed = time.time() - t0
     assert ack["result"]["cancelled"] is True
+    assert ack["result"]["status"] == "terminated", ack
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
     assert elapsed < 10, "worker should be terminated promptly, not at 60s"
 

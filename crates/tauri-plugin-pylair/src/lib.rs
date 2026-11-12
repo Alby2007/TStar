@@ -173,7 +173,7 @@ async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
     })
     .await;
     match ready {
-        Ok(true) => match h.call("hello", json!({"name": "self-test"})).await {
+        Ok(true) => match h.call("hello", json!({"name": "self-test"}), None).await {
             Ok(v) => {
                 println!("self-test({origin}) ok: {v}");
                 h.shutdown().await;
@@ -375,6 +375,10 @@ impl<R: Runtime> Builder<R> {
                 } = event
                 {
                     app.state::<Registry>().lock().unwrap().drop_label(label);
+                    // Its tasks die with it — nobody left to see the results.
+                    if let Some(rt) = app.try_state::<PyRuntime>() {
+                        rt.0.cancel_owner(label.to_string());
+                    }
                 }
                 // Block exit until the runtime's process tree is gone: the
                 // async drop below may never get to run once the process ends.
@@ -442,7 +446,8 @@ async fn python_call<R: Runtime>(
     input: Value,
 ) -> Result<Value, ErrorObj> {
     subscribed(&window, &reg);
-    rt.0.call(&fn_name, input).await
+    rt.0.call(&fn_name, input, Some(window.label().to_string()))
+        .await
 }
 
 /// Start a streaming call. Returns the task id; chunks and the terminal
@@ -458,7 +463,9 @@ async fn python_call_stream<R: Runtime>(
 ) -> Result<u64, ErrorObj> {
     subscribed(&window, &reg);
     let label = window.label().to_string();
-    let (task, mut items) = rt.0.call_stream(&fn_name, input).await?;
+    let (task, mut items) =
+        rt.0.call_stream(&fn_name, input, Some(label.clone()))
+            .await?;
     let reg_state: Registry = app.state::<Registry>().inner().clone();
     tauri::async_runtime::spawn(async move {
         while let Some(item) = items.recv().await {
@@ -491,7 +498,8 @@ async fn python_grant_credit<R: Runtime>(
     n: u64,
 ) -> Result<(), ErrorObj> {
     subscribed(&window, &reg);
-    rt.0.grant_credit(task, n).await
+    rt.0.grant_credit(task, n, Some(window.label().to_string()))
+        .await
 }
 
 /// End of the installed-webview self-test: print the verdict and exit with
@@ -521,9 +529,9 @@ async fn python_cancel<R: Runtime>(
     reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
     task: u64,
-) -> Result<bool, ErrorObj> {
+) -> Result<supervisor::CancelOutcome, ErrorObj> {
     subscribed(&window, &reg);
-    rt.0.cancel(task).await
+    rt.0.cancel(task, Some(window.label().to_string())).await
 }
 
 /// Operator-initiated recovery: respawn the runtime out of the Failed state.
@@ -552,10 +560,9 @@ async fn python_shutdown<R: Runtime>(
     window: tauri::WebviewWindow<R>,
     reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
-) -> Result<(), ErrorObj> {
+) -> Result<supervisor::ShutdownOutcome, ErrorObj> {
     subscribed(&window, &reg);
-    rt.0.shutdown().await;
-    Ok(())
+    Ok(rt.0.shutdown().await)
 }
 
 #[cfg(test)]

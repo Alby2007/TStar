@@ -23,7 +23,7 @@ function fakeBridge() {
     async invoke(cmd, args) {
       calls.push({ cmd, args });
       if (cmd === "plugin:pylair|python_call_stream") return nextTask++;
-      if (cmd === "plugin:pylair|python_cancel") return true;
+      if (cmd === "plugin:pylair|python_cancel") return "cancelled";
       if (cmd === "plugin:pylair|python_state") return "ready";
       return null;
     },
@@ -117,10 +117,10 @@ test("stream tops up pull credit as consumer drains", async () => {
   assert.ok(grants.length >= 1 && grants.every((g) => g.args.task === 100));
 });
 
-test("cancel() forwards task id", async () => {
+test("cancel() forwards task id and returns the outcome", async () => {
   const b = fakeBridge();
   setBridge(b);
-  assert.equal(await cancel(77), true);
+  assert.equal(await cancel(77), "cancelled");
   assert.deepEqual(b.calls.at(-1), { cmd: "plugin:pylair|python_cancel", args: { task: 77 } });
 });
 

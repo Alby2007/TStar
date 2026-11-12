@@ -47,22 +47,27 @@ integration → `M6` reference app + RC.
 
 ## Known limitations
 
-- **No authorization finer than Tauri capabilities.** A webview can
-  only call `python_call` if a capability grants it `pylair:*`
-  permissions — the template grants them to `windows: ["main"]` only,
-  and remote origins get no IPC access at all unless a capability adds
-  `remote.urls`. But within a granted capability, every covered webview
-  can call *every* `@expose`d function — Pylair adds no per-window or
-  per-function ACL on top. Event delivery is scoped (streams reach only
-  their owning window); invocation scoping beyond capabilities is
-  planned with wrap mode. The exposure exists only if you widen a
-  capability (more windows, `remote.urls`) or load untrusted content in
-  a privileged window.
+- **Invocation is capability-level; task control is owner-scoped.** A
+  webview can only call `python_call` if a capability grants it
+  `pylair:*` permissions — the template grants them to
+  `windows: ["main"]` only, and remote origins get no IPC access unless
+  a capability adds `remote.urls`. Within a granted capability, every
+  covered webview can *invoke* every `@expose`d function — Pylair adds
+  no per-window or per-function ACL on invocation. But once a task
+  exists, only its owning webview (the Tauri window label — never a
+  JS-supplied id) can cancel it or grant it stream credit, a task id
+  from a dead runtime generation controls nothing, and closing the
+  owner window cancels its tasks. Event delivery is likewise scoped
+  (streams reach only their owning window); invocation scoping beyond
+  capabilities is planned with wrap mode. The exposure exists only if
+  you widen a capability (more windows, `remote.urls`) or load untrusted
+  content in a privileged window.
 - **Inline sync functions can't be interrupted.** A non-isolated sync
-  `def` keeps running after cancel; the caller still gets
-  `TASK_CANCELLED` immediately and the result is discarded, but the
-  Python work runs to completion. Mark anything long-running
-  `@expose(isolated=True)` — see [docs/cancellation.md](docs/cancellation.md).
+  `def` keeps running after cancel — `cancel()` reports
+  `requested_may_continue`, the caller gets `TASK_CANCELLED` immediately
+  and the result is discarded, but the Python work may run to
+  completion. Mark anything long-running `@expose(isolated=True)` — see
+  [docs/cancellation.md](docs/cancellation.md).
 - **Async cancel is cooperative.** A coroutine blocked in native code
   can't be preempted until control returns to the event loop; a wedged
   runtime is killed via missed pongs instead. `loop_stall_kill` can make
