@@ -216,6 +216,13 @@ class Server:
     # ---- dispatch ----------------------------------------------------------
 
     async def _handle(self, msg: dict) -> None:
+        if not isinstance(msg, dict):
+            # A valid-JSON scalar/array frame is still not a request —
+            # typed rejection, never an AttributeError on the loop.
+            self._send(
+                proto.error_response(None, proto.INVALID_REQUEST, "invalid request")
+            )
+            return
         if msg.get("__parse_error__"):
             _log(f"unparseable frame: {msg['raw']!r}")
             self._send(
