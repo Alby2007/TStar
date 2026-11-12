@@ -142,7 +142,10 @@ async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
     // Print the interpreter actually being spawned — on a clean machine
     // this is the proof the bundled runtime is what's running, not a
     // system or project Python the app happened to find.
-    eprintln!("self-test({origin}): interpreter {}", spec.program.display());
+    eprintln!(
+        "self-test({origin}): interpreter {}",
+        spec.program.display()
+    );
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let (h, actor) = spawn_supervisor(spec, SupervisorConfig::default(), tx);
     tokio::spawn(actor);

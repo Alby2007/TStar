@@ -36,12 +36,20 @@ env:
 
 jobs:
   acceptance:
-    name: registry-acceptance (${{ matrix.os }}, ${{ inputs.source || 'pack' }})
+    name: registry-acceptance (${{ matrix.os }}${{ matrix.build_shell && '-' + matrix.build_shell || '' }}, ${{ inputs.source || 'pack' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-latest, macos-15-intel]
+        include:
+          - {os: ubuntu-22.04}
+          - {os: windows-latest}
+          # A second Windows leg under pwsh: git-bash resolves GNU tar,
+          # pwsh resolves System32 bsdtar — both PATH orderings get tested
+          # so tool-variance bugs can't come back unnoticed.
+          - {os: windows-latest, build_shell: pwsh}
+          - {os: macos-latest}
+          - {os: macos-15-intel}
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
@@ -111,6 +119,7 @@ jobs:
           workspaces: app-under-test/src-tauri
 
       - name: pylair build
+        if: ${{ !(runner.os == 'Windows' && matrix.build_shell == 'pwsh') }}
         working-directory: app-under-test
         shell: bash
         run: |
@@ -119,6 +128,12 @@ jobs:
             macOS)   npx pylair build ;;  # default bundles: .app + .dmg — exercises the dmg repackage
             *)       npx pylair build --bundles deb ;;
           esac
+
+      - name: pylair build (pwsh — System32 tar ordering)
+        if: ${{ runner.os == 'Windows' && matrix.build_shell == 'pwsh' }}
+        working-directory: app-under-test
+        shell: pwsh
+        run: npx pylair build --bundles nsis
 
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'

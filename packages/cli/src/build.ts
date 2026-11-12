@@ -22,10 +22,11 @@ import {
 } from "node:fs";
 import { get } from "node:https";
 import { arch, platform, tmpdir } from "node:os";
-import { basename, dirname, join, relative } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
 import { DEFAULT_PRUNE, prune } from "./prune.js";
+import { x as untar } from "tar";
 
 const PBS_TAG = "20251120";
 const PBS_VERSIONS: Record<string, string> = { "3.12": "3.12.12", "3.13": "3.13.9" };
@@ -114,15 +115,12 @@ async function fetchPython(
   const dest = join(resources, "python");
   rmSync(dest, { recursive: true, force: true });
   mkdirSync(dest, { recursive: true });
-  // GNU tar (Git Bash) parses "D:\..." as a remote host:file spec and
-  // dies; BSD tar (System32, macOS) has no --force-local to guard it.
-  // Give tar only relative paths — cwd at the tarball, archive by
-  // basename, -C by relative path — and no tar can misparse anything.
-  execFileSync(
-    "tar",
-    ["-xzf", basename(tarball), "-C", relative(dirname(tarball), dest), "--strip-components=1"],
-    { cwd: dirname(tarball), stdio: "inherit" },
-  );
+  // Extract in-process — same lesson as the tomllib probe: whichever
+  // `tar` PATH resolves to can differ (System32 bsdtar vs Git Bash GNU
+  // tar, which dies on drive-letter paths). The `tar` package handles
+  // pax long names (>100 chars) and the bin/python3 -> python3.12
+  // symlinks the POSIX builds carry.
+  await untar({ file: tarball, cwd: dest, strip: 1 });
   const py = join(dest, isWin ? "python.exe" : "bin/python3");
   if (!existsSync(py)) throw new Error(`expected interpreter at ${py}`);
   return py;
