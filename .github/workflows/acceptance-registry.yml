@@ -36,7 +36,7 @@ env:
 
 jobs:
   acceptance:
-    name: registry-acceptance (${{ matrix.os }}${{ matrix.build_shell && '-' + matrix.build_shell || '' }}, ${{ inputs.source || 'pack' }})
+    name: registry-acceptance (${{ matrix.os }}${{ matrix.build_shell && format('-{0}', matrix.build_shell) || '' }}, ${{ inputs.source || 'pack' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
