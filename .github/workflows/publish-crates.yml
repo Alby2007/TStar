@@ -21,9 +21,13 @@ jobs:
     # frameworks alone. The uploaded tarball is identical either way, and
     # ci.yml already compiles the crate on all three OSes.
     runs-on: macos-latest
+    environment: crates
     permissions:
       contents: write # tag after a successful upload — never commits to main
+      id-token: write # OIDC token for crates.io trusted publishing
     env:
+      # Fallback while trusted publishing proves itself — remove after a
+      # real publish succeeds via OIDC.
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v7
@@ -43,9 +47,20 @@ jobs:
       - name: Package + verify (always, even for real publishes)
         run: cargo publish -p tauri-plugin-pylair --dry-run
 
+      # Trusted publishing: swap the GitHub OIDC JWT for a short-lived
+      # crates.io token. Runs on dry_run too so the exchange can be tested
+      # without publishing. continue-on-error keeps the secret-token
+      # fallback alive until a real publish has gone through this path.
+      - name: Exchange OIDC token for a crates.io token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        continue-on-error: true
+
       - name: Publish to crates.io
         if: ${{ !inputs.dry_run }}
         run: cargo publish -p tauri-plugin-pylair
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
 
       # Tag only runs if the upload above succeeded — a failed publish
       # leaves nothing behind.
