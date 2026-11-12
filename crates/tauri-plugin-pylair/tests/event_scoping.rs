@@ -22,10 +22,8 @@ fn sleeper() -> SpawnSpec {
 
 #[test]
 fn runtime_events_reach_only_subscribed_windows() {
-    let cfg = SupervisorConfig {
-        hello_timeout: Duration::from_millis(300),
-        ..Default::default()
-    };
+    let mut cfg = SupervisorConfig::default();
+    cfg.hello_timeout = Duration::from_millis(300);
     let app = tauri::test::mock_builder()
         .plugin(Builder::<MockRuntime>::new(sleeper()).config(cfg).build())
         .build(mock_context(noop_assets()))

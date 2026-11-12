@@ -15,6 +15,8 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
@@ -74,7 +76,169 @@ impl SpawnSpec {
     }
 }
 
+/// Enforceable ceilings on input, output and concurrency (RC.8A). Every
+/// overload returns `LIMIT_EXCEEDED` naming the limit in `data.limit` —
+/// nothing is allowed to grow without bound. Limits are per RUNTIME, not
+/// per window: one busy webview can exhaust a shared cap and starve the
+/// others (no fairness — Known limitations).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Limits {
+    /// In-flight tasks (plain calls, streams and isolated workers — all
+    /// are tasks). Default `PYLAIR_MAX_TASKS` or 64.
+    pub max_concurrent_tasks: usize,
+    /// In-flight streaming tasks (a subset of `max_concurrent_tasks`).
+    /// Default `PYLAIR_MAX_STREAMS` or 32.
+    pub max_concurrent_streams: usize,
+    /// Bytes buffered for ONE stream's consumer (serialized-size estimate).
+    /// The separate `stream_buffer` chunk-count cap still applies —
+    /// whichever trips first ends the stream. Default
+    /// `PYLAIR_STREAM_BUFFER_BYTES` or 16 MiB.
+    pub stream_buffer_bytes: usize,
+    /// Total buffered stream bytes across all streams. Default
+    /// `PYLAIR_STREAM_BUFFER_BYTES_TOTAL` or 64 MiB.
+    pub stream_buffer_bytes_total: usize,
+    /// Outstanding pull-credit per stream task (initial grant + later
+    /// grants - chunks delivered). Default `PYLAIR_MAX_STREAM_CREDIT` or
+    /// 4096.
+    pub max_stream_credit: u64,
+    /// Commands queued to the supervisor. Default
+    /// `PYLAIR_MAX_QUEUED_COMMANDS` or 64.
+    pub max_queued_commands: usize,
+    /// Isolated worker processes in flight at once (enforced Python-side).
+    /// Default `PYLAIR_MAX_ISOLATED_WORKERS` or 8.
+    pub max_isolated_workers: usize,
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_tasks: env_usize("PYLAIR_MAX_TASKS", 64),
+            max_concurrent_streams: env_usize("PYLAIR_MAX_STREAMS", 32),
+            stream_buffer_bytes: env_usize("PYLAIR_STREAM_BUFFER_BYTES", 16 * 1024 * 1024),
+            stream_buffer_bytes_total: env_usize(
+                "PYLAIR_STREAM_BUFFER_BYTES_TOTAL",
+                64 * 1024 * 1024,
+            ),
+            max_stream_credit: env_u64("PYLAIR_MAX_STREAM_CREDIT", 4096),
+            max_queued_commands: env_usize("PYLAIR_MAX_QUEUED_COMMANDS", 64),
+            max_isolated_workers: env_usize("PYLAIR_MAX_ISOLATED_WORKERS", 8),
+        }
+    }
+}
+
+impl Limits {
+    /// Clamp zero and absurd values into supported ranges; returns the
+    /// warnings for anything clamped. Called once at supervisor start —
+    /// the effective limits are logged with them.
+    fn validated(mut self) -> (Self, Vec<String>) {
+        let mut warns = Vec::new();
+        let mut clamp = |v: &mut usize, name: &str, lo: usize, hi: usize| {
+            if *v < lo || *v > hi {
+                warns.push(format!("{name}={v} outside {lo}..={hi} — clamped"));
+                *v = (*v).clamp(lo, hi);
+            }
+        };
+        clamp(
+            &mut self.max_concurrent_tasks,
+            "max_concurrent_tasks",
+            1,
+            100_000,
+        );
+        clamp(
+            &mut self.max_concurrent_streams,
+            "max_concurrent_streams",
+            1,
+            100_000,
+        );
+        clamp(
+            &mut self.stream_buffer_bytes,
+            "stream_buffer_bytes",
+            1024,
+            1 << 30,
+        );
+        clamp(
+            &mut self.stream_buffer_bytes_total,
+            "stream_buffer_bytes_total",
+            1024,
+            8 << 30,
+        );
+        clamp(
+            &mut self.max_queued_commands,
+            "max_queued_commands",
+            1,
+            10_000,
+        );
+        clamp(
+            &mut self.max_isolated_workers,
+            "max_isolated_workers",
+            0,
+            1024,
+        );
+        if self.max_stream_credit < 1 || self.max_stream_credit > 1_000_000 {
+            warns.push(format!(
+                "max_stream_credit={} outside 1..=1000000 — clamped",
+                self.max_stream_credit
+            ));
+            self.max_stream_credit = self.max_stream_credit.clamp(1, 1_000_000);
+        }
+        // A per-stream cap above the total can never hold a full buffer.
+        if self.stream_buffer_bytes_total < self.stream_buffer_bytes {
+            warns.push(format!(
+                "stream_buffer_bytes_total={} below per-stream cap {} — raised",
+                self.stream_buffer_bytes_total, self.stream_buffer_bytes
+            ));
+            self.stream_buffer_bytes_total = self.stream_buffer_bytes;
+        }
+        (self, warns)
+    }
+
+    pub fn with_max_concurrent_tasks(mut self, v: usize) -> Self {
+        self.max_concurrent_tasks = v;
+        self
+    }
+    pub fn with_max_concurrent_streams(mut self, v: usize) -> Self {
+        self.max_concurrent_streams = v;
+        self
+    }
+    pub fn with_stream_buffer_bytes(mut self, v: usize) -> Self {
+        self.stream_buffer_bytes = v;
+        self
+    }
+    pub fn with_stream_buffer_bytes_total(mut self, v: usize) -> Self {
+        self.stream_buffer_bytes_total = v;
+        self
+    }
+    pub fn with_max_stream_credit(mut self, v: u64) -> Self {
+        self.max_stream_credit = v;
+        self
+    }
+    pub fn with_max_queued_commands(mut self, v: usize) -> Self {
+        self.max_queued_commands = v;
+        self
+    }
+    pub fn with_max_isolated_workers(mut self, v: usize) -> Self {
+        self.max_isolated_workers = v;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SupervisorConfig {
     /// Deadline for the runtime's `hello` after spawn.
     pub hello_timeout: Duration,
@@ -111,6 +275,9 @@ pub struct SupervisorConfig {
     /// runtime (no crash accounting). Falls back to the
     /// PYLAIR_RESTART_TRIGGER env var when unset.
     pub restart_trigger: Option<PathBuf>,
+    /// Concurrency/queue/buffer ceilings (RC.8A). Validated and logged at
+    /// supervisor start.
+    pub limits: Limits,
 }
 
 impl Default for SupervisorConfig {
@@ -130,6 +297,7 @@ impl Default for SupervisorConfig {
             cancel_timeout: Duration::from_secs(5),
             max_frame: proto::max_frame(),
             restart_trigger: None,
+            limits: Limits::default(),
         }
     }
 }
@@ -145,27 +313,85 @@ pub enum StreamItem {
     End(Result<Value, ErrorObj>),
 }
 
-/// Supervisor-side end of a stream. Chunks are bounded (`try_send`); the
-/// terminal result travels on its own one-shot, so it can never be lost to a
-/// full chunk buffer and delivering it never awaits.
+/// Byte-budget lease for one buffered stream chunk (RC.8A): lives in the
+/// channel item, so the counters it meters are released exactly when the
+/// chunk leaves the buffer — recv'd by the consumer or dropped with the
+/// channel. A consumer holding received items is draining, not stalling,
+/// so its memory is not counted here.
+struct StreamLease {
+    per_stream: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.per_stream.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Channel payload: the public `StreamItem::Chunk` plus its byte lease.
+struct WeightedChunk {
+    seq: u64,
+    value: Value,
+    _lease: StreamLease,
+}
+
+/// Supervisor-side end of a stream. Chunks are bounded by count AND
+/// bytes (`try_send`); the terminal result travels on its own one-shot,
+/// so it can never be lost to a full chunk buffer and never awaits.
 struct StreamSink {
-    chunks: mpsc::Sender<StreamItem>,
+    chunks: mpsc::Sender<WeightedChunk>,
     end: Option<oneshot::Sender<Result<Value, ErrorObj>>>,
+    per_stream: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    per_cap: u64,
+    total_cap: u64,
 }
 
 /// Why a chunk could not be delivered.
+#[derive(Debug)]
 enum ChunkFail {
-    /// Buffer full: the consumer is not draining.
+    /// Chunk-count buffer full: the consumer is not draining.
     Stalled,
+    /// Per-stream byte cap exceeded (RC.8A).
+    StreamBytes,
+    /// All-streams byte cap exceeded (RC.8A).
+    TotalBytes,
     /// Receiver dropped: the consumer is gone.
     Gone,
 }
 
 impl StreamSink {
     fn chunk(&self, seq: u64, value: Value) -> Result<(), ChunkFail> {
+        // Serialized-size estimate — Value::to_string is already a
+        // compact JSON encoding, close to the on-wire frame weight.
+        let bytes = value.to_string().len() as u64;
+        let per = self.per_stream.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if per > self.per_cap {
+            self.per_stream.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(ChunkFail::StreamBytes);
+        }
+        let total = self.total.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if total > self.total_cap {
+            self.total.fetch_sub(bytes, Ordering::Relaxed);
+            self.per_stream.fetch_sub(bytes, Ordering::Relaxed);
+            return Err(ChunkFail::TotalBytes);
+        }
         self.chunks
-            .try_send(StreamItem::Chunk { seq, value })
+            .try_send(WeightedChunk {
+                seq,
+                value,
+                _lease: StreamLease {
+                    per_stream: self.per_stream.clone(),
+                    total: self.total.clone(),
+                    bytes,
+                },
+            })
             .map_err(|e| match e {
+                // On failure the rejected WeightedChunk (with its lease)
+                // is handed back and dropped — counters release.
                 mpsc::error::TrySendError::Full(_) => ChunkFail::Stalled,
                 mpsc::error::TrySendError::Closed(_) => ChunkFail::Gone,
             })
@@ -183,15 +409,18 @@ impl StreamSink {
 /// Consumer-side end of a stream: queued chunks first, then exactly one
 /// `StreamItem::End`, then `None`.
 pub struct StreamRx {
-    chunks: mpsc::Receiver<StreamItem>,
+    chunks: mpsc::Receiver<WeightedChunk>,
     end: Option<oneshot::Receiver<Result<Value, ErrorObj>>>,
 }
 
 impl StreamRx {
     pub async fn recv(&mut self) -> Option<StreamItem> {
         if self.end.is_some() {
-            if let Some(item) = self.chunks.recv().await {
-                return Some(item);
+            if let Some(c) = self.chunks.recv().await {
+                return Some(StreamItem::Chunk {
+                    seq: c.seq,
+                    value: c.value,
+                });
             }
             // Chunk channel closed => the sink is gone and the terminal is set
             // (or the supervisor itself dropped).
@@ -204,13 +433,22 @@ impl StreamRx {
     }
 }
 
-fn stream_pair(buffer: usize) -> (StreamSink, StreamRx) {
+fn stream_pair(
+    buffer: usize,
+    per_stream_cap: u64,
+    total: Arc<AtomicU64>,
+    total_cap: u64,
+) -> (StreamSink, StreamRx) {
     let (ctx, crx) = mpsc::channel(buffer.max(1));
     let (etx, erx) = oneshot::channel();
     (
         StreamSink {
             chunks: ctx,
             end: Some(etx),
+            per_stream: Arc::new(AtomicU64::new(0)),
+            total,
+            per_cap: per_stream_cap,
+            total_cap,
         },
         StreamRx {
             chunks: crx,
@@ -231,7 +469,9 @@ enum Command {
         fn_name: String,
         input: Value,
         items: StreamSink,
-        task_out: oneshot::Sender<u64>,
+        /// Ok(task id) or the typed rejection — `call_stream` must surface
+        /// the REAL error (e.g. LIMIT_EXCEEDED), not a bare disconnect.
+        task_out: oneshot::Sender<Result<u64, ErrorObj>>,
         owner: Option<String>,
     },
     Cancel {
@@ -322,10 +562,15 @@ fn classify_pong(stale: Duration, kill: Option<Duration>) -> PongVerdict {
     }
 }
 
-/// Per-task metadata for ownership and completion tracking (RC.6A).
+/// Per-task metadata for ownership, kind and credit tracking (RC.6A/RC.8A).
 struct TaskMeta {
     call_id: u64,
     owner: Option<String>,
+    /// Streaming tasks count toward `max_concurrent_streams`.
+    is_stream: bool,
+    /// Outstanding pull-credit: initial grant + `GrantCredit`s minus
+    /// delivered chunks (RC.8A cap).
+    credit: u64,
 }
 
 enum PendingKind {
@@ -351,9 +596,21 @@ pub struct Handle {
     state: watch::Receiver<State>,
     stream_buffer: usize,
     cancel_timeout: Duration,
+    /// Shared with the actor: total stream bytes buffered for ALL
+    /// consumers, metered by each chunk's `StreamLease` (RC.8A).
+    stream_bytes_total: Arc<AtomicU64>,
+    limits: Arc<Limits>,
 }
 
 impl Handle {
+    fn queue_err(&self) -> ErrorObj {
+        limit_err(
+            "max_queued_commands",
+            self.limits.max_queued_commands as u64,
+            "command queue full — the supervisor is saturated",
+        )
+    }
+
     pub fn state(&self) -> State {
         *self.state.borrow()
     }
@@ -383,7 +640,10 @@ impl Handle {
                 task_out: ttx,
                 owner,
             })
-            .map_err(|_| stopped_err())?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => self.queue_err(),
+                mpsc::error::TrySendError::Closed(_) => stopped_err(),
+            })?;
         Ok(CallTask {
             task: trx,
             result: rrx,
@@ -409,32 +669,40 @@ impl Handle {
         input: Value,
         owner: Option<String>,
     ) -> Result<(u64, StreamRx), ErrorObj> {
-        let (items_tx, items_rx) = stream_pair(self.stream_buffer);
+        let (items_tx, items_rx) = stream_pair(
+            self.stream_buffer,
+            self.limits.stream_buffer_bytes as u64,
+            self.stream_bytes_total.clone(),
+            self.limits.stream_buffer_bytes_total as u64,
+        );
         let (task_tx, task_rx) = oneshot::channel();
         self.cmd
-            .send(Command::CallStream {
+            .try_send(Command::CallStream {
                 fn_name: fn_name.into(),
                 input,
                 items: items_tx,
                 task_out: task_tx,
                 owner,
             })
-            .await
-            .map_err(|_| stopped_err())?;
-        let task = task_rx.await.map_err(|_| stopped_err())?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => self.queue_err(),
+                mpsc::error::TrySendError::Closed(_) => stopped_err(),
+            })?;
+        let task = task_rx.await.map_err(|_| stopped_err())??;
         Ok((task, items_rx))
     }
 
     /// Retry after a Failed state — respawns the runtime fresh.
     pub async fn retry(&self) -> Result<(), ErrorObj> {
-        self.cmd
-            .send(Command::Retry)
-            .await
-            .map_err(|_| stopped_err())
+        self.cmd.try_send(Command::Retry).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => self.queue_err(),
+            mpsc::error::TrySendError::Closed(_) => stopped_err(),
+        })
     }
 
     /// Ask the supervisor to cancel `task` as `caller`. Resolves to a
-    /// `CancelOutcome` — never an ambiguous bool (RC.6B).
+    /// `CancelOutcome` — never an ambiguous bool (RC.6B). A full command
+    /// queue is a `LIMIT_EXCEEDED` error, not a wait.
     pub async fn cancel(
         &self,
         task: u64,
@@ -442,13 +710,15 @@ impl Handle {
     ) -> Result<CancelOutcome, ErrorObj> {
         let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(Command::Cancel {
+            .try_send(Command::Cancel {
                 task,
                 respond: tx,
                 caller,
             })
-            .await
-            .map_err(|_| stopped_err())?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => self.queue_err(),
+                mpsc::error::TrySendError::Closed(_) => stopped_err(),
+            })?;
         match timeout(self.cancel_timeout, rx).await {
             Ok(r) => r.map_err(|_| stopped_err()),
             Err(_) => Err(ErrorObj {
@@ -468,7 +738,7 @@ impl Handle {
     /// entered; a `tokio::spawn` inside this method panicked there. The
     /// awaited send keeps the non-dropping guarantee: a momentarily-full
     /// command queue cannot silently lose it (the window's tasks would
-    /// run on orphaned).
+    /// run on orphaned) — and nobody is left to report a loss to anyway.
     pub async fn cancel_owner(&self, owner: String) {
         let _ = self.cmd.send(Command::CancelOwned { owner }).await;
     }
@@ -482,19 +752,22 @@ impl Handle {
     ) -> Result<(), ErrorObj> {
         let (tx, rx) = oneshot::channel();
         self.cmd
-            .send(Command::GrantCredit {
+            .try_send(Command::GrantCredit {
                 task,
                 n,
                 respond: tx,
                 caller,
             })
-            .await
-            .map_err(|_| stopped_err())?;
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => self.queue_err(),
+                mpsc::error::TrySendError::Closed(_) => stopped_err(),
+            })?;
         rx.await.map_err(|_| stopped_err())?
     }
 
     /// Stop the runtime and wait until its process tree is gone (or the
     /// supervisor has already stopped). Returns what cleanup achieved.
+    /// The awaited send is deliberate: a shutdown must never be dropped.
     pub async fn shutdown(&self) -> ShutdownOutcome {
         let (ack, done) = oneshot::channel();
         if self.cmd.send(Command::Shutdown { ack }).await.is_ok() {
@@ -513,22 +786,58 @@ fn stopped_err() -> ErrorObj {
     }
 }
 
+/// Overload always answers with an explicit, typed error naming the limit
+/// (RC.8A) — never a silent wait, a drop, or a mislabeled "stopped".
+fn limit_err(limit: &str, max: u64, msg: impl Into<String>) -> ErrorObj {
+    ErrorObj {
+        code: proto::LIMIT_EXCEEDED,
+        message: msg.into(),
+        data: Some(serde_json::json!({"limit": limit, "max": max})),
+    }
+}
+
 /// Create the supervisor actor. Returns the handle plus the actor future —
 /// the CALLER drives it (tokio::spawn / tauri::async_runtime::spawn) because
 /// bare `tokio::spawn` panics outside an entered runtime, and plugin `setup`
 /// runs on the main thread where no reactor is entered.
 pub fn spawn(
     spec: SpawnSpec,
-    config: SupervisorConfig,
+    mut config: SupervisorConfig,
     events: mpsc::Sender<RuntimeEvent>,
 ) -> (
     Handle,
     impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (limits, warns) = config.limits.validated();
+    for w in &warns {
+        let _ = events.try_send(RuntimeEvent::Stderr(format!("pylair limits: {w}")));
+    }
+    // An initial grant above the cap would violate the cap immediately.
+    if config.initial_stream_credit > limits.max_stream_credit {
+        let _ = events.try_send(RuntimeEvent::Stderr(format!(
+            "pylair limits: initial_stream_credit={} exceeds max_stream_credit={} — clamped",
+            config.initial_stream_credit, limits.max_stream_credit
+        )));
+        config.initial_stream_credit = limits.max_stream_credit;
+    }
+    let _ = events.try_send(RuntimeEvent::Stderr(format!(
+        "pylair limits: tasks={} streams={} queue={} stream_bytes={}/{} credit={} workers={} frame={}",
+        limits.max_concurrent_tasks,
+        limits.max_concurrent_streams,
+        limits.max_queued_commands,
+        limits.stream_buffer_bytes,
+        limits.stream_buffer_bytes_total,
+        limits.max_stream_credit,
+        limits.max_isolated_workers,
+        config.max_frame,
+    )));
+    config.limits = limits.clone();
+    let limits = Arc::new(limits);
+    let (cmd_tx, cmd_rx) = mpsc::channel(limits.max_queued_commands);
     let (state_tx, state_rx) = watch::channel(State::Starting);
     let stream_buffer = config.stream_buffer;
     let cancel_timeout = config.cancel_timeout;
+    let stream_bytes_total = Arc::new(AtomicU64::new(0));
     let actor = Supervisor {
         spec,
         config,
@@ -549,6 +858,8 @@ pub fn spawn(
             state: state_rx,
             stream_buffer,
             cancel_timeout,
+            stream_bytes_total,
+            limits,
         },
         actor,
     )
@@ -881,36 +1192,56 @@ impl Supervisor {
                                     let seq = p["seq"].as_u64().unwrap_or(0);
                                     let value = p["value"].clone();
                                     let mut abandoned = None;
-                                    if let Some(call_id) = tasks.get(&task).map(|m| m.call_id) {
-                                        if let Some(PendingKind::Stream(sink)) = pending.get(&call_id) {
+                                    if let Some(meta) = tasks.get_mut(&task) {
+                                        // Each delivered chunk consumed one
+                                        // credit (RC.8A accounting).
+                                        meta.credit = meta.credit.saturating_sub(1);
+                                        if let Some(PendingKind::Stream(sink)) = pending.get(&meta.call_id) {
                                             if let Err(why) = sink.chunk(seq, value) {
-                                                abandoned = Some((call_id, why));
+                                                abandoned = Some((meta.call_id, why));
                                             }
                                         }
                                     }
                                     if let Some((call_id, why)) = abandoned {
-                                        // The consumer stalled or vanished. End the stream
-                                        // with a terminal that cannot be lost, and STOP the
-                                        // producer instead of leaving it running unobserved.
-                                        let (msg, note) = match why {
-                                            ChunkFail::Stalled => ("stream consumer stalled", "stalled"),
-                                            ChunkFail::Gone => ("stream consumer went away", "went away"),
+                                        // The consumer stalled or vanished, or a
+                                        // byte cap tripped. End the stream with a
+                                        // terminal that cannot be lost, and STOP
+                                        // the producer instead of leaving it
+                                        // running unobserved.
+                                        let (err, note) = match why {
+                                            ChunkFail::Stalled => (ErrorObj {
+                                                code: proto::INTERNAL,
+                                                message: "stream consumer stalled".into(),
+                                                data: None,
+                                            }, "stalled"),
+                                            ChunkFail::Gone => (ErrorObj {
+                                                code: proto::INTERNAL,
+                                                message: "stream consumer went away".into(),
+                                                data: None,
+                                            }, "went away"),
+                                            ChunkFail::StreamBytes => (limit_err(
+                                                "stream_buffer_bytes",
+                                                self.config.limits.stream_buffer_bytes as u64,
+                                                "stream consumer buffered past the per-stream byte cap"),
+                                                "over the byte cap"),
+                                            ChunkFail::TotalBytes => (limit_err(
+                                                "stream_buffer_bytes_total",
+                                                self.config.limits.stream_buffer_bytes_total as u64,
+                                                "all streams exceeded the shared byte cap"),
+                                                "over the shared byte cap"),
                                         };
                                         let _ = self.events.try_send(RuntimeEvent::Stderr(
                                             format!("task {task}: stream consumer {note}; cancelling producer")));
                                         if let Some(PendingKind::Stream(sink)) = pending.remove(&call_id) {
-                                            sink.finish(Err(ErrorObj {
-                                                code: proto::INTERNAL,
-                                                message: msg.into(),
-                                                data: None,
-                                            }));
+                                            sink.finish(Err(err));
                                         }
                                         task_of_call.remove(&call_id);
                                         tasks.remove(&task);
                                         let cid = self.next_id.fetch_add(1, Ordering::Relaxed);
                                         let (ack, _) = oneshot::channel();
                                         if send_ctrl(&io, &proto::request(cid, "cancel",
-                                            serde_json::json!({"task": task}))) {
+                                            serde_json::json!({"task": task})),
+                                            self.config.max_frame) {
                                             pending.insert(cid, PendingKind::Cancel { respond: ack });
                                         }
                                     }
@@ -948,36 +1279,83 @@ impl Supervisor {
                     };
                     match cmd {
                         Command::Call { fn_name, input, respond, task_out, owner } => {
+                            let lim = &self.config.limits;
+                            if tasks.len() >= lim.max_concurrent_tasks {
+                                let _ = respond.send(Err(limit_err(
+                                    "max_concurrent_tasks",
+                                    lim.max_concurrent_tasks as u64,
+                                    "too many in-flight tasks")));
+                                continue;
+                            }
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
                                 serde_json::json!({"fn": fn_name, "task": task, "input": input}));
-                            if send_frame(&io, &body) {
-                                let _ = task_out.send(task);
-                                pending.insert(id, PendingKind::Call(respond));
-                                task_of_call.insert(id, task);
-                                tasks.insert(task, TaskMeta { call_id: id, owner });
-                            } else {
-                                let _ = respond.send(Err(ErrorObj {
-                                    code: proto::RUNTIME_CRASHED,
-                                    message: "runtime stdin is gone".into(), data: None }));
+                            match send_frame(&io, &body, self.config.max_frame) {
+                                Ok(()) => {
+                                    let _ = task_out.send(task);
+                                    pending.insert(id, PendingKind::Call(respond));
+                                    task_of_call.insert(id, task);
+                                    tasks.insert(task, TaskMeta {
+                                        call_id: id, owner, is_stream: false, credit: 0,
+                                    });
+                                }
+                                Err(SendFail::Oversize(n)) => {
+                                    let _ = respond.send(Err(limit_err(
+                                        "max_frame",
+                                        self.config.max_frame as u64,
+                                        format!("call frame is {n} bytes — the runtime would reject it"))));
+                                }
+                                Err(SendFail::LaneFull) => {
+                                    let _ = respond.send(Err(limit_err(
+                                        "frame_out_queue", 64,
+                                        "runtime stdin queue full — not draining")));
+                                }
                             }
                         }
                         Command::CallStream { fn_name, input, items, task_out, owner } => {
+                            let lim = &self.config.limits;
+                            if tasks.len() >= lim.max_concurrent_tasks {
+                                reject_stream(items, task_out, limit_err(
+                                    "max_concurrent_tasks",
+                                    lim.max_concurrent_tasks as u64,
+                                    "too many in-flight tasks"));
+                                continue;
+                            }
+                            let streams = tasks.values().filter(|m| m.is_stream).count();
+                            if streams >= lim.max_concurrent_streams {
+                                reject_stream(items, task_out, limit_err(
+                                    "max_concurrent_streams",
+                                    lim.max_concurrent_streams as u64,
+                                    "too many in-flight streams"));
+                                continue;
+                            }
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
                                 serde_json::json!({"fn": fn_name, "task": task, "input": input}));
                             let credit = proto::notification("stream.credit",
                                 serde_json::json!({"task": task, "n": self.config.initial_stream_credit}));
-                            if send_frame(&io, &body) {
-                                let _ = task_out.send(task);
-                                send_frame(&io, &credit);
-                                pending.insert(id, PendingKind::Stream(items));
-                                task_of_call.insert(id, task);
-                                tasks.insert(task, TaskMeta { call_id: id, owner });
-                            } else {
-                                items.finish(Err(stopped_err()));
+                            match send_frame(&io, &body, self.config.max_frame) {
+                                Ok(()) => {
+                                    let _ = task_out.send(Ok(task));
+                                    let _ = send_frame(&io, &credit, self.config.max_frame);
+                                    pending.insert(id, PendingKind::Stream(items));
+                                    task_of_call.insert(id, task);
+                                    tasks.insert(task, TaskMeta {
+                                        call_id: id, owner, is_stream: true,
+                                        credit: self.config.initial_stream_credit,
+                                    });
+                                }
+                                Err(e) => {
+                                    let max = self.config.max_frame as u64;
+                                    reject_stream(items, task_out, match e {
+                                        SendFail::Oversize(n) => limit_err("max_frame", max,
+                                            format!("call frame is {n} bytes — the runtime would reject it")),
+                                        SendFail::LaneFull => limit_err("frame_out_queue", 64,
+                                            "runtime stdin queue full — not draining"),
+                                    });
+                                }
                             }
                         }
                         Command::Cancel { task, respond, caller } => {
@@ -1002,7 +1380,7 @@ impl Supervisor {
                                     // Control lane: a data flood cannot starve
                                     // this, and a failed try_send is a loud
                                     // outcome — never a silent drop.
-                                    if send_ctrl(&io, &body) {
+                                    if send_ctrl(&io, &body, self.config.max_frame) {
                                         pending.insert(id, PendingKind::Cancel { respond });
                                     } else {
                                         let _ = respond.send(CancelOutcome::DeliveryFailed);
@@ -1011,7 +1389,7 @@ impl Supervisor {
                             }
                         }
                         Command::GrantCredit { task, n, respond, caller } => {
-                            match tasks.get(&task) {
+                            match tasks.get_mut(&task) {
                                 None => {
                                     let _ = respond.send(Err(ErrorObj {
                                         code: proto::TASK_NOT_FOUND,
@@ -1030,18 +1408,29 @@ impl Supervisor {
                                         data: None,
                                     }));
                                 }
-                                Some(_) => {
-                                    let body = proto::notification("stream.credit",
-                                        serde_json::json!({"task": task, "n": n}));
-                                    let _ = respond.send(if send_ctrl(&io, &body) {
-                                        Ok(())
-                                    } else {
-                                        Err(ErrorObj {
-                                            code: proto::RUNTIME_UNAVAILABLE,
-                                            message: "control queue full — credit not delivered".into(),
-                                            data: None,
-                                        })
-                                    });
+                                Some(meta) => {
+                                    let lim = &self.config.limits;
+                                    let would = meta.credit.checked_add(n);
+                                    match would {
+                                        Some(total) if total <= lim.max_stream_credit => {
+                                            let body = proto::notification("stream.credit",
+                                                serde_json::json!({"task": task, "n": n}));
+                                            let _ = respond.send(
+                                                if send_ctrl(&io, &body, self.config.max_frame) {
+                                                    meta.credit = total;
+                                                    Ok(())
+                                                } else {
+                                                    Err(limit_err("ctrl_queue", 16,
+                                                        "control queue full — credit not delivered"))
+                                                });
+                                        }
+                                        _ => {
+                                            let _ = respond.send(Err(limit_err(
+                                                "max_stream_credit",
+                                                lim.max_stream_credit,
+                                                format!("grant of {n} exceeds the outstanding-credit cap"))));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1056,7 +1445,7 @@ impl Supervisor {
                                     let body = proto::request(id, "cancel",
                                         serde_json::json!({"task": task}));
                                     let (ack, _) = oneshot::channel();
-                                    if send_ctrl(&io, &body) {
+                                    if send_ctrl(&io, &body, self.config.max_frame) {
                                         pending.insert(id, PendingKind::Cancel { respond: ack });
                                     }
                                 }
@@ -1069,7 +1458,7 @@ impl Supervisor {
                             self.shutdown_acks.push(ack);
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
-                            send_ctrl(&io, &body);
+                            let _ = send_ctrl(&io, &body, self.config.max_frame);
                             // Graceful exit within the grace window consumes
                             // `exited`; on timeout it is still pollable, so
                             // kill the tree and wait for the reap. Report
@@ -1082,6 +1471,12 @@ impl Supervisor {
                                 ShutdownOutcome::Incomplete
                             };
                             self.shutdown_outcome = Some(outcome);
+                            // The runtime may have written final responses
+                            // (TASK_CANCELLED, results) before exiting —
+                            // deliver them so callers get what actually
+                            // happened, then sweep the rest.
+                            drain_exited_inbox(&mut io, &mut pending, &mut tasks,
+                                               &mut task_of_call, &mut done_tasks).await;
                             fail_all(&mut pending, proto::RUNTIME_UNAVAILABLE, "shutdown").await;
                             return ExitCause::CleanShutdown;
                         }
@@ -1107,7 +1502,7 @@ impl Supervisor {
                     ping_seq += 1;
                     let body = proto::request(self.next_id.fetch_add(1, Ordering::Relaxed),
                         "ping", serde_json::json!({"seq": ping_seq}));
-                    send_frame(&io, &body);
+                    let _ = send_frame(&io, &body, self.config.max_frame);
                 }
                 // --- dev restart trigger ---
                 _ = trigger_tick.tick(), if restart_trigger.is_some() => {
@@ -1128,12 +1523,23 @@ impl Supervisor {
                         Ok(Err(e)) => format!("wait error: {e}"),
                         Err(_) => "monitor dropped".into(),
                     };
+                    // Same last-words delivery as the shutdown path: a dying
+                    // runtime's queued responses resolve their own calls.
+                    drain_exited_inbox(&mut io, &mut pending, &mut tasks,
+                                       &mut task_of_call, &mut done_tasks).await;
                     fail_all(&mut pending, proto::RUNTIME_CRASHED, &detail).await;
                     return ExitCause::Crashed(detail);
                 }
             }
         }
     }
+}
+
+/// A streaming call refused before dispatch: the typed error reaches both
+/// the task-id waiter and the stream's terminal (RC.8A).
+fn reject_stream(items: StreamSink, task_out: oneshot::Sender<Result<u64, ErrorObj>>, e: ErrorObj) {
+    let _ = task_out.send(Err(e.clone()));
+    items.finish(Err(e));
 }
 
 /// Answer a command immediately when there is no runtime to run it.
@@ -1165,19 +1571,30 @@ fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-fn send_frame(io: &ChildIo, body: &Value) -> bool {
+/// Why an outgoing frame could not be queued (RC.8A): the data lane is
+/// saturated, or the frame exceeds `max_frame` — which would otherwise
+/// trip the PEER's read cap and kill the whole runtime.
+enum SendFail {
+    LaneFull,
+    Oversize(usize),
+}
+
+fn send_frame(io: &ChildIo, body: &Value, max_frame: usize) -> Result<(), SendFail> {
     match serde_json::to_vec(body) {
-        Ok(bytes) => io.frame_out.try_send(bytes).is_ok(),
-        Err(_) => false,
+        Ok(bytes) if bytes.len() > max_frame => Err(SendFail::Oversize(bytes.len())),
+        Ok(bytes) => io.frame_out.try_send(bytes).map_err(|_| SendFail::LaneFull),
+        Err(_) => Err(SendFail::LaneFull),
     }
 }
 
 /// Control lane: cancel / credit / shutdown frames the writer drains before
 /// data frames. Bounded — a failed try_send is a visible failure, not a drop.
-fn send_ctrl(io: &ChildIo, body: &Value) -> bool {
+/// Control frames are always small, but the size check is kept anyway so
+/// no path can ever write a frame the peer would reject.
+fn send_ctrl(io: &ChildIo, body: &Value, max_frame: usize) -> bool {
     match serde_json::to_vec(body) {
-        Ok(bytes) => io.ctrl_out.try_send(bytes).is_ok(),
-        Err(_) => false,
+        Ok(bytes) if bytes.len() <= max_frame => io.ctrl_out.try_send(bytes).is_ok(),
+        _ => false,
     }
 }
 
@@ -1204,6 +1621,56 @@ fn cancel_outcome(out: &Result<Value, ErrorObj>) -> CancelOutcome {
         // task_not_found from the runtime = it finished before we asked.
         Ok(_) => CancelOutcome::Completed,
         Err(_) => CancelOutcome::TerminationUncertain,
+    }
+}
+
+/// Deliver every response the runtime managed to write before it exited.
+/// `wait()` can report the exit while bytes still sit unread in the pipe —
+/// without this drain, `fail_all` would overwrite the runtime's actual
+/// last words (TASK_CANCELLED, real results) with a generic code.
+/// Bounded: at most 250ms of parsing whatever the pipe still holds.
+async fn drain_exited_inbox(
+    io: &mut ChildIo,
+    pending: &mut HashMap<u64, PendingKind>,
+    tasks: &mut HashMap<u64, TaskMeta>,
+    task_of_call: &mut HashMap<u64, u64>,
+    done_tasks: &mut HashSet<u64>,
+) {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let msg = match timeout(left, io.msg_in.recv()).await {
+            Ok(Some(m)) => m,
+            _ => return, // channel closed (reader hit EOF) or nothing left
+        };
+        let Ok(InMsg::Response { id, result, error }) = msg else {
+            continue; // notifications from a dead runtime are moot
+        };
+        let out = match (result, error) {
+            (_, Some(e)) => Err(e),
+            (r, None) => Ok(r.unwrap_or(Value::Null)),
+        };
+        if let Some(kind) = pending.remove(&id) {
+            match kind {
+                PendingKind::Call(tx) => {
+                    let _ = tx.send(out);
+                }
+                PendingKind::Stream(sink) => sink.finish(out),
+                PendingKind::Cancel { respond } => {
+                    let _ = respond.send(cancel_outcome(&out));
+                }
+            }
+        }
+        if let Some(task) = task_of_call.remove(&id) {
+            tasks.remove(&task);
+            if done_tasks.len() >= 1024 {
+                done_tasks.clear();
+            }
+            done_tasks.insert(task);
+        }
     }
 }
 
@@ -1279,10 +1746,19 @@ fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
         cmd.env_remove(k);
     }
     cmd.envs(spec.env.iter().cloned());
+    // The classic fork/prctl race: if the whole process dies between the
+    // fork and the child's PR_SET_PDEATHSIG, the child is reparented before
+    // the flag exists and the signal would never fire — a permanent orphan.
+    // Mirror the isolated worker's check: verify getppid() still names the
+    // process we forked from; if it changed, abort the exec and fail spawn.
+    let expected_ppid = std::process::id() as libc::pid_t;
     unsafe {
-        cmd.as_std_mut().pre_exec(|| {
+        cmd.as_std_mut().pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != expected_ppid {
+                return Err(io::Error::other("reparented before pdeathsig — aborting"));
             }
             Ok(())
         });
@@ -1647,5 +2123,38 @@ mod tests {
             classify_pong(Duration::from_millis(500), Some(Duration::from_millis(500))),
             StallKill
         );
+    }
+
+    #[test]
+    fn stream_byte_caps_distinguish_per_stream_and_total() {
+        use serde_json::json;
+        // Deterministic counterpart to the e2e limits test: two streams
+        // sharing one total budget — the chunk that crosses the SHARED cap
+        // must be reported as TotalBytes even though its own per-stream
+        // usage is under the per cap.
+        let total = Arc::new(AtomicU64::new(0));
+        let (s1, mut r1) = stream_pair(64, 1024, total.clone(), 1024);
+        let (s2, _r2) = stream_pair(64, 1024, total.clone(), 1024);
+
+        for i in 0..5u64 {
+            assert!(s1.chunk(i, json!(0)).is_ok());
+            assert!(s2.chunk(i, json!(0)).is_ok());
+        }
+        // Push the shared counter near the cap via a third view of the same
+        // Arc — equivalent to bytes buffered by a consumer that isn't
+        // draining.
+        total.store(1024 - 8, Ordering::Relaxed);
+        // s2's next chunk (18 bytes serialized) crosses the shared budget:
+        // TotalBytes even though s2's own usage (~23 bytes) is under per.
+        let err = json!("x".repeat(16));
+        let res = s2.chunk(99, err.clone());
+        assert!(
+            matches!(res, Err(ChunkFail::TotalBytes)),
+            "expected TotalBytes, got {res:?}"
+        );
+        // Draining s1's buffered chunks releases its leases, but the total
+        // is still over — s1's next chunk trips the shared cap too.
+        while r1.chunks.try_recv().is_ok() {}
+        assert!(matches!(s1.chunk(99, err), Err(ChunkFail::TotalBytes)));
     }
 }

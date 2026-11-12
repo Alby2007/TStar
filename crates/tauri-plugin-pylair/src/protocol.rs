@@ -31,6 +31,8 @@ pub const PROTOCOL_VIOLATION: i64 = -32032;
 /// In-flight call killed by a dev-mode hot reload — not a crash; the UI
 /// can present it as "restarting" rather than an error.
 pub const RUNTIME_RESTARTED: i64 = -32033;
+/// A configured limit was hit — `data.limit` names it (RC.8A).
+pub const LIMIT_EXCEEDED: i64 = -32040;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorObj {

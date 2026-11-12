@@ -167,6 +167,25 @@ def test_cancel_stream(runtime):
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
 
 
+def test_cancel_before_registration_still_terminates(runtime):
+    """A cancel that lands BEFORE its call (control frames can overtake
+    the data lane) is held in _pending_cancels and applied at
+    registration. A task cancelled before its first step never enters a
+    handler — without the finisher the call's terminal would be lost.
+    RC.8B found this exact hang."""
+    runtime.recv()
+    # cancel first, call second — both queued in the same pipe order.
+    runtime.send(proto.request(9, "cancel", {"task": 9}))
+    runtime.send(call(3, "sleep_forever", task=9))
+    # The cancel ack reports not-found (the task didn't exist yet)...
+    ack = runtime.recv_until(lambda m: m.get("id") == 9)
+    assert ack["result"]["cancelled"] is False
+    # ...but the call's terminal must still arrive, and it must be the
+    # cancelled outcome — never a hang or a completed result.
+    terminal = runtime.recv_until(lambda m: m.get("id") == 3)
+    assert terminal["error"]["code"] == proto.TASK_CANCELLED
+
+
 def test_isolated_call(runtime):
     runtime.recv()
     runtime.send(call(1, "isolated_add", task=1, input={"a": 4, "b": 5}))
@@ -292,3 +311,32 @@ def test_oversized_frame_rejected():
     # runtime should exit (violation -> EOF path), not hang waiting for 64 MiB
     rc = proc.wait(timeout=10)
     assert rc is not None
+
+
+def test_shutdown_emits_ack_and_task_terminals(runtime):
+    """Shutdown while a stream is live: the ack AND a TASK_CANCELLED for the
+    task must both reach the wire before the process exits. Regression: the
+    drain used to close the frame fd before the writer thread flushed, and
+    cancel_all never gave the terminal-emitting finishers a loop turn —
+    every final frame was silently dropped."""
+    runtime.recv()  # hello
+    runtime.send(call(1, "infinite_counted", task=7))
+    runtime.send(proto.request(2, "shutdown", None))
+
+    msgs = []
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            msgs.append(runtime.recv(timeout=max(0.1, deadline - time.time())))
+        except queue.Empty:
+            break
+        if "__io_error__" in msgs[-1]:
+            break
+    runtime.proc.wait(timeout=10)
+
+    by_id = {m.get("id"): m for m in msgs if "id" in m}
+    assert by_id[2].get("result") == {}, "shutdown ack missing or wrong"
+    err = by_id[1].get("error") or {}
+    assert err.get("code") == proto.TASK_CANCELLED, (
+        f"stream terminal across shutdown was {msgs!r}"
+    )

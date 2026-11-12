@@ -326,6 +326,16 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 | -32030 | RUNTIME_UNAVAILABLE | host-side: not `ready`, restarting, or dead |
 | -32031 | RUNTIME_CRASHED | process died mid-call |
 | -32032 | PROTOCOL_VIOLATION | garbage on frame fd / bad hello / credit overrun |
+| -32033 | RUNTIME_RESTARTED | in-flight call killed by a dev-mode hot reload |
+| -32040 | LIMIT_EXCEEDED | a configured resource limit was hit |
+
+`LIMIT_EXCEEDED` errors carry `data: {"limit": "<name>", "max": <n>}`
+naming which cap fired — e.g. `"max_concurrent_tasks"`,
+`"stream_buffer_bytes"`, `"max_stream_credit"`, `"max_frame"`. Clients
+surface it as `LimitExceededError` with `.limit`/`.max`. Limits are
+enforced per runtime (not per window) on the supervisor's `Limits`
+config; defaults are env-overridable via `PYLAIR_MAX_*` and the
+effective set is logged at startup.
 
 ## 9. Concurrency and ordering
 

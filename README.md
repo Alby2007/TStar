@@ -89,6 +89,19 @@ integration → `M6` reference app + RC.
   that stay in the group die with it (SIGTERM-ignoring grandchildren
   included), but a child that deliberately detaches — `setsid`, a new
   process group, a double-fork daemon — escapes the group kill.
+- **Resource limits are per runtime, not per window.** Concurrent tasks,
+  streams, queued commands, buffered stream bytes (per-stream and total),
+  outstanding stream credit, isolated workers and frame size are all
+  bounded (`Limits` on `SupervisorConfig`, `PYLAIR_MAX_*` env overrides;
+  effective values are logged at startup). A webview that floods the
+  bridge can starve every other window — limits exist to keep one
+  runtime's failure bounded and explicit, not to guarantee fairness
+  between windows. On a hit the call/stream fails with
+  `LIMIT_EXCEEDED` (`-32040`), surfaced in JS as `LimitExceededError`
+  with `.limit` naming the cap. If the host itself stops draining, the
+  Python outbound queue fills, the runtime logs `outbound queue full —
+  host not draining` and exits rather than growing without bound —
+  callers see `RUNTIME_CRASHED`, not a silent hang.
 - **Ints beyond ±2^53 can't cross the bridge.** The call fails with
   `INTERNAL: integer … exceeds the JSON safe-integer range` — an
   explicit error rather than a silently rounded value. Return large

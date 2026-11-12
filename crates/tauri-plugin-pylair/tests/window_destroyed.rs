@@ -71,22 +71,22 @@ fn spec(script: &str) -> SpawnSpec {
 }
 
 fn config() -> SupervisorConfig {
-    SupervisorConfig {
-        hello_timeout: Duration::from_secs(5),
-        ping_interval: Duration::from_millis(150),
-        missed_pongs_to_kill: 30,
-        backoff_base: Duration::from_millis(50),
-        backoff_cap: Duration::from_millis(200),
-        breaker_crashes: 5,
-        breaker_window: Duration::from_secs(60),
-        shutdown_grace: Duration::from_secs(2),
-        initial_stream_credit: 8,
-        stream_buffer: 256,
-        loop_stall_kill: None,
-        cancel_timeout: Duration::from_secs(5),
-        max_frame: proto::max_frame(),
-        restart_trigger: None,
-    }
+    let mut c = SupervisorConfig::default();
+    c.hello_timeout = Duration::from_secs(5);
+    c.ping_interval = Duration::from_millis(150);
+    c.missed_pongs_to_kill = 30;
+    c.backoff_base = Duration::from_millis(50);
+    c.backoff_cap = Duration::from_millis(200);
+    c.breaker_crashes = 5;
+    c.breaker_window = Duration::from_secs(60);
+    c.shutdown_grace = Duration::from_secs(2);
+    c.initial_stream_credit = 8;
+    c.stream_buffer = 256;
+    c.loop_stall_kill = None;
+    c.cancel_timeout = Duration::from_secs(5);
+    c.max_frame = proto::max_frame();
+    c.restart_trigger = None;
+    c
 }
 
 async fn wait_ready(h: &Handle) {

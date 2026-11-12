@@ -15,6 +15,14 @@ from pylair import _protocol as proto
 
 ISOLATED_GRACE_S = 3.0
 
+# RC.8A ceilings — the host enforces these on the way in; the runtime
+# clamps defensively so a host bug can't grow them without bound.
+MAX_STREAM_CREDIT = int(os.environ.get("PYLAIR_MAX_STREAM_CREDIT", "4096"))
+MAX_ISOLATED_WORKERS = int(os.environ.get("PYLAIR_MAX_ISOLATED_WORKERS", "8"))
+# One chunk frame can never legitimately exceed the frame cap; a value
+# this large ends the stream with a typed error instead (RC.8A).
+from pylair._transport import MAX_FRAME
+
 
 def _log(msg: str) -> None:
     print(f"[pylair] {msg}", file=sys.stderr, flush=True)
@@ -42,6 +50,7 @@ class TaskRegistry:
         # hold cancels/credit for not-yet-known ids and apply them at start.
         self._pending_cancels: set[int | str] = set()
         self._pending_credit: dict[int | str, int] = {}
+        self._isolated = 0
 
     def get(self, task_id: int | str) -> Task | None:
         return self._tasks.get(task_id)
@@ -58,8 +67,22 @@ class TaskRegistry:
         fn: Callable[..., Any],
         input: dict,
     ) -> None:
+        if kind == "isolated" and self._isolated >= MAX_ISOLATED_WORKERS:
+            # Worker processes are the heaviest resource — refuse past the
+            # cap with the typed error, don't queue (RC.8A).
+            self._send(
+                proto.error_response(
+                    call_id,
+                    proto.LIMIT_EXCEEDED,
+                    f"isolated worker cap {MAX_ISOLATED_WORKERS} reached",
+                    {"limit": "max_isolated_workers", "max": MAX_ISOLATED_WORKERS},
+                )
+            )
+            return
         task = Task(id=task_id, fn_name=fn_name, kind=kind, call_id=call_id)
         self._tasks[task_id] = task
+        if kind == "isolated":
+            self._isolated += 1
 
         if kind == "generator":
             # Credit is owned by the HOST: it grants the initial window right
@@ -85,6 +108,10 @@ class TaskRegistry:
             self._pending_cancels.discard(task_id)
             if task.asyncio_task is not None and not task.asyncio_task.done():
                 task.asyncio_task.cancel()
+                # Same guarantee as cancel(): a task cancelled before its
+                # first step never enters a handler, so nothing would emit
+                # TASK_CANCELLED — the call's terminal would be lost.
+                asyncio.create_task(self._ensure_terminal(task))
 
     # ---- execution modes -------------------------------------------------
 
@@ -140,6 +167,20 @@ class TaskRegistry:
                 await self._wait_for_credit(task)
                 value = await agen.__anext__()
                 task.credit -= 1
+                # A chunk over the frame cap would be rejected by the host
+                # reader and kill the runtime — end THIS stream with the
+                # typed error instead (RC.8A).
+                if len(_json.dumps(value).encode()) + 256 > MAX_FRAME:
+                    self._finish(
+                        task,
+                        proto.error_response(
+                            task.call_id,
+                            proto.LIMIT_EXCEEDED,
+                            "stream chunk exceeds the frame cap",
+                            {"limit": "max_frame", "max": MAX_FRAME},
+                        ),
+                    )
+                    return
                 self._send(
                     proto.notification(
                         "stream.chunk",
@@ -275,9 +316,13 @@ class TaskRegistry:
             # Credit that outran its call: hold it for registration instead
             # of losing it (control lane is independent of the data lane).
             if len(self._pending_credit) < 4096:
-                self._pending_credit[task_id] = self._pending_credit.get(task_id, 0) + n
+                self._pending_credit[task_id] = min(
+                    self._pending_credit.get(task_id, 0) + n, MAX_STREAM_CREDIT
+                )
             return False
-        task.credit += n
+        # Defensive clamp (RC.8A): the host enforces the outstanding-credit
+        # cap on grants; the runtime never lets it grow past the ceiling.
+        task.credit = min(task.credit + n, MAX_STREAM_CREDIT)
         task.credit_event.set()
         return True
 
@@ -339,11 +384,34 @@ class TaskRegistry:
         for task in self._tasks.values():
             if not task.done:
                 await self.cancel(task.id)
+        # cancel() only SCHEDULES the terminal-emitting finisher. On
+        # shutdown the loop closes right after this returns, so wait for
+        # the cancelled tasks to end — the finishers emit TASK_CANCELLED
+        # while the writer thread is still alive to carry them.
+        waiters = [
+            t.asyncio_task
+            for t in self._tasks.values()
+            if t.asyncio_task is not None and not t.asyncio_task.done()
+        ]
+        try:
+            if waiters:
+                await asyncio.wait(waiters)
+        finally:
+            for task in self._tasks.values():
+                if not task.done:
+                    self._finish(
+                        task,
+                        proto.error_response(
+                            task.call_id, proto.TASK_CANCELLED, "task cancelled"
+                        ),
+                    )
 
     def _finish(self, task: Task, terminal: dict) -> None:
         if task.done:
             return  # a cancelled task's late result is discarded
         task.done = True
+        if task.kind == "isolated":
+            self._isolated -= 1
         try:
             self._send(terminal)  # serializes on the event loop
         except (TypeError, ValueError) as e:
