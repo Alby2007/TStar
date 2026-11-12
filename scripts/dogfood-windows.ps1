@@ -115,20 +115,18 @@ function Start-App([string]$Exe, [string]$Tag, [string]$LogDir) {
     Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
     # Raw ProcessStartInfo, not Start-Process -Redirect*: the cmdlet's
     # redirect path leaves Process.ExitCode EMPTY on Windows PowerShell
-    # 5.1 (measured). Task threads drain both pipes into the log files so
-    # the child can never block on a full 64KB pipe buffer.
+    # 5.1 (measured). ReadToEndAsync drains the pipes on .NET threads so
+    # the child never blocks — a PS scriptblock on a Task thread has no
+    # runspace and throws on pwsh 7 (found by CI).
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $p = [System.Diagnostics.Process]::Start($psi)
-    $outReader = [System.Threading.Tasks.Task]::Run([System.Action]{
-        [IO.File]::WriteAllText($out, $p.StandardOutput.ReadToEnd()) })
-    $errReader = [System.Threading.Tasks.Task]::Run([System.Action]{
-        [IO.File]::WriteAllText($err, $p.StandardError.ReadToEnd()) })
     return @{ Proc = $p; Err = $err; Out = $out
-              ErrReader = $errReader; OutReader = $outReader }
+              OutTask = $p.StandardOutput.ReadToEndAsync()
+              ErrTask = $p.StandardError.ReadToEndAsync() }
 }
 
 # -- phase resolution ----------------------------------------------------
@@ -229,8 +227,10 @@ try {
             $code = try { $a.Proc.ExitCode } catch { 'unreadable' }
             Stop-InstallDirProcs $InstallDir
             $clean = Wait-NoSurvivors $InstallDir $SurvivorTimeoutSec
-            [void]$a.ErrReader.Wait(5000)
-            $stderr = Get-Content $a.Err -Raw -ErrorAction SilentlyContinue
+            # ErrTask completes once every handle holder is dead — read
+            # it only after the survivors poll so it can't block.
+            $stderr = $a.ErrTask.GetAwaiter().GetResult()
+            [IO.File]::WriteAllText($a.Err, $stderr)
             $panicked = $stderr -match 'panicked'
             if ($closed -and $code -eq 0 -and -not $panicked -and $clean) {
                 Add-Result 'A clean-close' 'PASS' "exit 0, no panic, no survivors"
