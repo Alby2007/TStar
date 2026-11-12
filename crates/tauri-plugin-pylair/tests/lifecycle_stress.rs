@@ -103,13 +103,15 @@ async fn wait_ready(h: &Handle) {
 }
 
 /// Drain until the terminal arrives; return its exact result.
-async fn terminal(rx: &mut tauri_plugin_pylair::supervisor::StreamRx, gen: usize) -> Result<serde_json::Value, tauri_plugin_pylair::protocol::ErrorObj> {
+async fn terminal(
+    rx: &mut tauri_plugin_pylair::supervisor::StreamRx,
+    gen: usize,
+) -> Result<serde_json::Value, tauri_plugin_pylair::protocol::ErrorObj> {
     let mut n = 0;
     loop {
-        match timeout(T, rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("gen {gen}: stream never produced a terminal ({n} chunks drained)"))
-        {
+        match timeout(T, rx.recv()).await.unwrap_or_else(|_| {
+            panic!("gen {gen}: stream never produced a terminal ({n} chunks drained)")
+        }) {
             Some(StreamItem::End(r)) => return r,
             Some(StreamItem::Chunk { .. }) => {
                 n += 1;
@@ -161,7 +163,10 @@ async fn two_hundred_window_generations_no_leaks_no_stale_events() {
             .unwrap_or_else(|_| panic!("gen {gen}: new stream produced nothing"))
         {
             Some(StreamItem::Chunk { seq, value }) => {
-                assert_eq!(seq, 0, "gen {gen}: first chunk seq {seq}, not 0 — stale event");
+                assert_eq!(
+                    seq, 0,
+                    "gen {gen}: first chunk seq {seq}, not 0 — stale event"
+                );
                 assert_eq!(value, json!(0), "gen {gen}: first chunk value not fresh");
             }
             Some(StreamItem::End(r)) => {

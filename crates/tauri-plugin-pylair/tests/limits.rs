@@ -15,7 +15,11 @@ use tokio::time::{sleep, timeout};
 
 const T: Duration = Duration::from_secs(20);
 
-fn spawn_h(spec: SpawnSpec, config: SupervisorConfig, events: mpsc::Sender<RuntimeEvent>) -> Handle {
+fn spawn_h(
+    spec: SpawnSpec,
+    config: SupervisorConfig,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> Handle {
     let (h, actor) = spawn(spec, config, events);
     tokio::spawn(actor);
     h
@@ -150,7 +154,10 @@ async fn task_cap_rejects_then_recovers() {
     let t1 = timeout(T, ct1.task).await.unwrap().unwrap();
     let t2 = timeout(T, ct2.task).await.unwrap().unwrap();
 
-    let err = h.call("add", json!({"a": 1, "b": 2}), None).await.unwrap_err();
+    let err = h
+        .call("add", json!({"a": 1, "b": 2}), None)
+        .await
+        .unwrap_err();
     assert_limit(&err, "max_concurrent_tasks");
 
     // Drain: cancel one task. Awaiting the cancelled task's own terminal
@@ -176,7 +183,11 @@ async fn stream_cap_rejects_second_stream() {
     wait_state(&h, State::Ready).await;
 
     let (task, mut items) = h.call_stream("infinite", json!({}), None).await.unwrap();
-    let err = h.call_stream("infinite", json!({}), None).await.err().unwrap();
+    let err = h
+        .call_stream("infinite", json!({}), None)
+        .await
+        .err()
+        .unwrap();
     assert_limit(&err, "max_concurrent_streams");
 
     // The first stream is unaffected and still produces.
@@ -294,7 +305,10 @@ async fn per_stream_byte_cap_ends_stream_with_limit_error() {
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    let (task, mut items) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
+    let (task, mut items) = h
+        .call_stream("infinite_counted", json!({}), None)
+        .await
+        .unwrap();
     // Don't drain while the flood accumulates — every recv releases a
     // byte lease, so draining first would hide the cap. The diagnostic
     // fires exactly when the cap trips.
@@ -337,9 +351,18 @@ async fn total_byte_cap_trips_across_streams() {
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    let (_t1, mut s1) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
-    let (_t2, mut s2) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
-    let (_t3, mut s3) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
+    let (_t1, mut s1) = h
+        .call_stream("infinite_counted", json!({}), None)
+        .await
+        .unwrap();
+    let (_t2, mut s2) = h
+        .call_stream("infinite_counted", json!({}), None)
+        .await
+        .unwrap();
+    let (_t3, mut s3) = h
+        .call_stream("infinite_counted", json!({}), None)
+        .await
+        .unwrap();
     // Don't drain before the trip — the diagnostic fires exactly then.
     wait_for_diag(&mut rx, "over the shared byte cap").await;
     // Whichever stream's chunk pushes the shared total over the cap gets
@@ -377,7 +400,10 @@ async fn oversized_call_fails_limit_not_runtime() {
     // A call whose serialized frame exceeds max_frame must fail THIS call
     // with LIMIT_EXCEEDED — not trip the peer's read cap and kill the runtime.
     let big = "x".repeat(4 * 1024);
-    let err = h.call("echo", json!({"input": big}), None).await.unwrap_err();
+    let err = h
+        .call("echo", json!({"input": big}), None)
+        .await
+        .unwrap_err();
     assert_limit(&err, "max_frame");
 
     // Runtime survived: normal calls still work.
@@ -425,7 +451,8 @@ async fn isolated_worker_cap_is_typed_error() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
     let cfg = fast_config();
     let mut spec = real_runtime_spec();
-    spec.env.push(("PYLAIR_MAX_ISOLATED_WORKERS".into(), "2".into()));
+    spec.env
+        .push(("PYLAIR_MAX_ISOLATED_WORKERS".into(), "2".into()));
     let h = spawn_h(spec, cfg, ev);
     wait_state(&h, State::Ready).await;
 
@@ -434,10 +461,7 @@ async fn isolated_worker_cap_is_typed_error() {
     let r2 = h.call("isolated_sleep", json!({"seconds": 3.0}), None);
     let r3 = h.call("isolated_sleep", json!({"seconds": 3.0}), None);
     let (r1, r2, r3) = tokio::join!(r1, r2, r3);
-    let errs: Vec<_> = [r1, r2, r3]
-        .into_iter()
-        .filter_map(|r| r.err())
-        .collect();
+    let errs: Vec<_> = [r1, r2, r3].into_iter().filter_map(|r| r.err()).collect();
     assert_eq!(errs.len(), 1, "exactly one call must be refused: {errs:?}");
     assert_limit(&errs[0], "max_isolated_workers");
     h.shutdown().await;
@@ -455,7 +479,10 @@ async fn byte_capped_stream_bounds_memory_under_flood() {
     let h = spawn_h(real_runtime_spec(), cfg, ev);
     wait_state(&h, State::Ready).await;
 
-    let (_task, mut items) = h.call_stream("infinite_counted", json!({}), None).await.unwrap();
+    let (_task, mut items) = h
+        .call_stream("infinite_counted", json!({}), None)
+        .await
+        .unwrap();
     // The flood runs >1s with no consumer; buffered bytes stay <= 4KiB
     // (the producer is cancelled at the cap, so the flood STOPS — that's
     // the bound). Then confirm the supervisor is still healthy.

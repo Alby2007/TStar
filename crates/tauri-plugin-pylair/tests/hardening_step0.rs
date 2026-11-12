@@ -296,9 +296,7 @@ async fn cancel_not_dropped_when_frame_queue_full() {
                 let tx = full_tx.clone();
                 tokio::spawn(async move {
                     if let Ok(Err(e)) = ct.result.await {
-                        if e.code == proto::RUNTIME_CRASHED
-                            || e.code == proto::LIMIT_EXCEEDED
-                        {
+                        if e.code == proto::RUNTIME_CRASHED || e.code == proto::LIMIT_EXCEEDED {
                             let _ = tx.send(()).await;
                         }
                     }

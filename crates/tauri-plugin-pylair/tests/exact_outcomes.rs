@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tauri_plugin_pylair::protocol as proto;
 use tauri_plugin_pylair::supervisor::{
-    spawn, CancelOutcome, Handle, RuntimeEvent, ShutdownOutcome, SpawnSpec, State,
-    StreamItem, SupervisorConfig,
+    spawn, CancelOutcome, Handle, RuntimeEvent, ShutdownOutcome, SpawnSpec, State, StreamItem,
+    SupervisorConfig,
 };
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -53,7 +53,9 @@ fn real_runtime_spec() -> SpawnSpec {
         args: vec!["-m".into(), "pylair".into(), "testapp".into()],
         env: vec![(
             "PYTHONPATH".into(),
-            root.join("python/pylair/src").to_string_lossy().into_owned(),
+            root.join("python/pylair/src")
+                .to_string_lossy()
+                .into_owned(),
         )],
         cwd: Some(root.join("python/pylair/tests")),
         ..Default::default()
@@ -221,7 +223,10 @@ async fn cancel_after_pipe_dies_is_delivery_failed() {
     // can't hear us) — a forced kill, reported as such.
     let out = timeout(T, h.shutdown()).await.expect("shutdown timed out");
     assert!(
-        matches!(out, ShutdownOutcome::ForcedKill | ShutdownOutcome::Terminated),
+        matches!(
+            out,
+            ShutdownOutcome::ForcedKill | ShutdownOutcome::Terminated
+        ),
         "shutdown on a dead-pipe child reported {out:?}"
     );
 }
@@ -287,7 +292,9 @@ async fn cancel_while_python_loop_blocked_is_wedged_error() {
 
     // block_loop runs time.sleep INSIDE the async def — the event loop
     // stops dispatching but the reader thread keeps answering pings.
-    let ct = h.call_task("block_loop", json!({"seconds": 30}), None).unwrap();
+    let ct = h
+        .call_task("block_loop", json!({"seconds": 30}), None)
+        .unwrap();
     let task = timeout(T, ct.task).await.unwrap().unwrap();
     sleep(Duration::from_millis(300)).await; // let the block actually start
 

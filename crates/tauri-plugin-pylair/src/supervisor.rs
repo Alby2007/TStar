@@ -111,11 +111,17 @@ pub struct Limits {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 impl Default for Limits {
@@ -147,12 +153,42 @@ impl Limits {
                 *v = (*v).clamp(lo, hi);
             }
         };
-        clamp(&mut self.max_concurrent_tasks, "max_concurrent_tasks", 1, 100_000);
-        clamp(&mut self.max_concurrent_streams, "max_concurrent_streams", 1, 100_000);
-        clamp(&mut self.stream_buffer_bytes, "stream_buffer_bytes", 1024, 1 << 30);
-        clamp(&mut self.stream_buffer_bytes_total, "stream_buffer_bytes_total", 1024, 8 << 30);
-        clamp(&mut self.max_queued_commands, "max_queued_commands", 1, 10_000);
-        clamp(&mut self.max_isolated_workers, "max_isolated_workers", 0, 1024);
+        clamp(
+            &mut self.max_concurrent_tasks,
+            "max_concurrent_tasks",
+            1,
+            100_000,
+        );
+        clamp(
+            &mut self.max_concurrent_streams,
+            "max_concurrent_streams",
+            1,
+            100_000,
+        );
+        clamp(
+            &mut self.stream_buffer_bytes,
+            "stream_buffer_bytes",
+            1024,
+            1 << 30,
+        );
+        clamp(
+            &mut self.stream_buffer_bytes_total,
+            "stream_buffer_bytes_total",
+            1024,
+            8 << 30,
+        );
+        clamp(
+            &mut self.max_queued_commands,
+            "max_queued_commands",
+            1,
+            10_000,
+        );
+        clamp(
+            &mut self.max_isolated_workers,
+            "max_isolated_workers",
+            0,
+            1024,
+        );
         if self.max_stream_credit < 1 || self.max_stream_credit > 1_000_000 {
             warns.push(format!(
                 "max_stream_credit={} outside 1..=1000000 — clamped",
@@ -171,13 +207,34 @@ impl Limits {
         (self, warns)
     }
 
-    pub fn with_max_concurrent_tasks(mut self, v: usize) -> Self { self.max_concurrent_tasks = v; self }
-    pub fn with_max_concurrent_streams(mut self, v: usize) -> Self { self.max_concurrent_streams = v; self }
-    pub fn with_stream_buffer_bytes(mut self, v: usize) -> Self { self.stream_buffer_bytes = v; self }
-    pub fn with_stream_buffer_bytes_total(mut self, v: usize) -> Self { self.stream_buffer_bytes_total = v; self }
-    pub fn with_max_stream_credit(mut self, v: u64) -> Self { self.max_stream_credit = v; self }
-    pub fn with_max_queued_commands(mut self, v: usize) -> Self { self.max_queued_commands = v; self }
-    pub fn with_max_isolated_workers(mut self, v: usize) -> Self { self.max_isolated_workers = v; self }
+    pub fn with_max_concurrent_tasks(mut self, v: usize) -> Self {
+        self.max_concurrent_tasks = v;
+        self
+    }
+    pub fn with_max_concurrent_streams(mut self, v: usize) -> Self {
+        self.max_concurrent_streams = v;
+        self
+    }
+    pub fn with_stream_buffer_bytes(mut self, v: usize) -> Self {
+        self.stream_buffer_bytes = v;
+        self
+    }
+    pub fn with_stream_buffer_bytes_total(mut self, v: usize) -> Self {
+        self.stream_buffer_bytes_total = v;
+        self
+    }
+    pub fn with_max_stream_credit(mut self, v: u64) -> Self {
+        self.max_stream_credit = v;
+        self
+    }
+    pub fn with_max_queued_commands(mut self, v: usize) -> Self {
+        self.max_queued_commands = v;
+        self
+    }
+    pub fn with_max_isolated_workers(mut self, v: usize) -> Self {
+        self.max_isolated_workers = v;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -637,12 +694,10 @@ impl Handle {
 
     /// Retry after a Failed state — respawns the runtime fresh.
     pub async fn retry(&self) -> Result<(), ErrorObj> {
-        self.cmd
-            .try_send(Command::Retry)
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => self.queue_err(),
-                mpsc::error::TrySendError::Closed(_) => stopped_err(),
-            })
+        self.cmd.try_send(Command::Retry).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => self.queue_err(),
+            mpsc::error::TrySendError::Closed(_) => stopped_err(),
+        })
     }
 
     /// Ask the supervisor to cancel `task` as `caller`. Resolves to a
@@ -1482,11 +1537,7 @@ impl Supervisor {
 
 /// A streaming call refused before dispatch: the typed error reaches both
 /// the task-id waiter and the stream's terminal (RC.8A).
-fn reject_stream(
-    items: StreamSink,
-    task_out: oneshot::Sender<Result<u64, ErrorObj>>,
-    e: ErrorObj,
-) {
+fn reject_stream(items: StreamSink, task_out: oneshot::Sender<Result<u64, ErrorObj>>, e: ErrorObj) {
     let _ = task_out.send(Err(e.clone()));
     items.finish(Err(e));
 }
@@ -1531,10 +1582,7 @@ enum SendFail {
 fn send_frame(io: &ChildIo, body: &Value, max_frame: usize) -> Result<(), SendFail> {
     match serde_json::to_vec(body) {
         Ok(bytes) if bytes.len() > max_frame => Err(SendFail::Oversize(bytes.len())),
-        Ok(bytes) => io
-            .frame_out
-            .try_send(bytes)
-            .map_err(|_| SendFail::LaneFull),
+        Ok(bytes) => io.frame_out.try_send(bytes).map_err(|_| SendFail::LaneFull),
         Err(_) => Err(SendFail::LaneFull),
     }
 }
