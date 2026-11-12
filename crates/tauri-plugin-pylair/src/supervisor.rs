@@ -1698,10 +1698,19 @@ fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
         cmd.env_remove(k);
     }
     cmd.envs(spec.env.iter().cloned());
+    // The classic fork/prctl race: if the whole process dies between the
+    // fork and the child's PR_SET_PDEATHSIG, the child is reparented before
+    // the flag exists and the signal would never fire — a permanent orphan.
+    // Mirror the isolated worker's check: verify getppid() still names the
+    // process we forked from; if it changed, abort the exec and fail spawn.
+    let expected_ppid = std::process::id() as libc::pid_t;
     unsafe {
-        cmd.as_std_mut().pre_exec(|| {
+        cmd.as_std_mut().pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != expected_ppid {
+                return Err(io::Error::other("reparented before pdeathsig — aborting"));
             }
             Ok(())
         });
