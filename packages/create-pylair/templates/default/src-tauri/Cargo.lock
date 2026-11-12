@@ -750,9 +750,9 @@ dependencies = [
 
 [[package]]
 name = "errno"
-version = "0.3.14"
+version = "0.3.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -3324,9 +3324,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-pylair"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dddbcdb80cc85f4973e50c32c680791afed510a15faaaf8b573b2c050ab80f3"
+checksum = "bd554d2d6b30756a4aa53a6ad4e5edf3bef863416db89bdb7c3ee6c9a5a61f57"
 dependencies = [
  "async-trait",
  "dunce",
