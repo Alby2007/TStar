@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, rc8-hardening]
+    branches: [main]
   pull_request:
 
 concurrency:
