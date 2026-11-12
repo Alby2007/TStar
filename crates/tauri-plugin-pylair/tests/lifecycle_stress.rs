@@ -139,16 +139,17 @@ async fn two_hundred_window_generations_no_leaks_no_stale_events() {
         // Destroy: the sweep must resolve the task's stream with an
         // explicit outcome — cancelled, or its own result if it finished.
         h.cancel_owner(label.clone()).await;
-        match terminal(&mut rx, gen).await {
-            Err(e) => assert_eq!(
+        // Ok means the task finished before the destroy — explicitly
+        // reported too.
+        if let Err(e) = terminal(&mut rx, gen).await {
+            assert_eq!(
                 e.code,
                 proto::TASK_CANCELLED,
                 "gen {gen}: task {task} ended with {} ({}), not an explicit \
                  cancellation",
                 e.code,
                 e.message
-            ),
-            Ok(_) => {} // finished before the destroy — explicitly reported
+            );
         }
 
         // New window, SAME label: its stream must be a clean generation —
@@ -178,15 +179,14 @@ async fn two_hundred_window_generations_no_leaks_no_stale_events() {
         // This generation is destroyed too — the next iteration is a new
         // window again.
         h.cancel_owner(label.clone()).await;
-        match terminal(&mut rx2, gen).await {
-            Err(e) => assert_eq!(
+        if let Err(e) = terminal(&mut rx2, gen).await {
+            assert_eq!(
                 e.code,
                 proto::TASK_CANCELLED,
                 "gen {gen}: successor task {task2} ended with {} ({})",
                 e.code,
                 e.message
-            ),
-            Ok(_) => {}
+            );
         }
     }
     h.shutdown().await;
