@@ -185,6 +185,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "window-close self-test exit $LASTEXITCODE"; exit 1 }
           $env:PYLAIR_SELF_TEST_WINDOW_CLOSE = $null
 
+      - name: Dogfood lifecycle (Windows — close, kill, restart)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Get-ChildItem "$env:LOCALAPPDATA","$env:ProgramFiles","${env:ProgramFiles(x86)}" `
+                -Recurse -Filter 'app-under-test.exe' -Depth 4 -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+          if (-not $exe) { Write-Error 'installed app-under-test.exe not found'; exit 1 }
+          & "$env:GITHUB_WORKSPACE\scripts\dogfood-windows.ps1" `
+                -ExePath $exe.FullName -InstallDir (Split-Path $exe.FullName -Parent)
+          if ($LASTEXITCODE -ne 0) { Write-Error "dogfood exit $LASTEXITCODE"; exit 1 }
+
       - name: Self-test installed app (macOS, isolated .app, scrubbed env)
         if: runner.os == 'macOS'
         working-directory: app-under-test

@@ -6,6 +6,10 @@
 //! PYLAIR_SELF_TEST_WINDOW_CLOSE: open the window, close it after a beat —
 //! exercises WindowEvent::Destroyed on the main thread (the rc.3 crash
 //! path) and exits 0 only if teardown stays panic-free.
+//!
+//! Lifecycle tests (scripts/dogfood-windows.ps1) need no runtime-start
+//! hook: the plugin spawns the Python child eagerly in setup(), so
+//! polling for python under the install dir is the positive control.
 
 use tauri::Manager;
 use tauri_plugin_pylair::{app_spawn_spec, self_test_gui, self_test_headless, self_test_requested};
