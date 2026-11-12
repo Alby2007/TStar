@@ -101,6 +101,17 @@ pylair prints a loud warning — unsigned apps trigger Gatekeeper on macOS
 and SmartScreen on Windows, which is correct and intended: users should
 see that warning until real signing is configured.
 
+On macOS, `pylair build` still re-signs the bundle **ad-hoc** when no
+identity is configured — every Mach-O binary inside the `.app` (the
+vendored CPython tree included), verified with
+`codesign --verify --deep --strict` before the build returns. Tauri's
+own output leaves only a linker stub signature on the main binary,
+which is the worse state for Gatekeeper. Ad-hoc signing does **not**
+remove the warning — a downloaded `.app` still needs
+right-click → **Open**, or `xattr -dr com.apple.quarantine <app>` — it
+makes the signature self-consistent so the verdict is a plain warning,
+not an "is damaged" refusal.
+
 Signing credentials are read from environment variables, never config
 files (secrets don't belong in VCS):
 

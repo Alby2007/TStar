@@ -7,12 +7,15 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  closeSync,
   cpSync,
   createWriteStream,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -153,6 +156,67 @@ function run(cmd: string, args: string[], cwd: string) {
   const r = spawnSync(cmd, args, { cwd, stdio: "inherit" });
   if (r.error) throw new Error(`${cmd} ${args.join(" ")} failed to start: ${r.error.message}`);
   if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")} exited ${r.status}`);
+}
+
+// ── macOS ad-hoc signing ──────────────────────────────────────────────
+// Mach-O magic numbers, read as the first BE u32 — includes the
+// byte-swapped forms and both fat headers.
+const MACHO_MAGIC = new Set([
+  0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe,
+  0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca,
+]);
+
+function isMachO(p: string): boolean {
+  const fd = openSync(p, "r");
+  try {
+    const b = Buffer.alloc(4);
+    return readSync(fd, b, 0, 4, 0) === 4 && MACHO_MAGIC.has(b.readUInt32BE(0));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Re-sign a built .app ad-hoc and REQUIRE it to verify. With no signing
+ * identity Tauri ships only the linker's ad-hoc stub on the main binary —
+ * a signature that doesn't cover the bundle is the worst state for
+ * Gatekeeper ("is damaged"), worse than none at all. Signs every Mach-O
+ * nested-first rather than `codesign --deep`, which is documented to miss
+ * binaries in layouts it doesn't model — a vendored CPython tree is
+ * exactly that. Verify with --deep --strict; if it fails, the build
+ * fails — a broken signature must not ship silently.
+ */
+function adHocSign(tauriDir: string): void {
+  const bundleDir = join(tauriDir, "target", "release", "bundle", "macos");
+  if (!existsSync(bundleDir)) return; // --bundles skipped app — nothing to sign
+  const app = readdirSync(bundleDir).find((n) => n.endsWith(".app"));
+  if (!app) return;
+  const appPath = join(bundleDir, app);
+
+  const machos: string[] = [];
+  const walk = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      // Dirent types describe the link, not the target — symlinked files
+      // and dirs are skipped; the real binary is signed in place.
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && isMachO(p)) machos.push(p);
+    }
+  };
+  walk(appPath);
+  // Deepest first — a parent's signature seals its children, so children
+  // must be final when the parent is written.
+  machos.sort((a, b) => b.split("/").length - a.split("/").length);
+  for (const p of machos) run("codesign", ["--force", "--sign", "-", p], appPath);
+  run("codesign", ["--force", "--sign", "-", appPath], bundleDir);
+
+  const v = spawnSync(
+    "codesign",
+    ["--verify", "--deep", "--strict", appPath],
+    { encoding: "utf-8" },
+  );
+  if (v.status !== 0)
+    throw new Error(`ad-hoc signing produced an invalid bundle:\n${v.stderr}`);
+  console.log(`ad-hoc signed ${app} — ${machos.length} nested binaries, codesign --verify clean`);
 }
 
 /** Shipped bundles must carry the licenses of what they embed. Collects:
@@ -332,6 +396,9 @@ export async function build(opts: BuildOptions): Promise<void> {
     process.env.WINDOWS_CERTIFICATE_THUMBPRINT
   );
   run(process.execPath, [tauriCliEntry(appDir), "build", ...(opts.tauriArgs ?? [])], appDir);
+  // Unsigned macOS builds get a full-bundle ad-hoc signature — better
+  // than the linker stub Tauri leaves on just the main binary.
+  if (platform() === "darwin" && !hasSigning) adHocSign(tauriDir);
   if (!hasSigning) {
     console.warn(`
 ╔══════════════════════════════════════════════════════════════════╗

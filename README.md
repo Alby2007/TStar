@@ -102,7 +102,11 @@ See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 Installers produced by `pylair build` are **unsigned** unless you configure
 code signing — expect Gatekeeper (macOS) and SmartScreen (Windows)
-warnings on unsigned builds. A first build downloads the bundled Python
+warnings on unsigned builds. On macOS the bundle is ad-hoc signed only:
+to open a downloaded build, right-click the app and choose **Open**, or
+run `xattr -dr com.apple.quarantine <app>`. This route is documented from
+the security model — it has not been verified on a physical Mac yet.
+A first build downloads the bundled Python
 runtime and Tauri's installer toolchain (WiX/NSIS on Windows) from
 GitHub, so it needs network access once; later builds reuse the caches.
 See [docs/build.md](docs/build.md).
