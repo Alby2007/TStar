@@ -15,7 +15,7 @@ Release candidate. `pylair` and `pylair-ollama` are on PyPI,
 Install RCs with **exact pins**, not `--pre`:
 
 ```sh
-pip install pylair==0.1.0rc1 pylair-ollama==0.1.0rc2
+pip install pylair==0.1.0rc2 pylair-ollama==0.1.0rc2
 ```
 
 `--pre` opts *every* package in the install into prereleases — it can
@@ -23,8 +23,20 @@ pull your dependencies into unstable versions and break for reasons
 unrelated to this project. Exact pins avoid that.
 
 Each package versions independently across registries — the numbers
-won't match (`pylair` and the crate are at `0.1.0-rc.1`, `pylair-ollama`
-at `0.1.0-rc.2`). Check each registry for its latest RC.
+won't match (`pylair` at `0.1.0rc2`, npm packages at `0.1.0-rc.4`, the
+crate at `0.1.0-rc.2`). Check each registry for its latest RC.
+
+Try it:
+
+```sh
+npx create-pylair my-app && cd my-app
+npm install && uv sync
+npx pylair dev
+```
+
+The first `pylair dev` compiles the Rust/Tauri side from source —
+expect a few minutes before the window appears; later runs reuse the
+build cache and start in seconds.
 
 Milestones: `M0` packaging spike → `M1` supervisor/protocol → `M2` typed
 bridge → `M3` streaming/cancellation → `M4` CLI/scaffolder → `M5` Ollama

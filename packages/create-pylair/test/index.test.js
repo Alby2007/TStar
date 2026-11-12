@@ -23,6 +23,7 @@ test("scaffolds a complete app skeleton", () => {
     "package.json",
     "backend/app.py",
     "src-tauri/Cargo.toml",
+    "src-tauri/Cargo.lock",
     "src-tauri/tauri.conf.json",
     "src-tauri/src/lib.rs",
     "src-tauri/capabilities/default.json",
@@ -40,7 +41,10 @@ test("scaffolds a complete app skeleton", () => {
   assert.equal(conf.identifier, "com.example.myapp");
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
-  assert.match(py, /pylair==0\.1\.0rc1/);
+  assert.match(py, /pylair==0\.1\.0rc2/);
+  const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
+  assert.match(lock, /name = "my-app"/);
+  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.2"/);
   rmSync(dir, { recursive: true });
 });
 
@@ -65,5 +69,13 @@ test("rejects bad names and non-empty dirs", () => {
   assert.notEqual(scaffold(["Bad Name"], dir).status, 0);
   assert.equal(scaffold(["ok-app"], dir).status, 0);
   assert.notEqual(scaffold(["ok-app"], dir).status, 0); // now non-empty
+  rmSync(dir, { recursive: true });
+});
+
+test("no args fails loudly when stdin is not a TTY", () => {
+  const dir = mkdtempSync(join(tmpdir(), "create-pylair-"));
+  const res = scaffold([], dir);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /app name required/);
   rmSync(dir, { recursive: true });
 });

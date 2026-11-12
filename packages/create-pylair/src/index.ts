@@ -11,6 +11,7 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 
 const TEMPLATES = resolve(fileURLToPath(import.meta.url), "../../templates");
 const BINARY = new Set([".png", ".ico", ".icns"]);
@@ -42,10 +43,10 @@ export function substitutions(name: string, identifier: string, local?: string):
     subs.__PYLAIR_RS__ = `tauri-plugin-pylair = { path = "${unixPath(join(root, "crates/tauri-plugin-pylair"))}" }`;
     subs.__PYLAIR_CLI__ = `file:${unixPath(join(root, "packages/cli"))}`;
   } else {
-    subs.__PYLAIR_PY__ = "pylair==0.1.0rc1";
+    subs.__PYLAIR_PY__ = "pylair==0.1.0rc2";
     subs.__PYLAIR_JS_PKG__ = "@pylair/client";
-    subs.__PYLAIR_JS__ = "0.1.0-rc.3";
-    subs.__PYLAIR_CLI__ = "0.1.0-rc.3";
+    subs.__PYLAIR_JS__ = "0.1.0-rc.4";
+    subs.__PYLAIR_CLI__ = "0.1.0-rc.4";
     subs.__PYLAIR_RS__ = `tauri-plugin-pylair = "=0.1.0-rc.2"`;
   }
   return subs;
@@ -76,13 +77,40 @@ function copyTree(src: string, dst: string, subs: Record<string, string>) {
   }
 }
 
-function main(argv: string[]): number {
+function main(argv: string[]): number | Promise<number> {
   const positional = argv.filter((a) => !a.startsWith("--") && argv[argv.indexOf(a) - 1] !== "--local" && argv[argv.indexOf(a) - 1] !== "--identifier" && argv[argv.indexOf(a) - 1] !== "--template");
   const name = positional[0];
-  if (!name || name === "create-pylair") {
+  if (name === "create-pylair") {
     console.log("usage: create-pylair <app-name> [--identifier com.x.y] [--local /repo] [--template default]");
-    return name ? 1 : 0;
+    return 1;
   }
+  if (!name) {
+    // Interactive: ask for the name (create-vite convention). Piped or
+    // scripted: fail loudly — silently scaffolding nothing is worse.
+    if (!process.stdin.isTTY) {
+      console.error("create-pylair: app name required — usage: create-pylair <app-name> [--identifier com.x.y] [--local /repo] [--template default]");
+      return 1;
+    }
+    return promptForName(argv);
+  }
+  return scaffold(name, argv);
+}
+
+async function promptForName(argv: string[]): Promise<number> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const name = (await rl.question("app name: ")).trim();
+    if (!name) {
+      console.error("create-pylair: app name required");
+      return 1;
+    }
+    return scaffold(name, argv);
+  } finally {
+    rl.close();
+  }
+}
+
+function scaffold(name: string, argv: string[]): number {
   if (!/^[a-z][a-z0-9-]*$/.test(name))
     fail(`invalid app name '${name}' — use lowercase letters, digits, dashes`);
 
@@ -113,4 +141,4 @@ next:
   return 0;
 }
 
-process.exit(main(process.argv.slice(2)));
+process.exit(await main(process.argv.slice(2)));
