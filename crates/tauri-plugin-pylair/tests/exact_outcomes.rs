@@ -184,10 +184,14 @@ async fn cancel_with_data_lane_saturated_is_wedged_error() {
     h.shutdown().await;
 }
 
-/// 2. Pipe stops accepting writes: the writer task dies with it. The
-///    first cancel after the break rides the still-open lane and is
-///    never acked (RUNTIME_WEDGED); every later cancel gets the dead
-///    lane's explicit verdict — DeliveryFailed.
+/// 2. Pipe stops accepting writes: the writer task dies with it.
+///    Cancels right after the break can still ride the open lane and
+///    wedge (POSIX can accept a write into the kernel pipe buffer before
+///    the close is recorded — delivered-but-unreadable is wedged); once
+///    a write returns EPIPE the lane is dead and every later control
+///    send reports DeliveryFailed. How many cancels squeeze in first is
+///    platform timing, so cancel until the verdict — every intermediate
+///    answer must also be a named outcome, never a hang.
 #[tokio::test]
 async fn cancel_after_pipe_dies_is_delivery_failed() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
@@ -199,24 +203,32 @@ async fn cancel_after_pipe_dies_is_delivery_failed() {
     let ct = h.call_task("hang", json!({}), None).unwrap();
     let task = timeout(T, ct.task).await.unwrap().unwrap();
 
-    // Cancel #1: still queued onto the live lane, but the write after the
-    // child's close kills the writer — the ack can never come.
-    let first = timeout(T, h.cancel(task, None))
-        .await
-        .expect("cancel must complete")
-        .expect_err("unacknowledged cancel is an error");
-    assert_eq!(first.code, proto::RUNTIME_WEDGED, "first cancel: {first:?}");
-
-    // Cancel #2: the writer is gone — the control lane itself is closed,
-    // which is its own named outcome, not a timeout.
-    let second = timeout(T, h.cancel(task, None))
-        .await
-        .expect("cancel must complete")
-        .expect("a dead lane is a named outcome, not an error");
-    assert_eq!(
-        second,
-        CancelOutcome::DeliveryFailed,
-        "cancel on a dead pipe reported {second:?}, not DeliveryFailed"
+    let mut saw_wedged = false;
+    let reached = timeout(T, async {
+        loop {
+            match h.cancel(task, None).await {
+                Ok(CancelOutcome::DeliveryFailed) => break,
+                Err(e) => {
+                    assert_eq!(
+                        e.code,
+                        proto::RUNTIME_WEDGED,
+                        "delivered-but-unacked cancel is RUNTIME_WEDGED, \
+                         not another code: {e:?}"
+                    );
+                    saw_wedged = true;
+                }
+                other => panic!("dead-pipe cancel reported {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "cancel never reached DeliveryFailed on a dead pipe"
+    );
+    assert!(
+        saw_wedged,
+        "expected at least one cancel to take the wedge path"
     );
 
     // Shutdown still terminates the tree (the child is alive; it just
