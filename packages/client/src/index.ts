@@ -24,6 +24,52 @@ export class PythonError extends Error {
   }
 }
 
+/** Protocol code for limit rejections (docs/protocol-v1.md §8). */
+export const LIMIT_EXCEEDED = -32040;
+
+/**
+ * A resource limit was hit — the host or runtime refused work rather than
+ * queueing it unboundedly. `.limit` names the limit
+ * ("max_concurrent_tasks", "max_concurrent_streams", "max_queued_commands",
+ * "stream_buffer_bytes", "stream_buffer_bytes_total", "max_stream_credit",
+ * "max_frame", "max_isolated_workers", "frame_out_queue"), `.max` carries
+ * the configured bound when the host reported one.
+ */
+export class LimitExceededError extends PythonError {
+  readonly limit: string;
+  readonly max?: number;
+  constructor(message: string, data?: unknown) {
+    super(LIMIT_EXCEEDED, message, data);
+    this.name = "LimitExceededError";
+    const d = (data ?? {}) as { limit?: unknown; max?: unknown };
+    this.limit = typeof d.limit === "string" ? d.limit : "unknown";
+    if (typeof d.max === "number") this.max = d.max;
+  }
+}
+
+/** Build the typed error for a wire code. */
+function mkError(code: number, message: string, data?: unknown): PythonError {
+  return code === LIMIT_EXCEEDED
+    ? new LimitExceededError(message, data)
+    : new PythonError(code, message, data);
+}
+
+/**
+ * Normalize a thrown value into PythonError IF it is a serialized error
+ * object (`{code, message, data?}`); anything else passes through
+ * unchanged — transport failures keep their original identity.
+ */
+function asPythonError(e: unknown): unknown {
+  const o = e as { code?: unknown; message?: unknown; data?: unknown };
+  if (o && typeof o.code === "number")
+    return mkError(
+      o.code,
+      typeof o.message === "string" ? o.message : String(e),
+      o.data,
+    );
+  return e;
+}
+
 export type RuntimeState =
   | "starting"
   | "ready"
@@ -257,10 +303,14 @@ export async function call<T = unknown>(
 ): Promise<T> {
   const b = await ipc();
   await ensureStreamListener();
-  const task = await b.invoke<number>(CMD.callStream, {
-    fnName: fn,
-    input: toWire(input) as Record<string, unknown>,
-  });
+  const task = await b
+    .invoke<number>(CMD.callStream, {
+      fnName: fn,
+      input: toWire(input) as Record<string, unknown>,
+    })
+    .catch((e) => {
+      throw asPythonError(e);
+    });
   wireAbort(opts.signal, task);
   return new Promise<T>((resolve, reject) => {
     const disarm = armDeadline(opts, task, (e) => {
@@ -272,7 +322,7 @@ export async function call<T = unknown>(
         if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
         disarm();
         tasks.delete(task);
-        if (ev.error) reject(new PythonError(ev.error.code, ev.error.message, ev.error.data));
+        if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
         else resolve(fromWire(ev.result) as T);
       },
     });
@@ -289,10 +339,14 @@ export async function* stream<T = unknown>(
 ): AsyncGenerator<T, void, void> {
   const b = await ipc();
   await ensureStreamListener();
-  const task = await b.invoke<number>(CMD.callStream, {
-    fnName: fn,
-    input: toWire(input) as Record<string, unknown>,
-  });
+  const task = await b
+    .invoke<number>(CMD.callStream, {
+      fnName: fn,
+      input: toWire(input) as Record<string, unknown>,
+    })
+    .catch((e) => {
+      throw asPythonError(e);
+    });
   wireAbort(opts.signal, task);
 
   const queue: StreamEvent[] = [];
@@ -323,7 +377,7 @@ export async function* stream<T = unknown>(
       const ev = queue.shift()!;
       if (ev.done) {
         finished = true;
-        if (ev.error) throw new PythonError(ev.error.code, ev.error.message, ev.error.data);
+        if (ev.error) throw mkError(ev.error.code, ev.error.message, ev.error.data);
         return;
       }
       // Pull-flow: top up credit in batches as the consumer pulls.

@@ -7,6 +7,7 @@ import {
   cancel,
   setBridge,
   PythonError,
+  LimitExceededError,
   _resetForTests,
 } from "../dist/index.js";
 
@@ -317,4 +318,52 @@ test("stream with timeoutMs throws the deadline error and cancels", async () => 
   const it = stream("slow", {}, { timeoutMs: 50 });
   await assert.rejects(it.next(), (e) => e instanceof PythonError && e.code === -32013);
   assert.ok(b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
+});
+
+test("invoke rejection with LIMIT_EXCEEDED surfaces LimitExceededError", async () => {
+  const b = fakeBridge();
+  // Saturated host: python_call_stream rejects with the serialized ErrorObj.
+  const realInvoke = b.invoke.bind(b);
+  b.invoke = async (cmd, args) => {
+    if (cmd === "plugin:pylair|python_call_stream")
+      throw {
+        code: -32040,
+        message: "too many in-flight tasks",
+        data: { limit: "max_concurrent_tasks", max: 64 },
+      };
+    return realInvoke(cmd, args);
+  };
+  setBridge(b);
+  await assert.rejects(
+    call("anything"),
+    (e) =>
+      e instanceof LimitExceededError &&
+      e.limit === "max_concurrent_tasks" &&
+      e.max === 64 &&
+      e.code === -32040,
+  );
+});
+
+test("stream terminal LIMIT_EXCEEDED throws LimitExceededError with .limit", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const it = stream("flood");
+  const first = it.next(); // generators start on next(): installs listener, registers task=100
+  await new Promise((r) => setTimeout(r, 0));
+  b.emit("pylair://stream", {
+    task: 100,
+    done: true,
+    error: {
+      code: -32040,
+      message: "stream buffer cap",
+      data: { limit: "stream_buffer_bytes", max: 16777216 },
+    },
+  });
+  await assert.rejects(
+    first,
+    (e) =>
+      e instanceof LimitExceededError &&
+      e.limit === "stream_buffer_bytes" &&
+      e.code === -32040,
+  );
 });

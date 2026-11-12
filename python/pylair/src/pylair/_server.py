@@ -9,6 +9,8 @@ exit (protocol §6).
 from __future__ import annotations
 
 import asyncio
+import collections
+import os
 import queue
 import sys
 import threading
@@ -19,24 +21,100 @@ from typing import Any
 from pylair import _json
 from pylair import _protocol as proto
 from pylair._expose import exposed_functions, exposes_manifest
-from pylair._tasks import TaskRegistry
-from pylair._transport import FrameChannel, FrameTooLarge
+from pylair._tasks import MAX_STREAM_CREDIT, TaskRegistry
+from pylair._transport import MAX_FRAME, FrameChannel, FrameTooLarge
 
 _EOF = object()
 _STOP = object()
+
+# RC.8A outbound bound. The frame-count cap must exceed the worst-case
+# LEGITIMATE burst — every frame the protocol allows to be in flight at
+# once — so that "full" can only mean the host stopped draining:
+#   max_concurrent_streams * max_stream_credit   (chunks produced under
+#                                                 granted-but-unconsumed
+#                                                 credit)
+# + max_concurrent_tasks                       (call results in flight)
+# + slack                                      (pongs, errors, control)
+# Memory is bounded separately by OUT_MAX_BYTES — the byte cap is the real
+# protection; the frame cap exists to bound queue bookkeeping.
+_MAX_STREAMS = int(os.environ.get("PYLAIR_MAX_CONCURRENT_STREAMS", "32"))
+_MAX_TASKS = int(os.environ.get("PYLAIR_MAX_CONCURRENT_TASKS", "64"))
+OUT_MAX_FRAMES = int(
+    os.environ.get(
+        "PYLAIR_OUT_MAX_FRAMES",
+        str(_MAX_STREAMS * MAX_STREAM_CREDIT + _MAX_TASKS + 4096),
+    )
+)
+OUT_MAX_BYTES = int(os.environ.get("PYLAIR_OUT_MAX_BYTES", str(64 * 1024 * 1024)))
+# Inbound bound: the reader stops pulling frames when the loop falls this
+# far behind — backpressure travels through the OS pipe to the host's own
+# bounded writer lane, so nothing here grows without bound either.
+IN_MAX = int(os.environ.get("PYLAIR_IN_MAX", "4096"))
 
 
 def _log(msg: str) -> None:
     print(f"[pylair] {msg}", file=sys.stderr, flush=True)
 
 
+class _BoundedOut:
+    """Frame+byte bounded queue for outbound frames (RC.8A).
+
+    `put_nowait` NEVER blocks — it raises `queue.Full` when either bound is
+    hit, which the caller turns into the host-gone path. `get` blocks the
+    dedicated writer thread only.
+    """
+
+    def __init__(self, max_frames: int, max_bytes: int) -> None:
+        self._items: collections.deque[Any] = collections.deque()
+        self._bytes = 0
+        self._max_frames = max_frames
+        self._max_bytes = max_bytes
+        self._cond = threading.Condition()
+
+    def put_nowait(self, body: Any) -> None:
+        with self._cond:
+            n = len(body) if isinstance(body, (bytes, bytearray)) else 0
+            if (
+                len(self._items) >= self._max_frames
+                or self._bytes + n > self._max_bytes
+            ):
+                raise queue.Full(
+                    f"outbound queue full ({len(self._items)} frames, {self._bytes} bytes)"
+                )
+            self._items.append(body)
+            self._bytes += n
+            self._cond.notify()
+
+    def close(self) -> None:
+        # The _STOP sentinel bypasses the caps: shutdown must always be
+        # deliverable, even on a full queue.
+        with self._cond:
+            self._items.append(_STOP)
+            self._cond.notify()
+
+    def get(self) -> Any:
+        with self._cond:
+            while not self._items:
+                self._cond.wait()
+            body = self._items.popleft()
+            self._bytes -= len(body) if isinstance(body, (bytes, bytearray)) else 0
+            return body
+
+    def stats(self) -> tuple[int, int]:
+        with self._cond:
+            return len(self._items), self._bytes
+
+
 class Server:
     def __init__(self, channel: FrameChannel) -> None:
         self._channel = channel
-        self._out: queue.Queue = queue.Queue()
+        self._out = _BoundedOut(OUT_MAX_FRAMES, OUT_MAX_BYTES)
         self._in: asyncio.Queue = asyncio.Queue()
+        self._in_max = IN_MAX
         self._tasks = TaskRegistry(self._send)
         self._stopping = False
+        self._out_full = False
+        self._loop: asyncio.AbstractEventLoop | None = None
         # Last time the asyncio loop proved it was making progress; read by the
         # reader thread when answering pings (single float store: atomic).
         self._loop_beat = time.monotonic()
@@ -46,7 +124,34 @@ class Server:
         # results): a TypeError/ValueError can then be turned into an
         # INTERNAL response for that one call. The writer thread only ever
         # sees valid bytes and must never die (protocol §2).
-        self._out.put(_json.dumps(msg).encode())
+        body = _json.dumps(msg).encode()
+        if len(body) > MAX_FRAME and isinstance(msg.get("id"), (int, str)):
+            # An oversized RESPONSE would trip the host's read cap and kill
+            # the runtime — fail just this call with the typed error (RC.8A).
+            body = _json.dumps(
+                proto.error_response(
+                    msg["id"],
+                    proto.LIMIT_EXCEEDED,
+                    "response exceeds the frame cap",
+                    {"limit": "max_frame", "max": MAX_FRAME},
+                )
+            ).encode()
+        try:
+            self._out.put_nowait(body)
+        except queue.Full:
+            # Never block the caller (event loop or reader thread). A host
+            # that stopped draining is functionally gone — take the same
+            # drain-and-exit path as stdin EOF, with a distinct reason.
+            if not self._out_full:
+                self._out_full = True
+                frames, nbytes = self._out.stats()
+                _log(
+                    f"outbound queue full ({frames} frames, {nbytes} bytes) "
+                    "— host not draining; treating as gone"
+                )
+            loop = self._loop
+            if loop is not None:
+                loop.call_soon_threadsafe(self._in.put_nowait, _EOF)
 
     # ---- io threads --------------------------------------------------------
 
@@ -96,6 +201,11 @@ class Server:
                         )
                     )
                     continue
+                # Inbound bound (RC.8A): if the loop is behind, stop pulling
+                # frames — the OS pipe backs up to the host's own bounded
+                # writer, so the queue can't grow without limit.
+                while self._in.qsize() >= self._in_max:
+                    time.sleep(0.001)
                 loop.call_soon_threadsafe(self._in.put_nowait, msg)
         except FrameTooLarge as e:
             _log(f"protocol violation: {e} — treating host as gone")
@@ -250,6 +360,7 @@ class Server:
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
+        self._loop = loop
         writer = threading.Thread(target=self._writer, name="tp-writer", daemon=True)
         reader = threading.Thread(
             target=self._reader, args=(loop,), name="tp-reader", daemon=True
