@@ -85,6 +85,10 @@ integration → `M6` reference app + RC.
   its modules — fine for short calls, seconds each with torch-class
   imports. A warm persistent worker (`worker={'mode': 'warm'}`) is
   reserved in the API but not implemented yet.
+- **Worker kill covers only the worker's process group.** Descendants
+  that stay in the group die with it (SIGTERM-ignoring grandchildren
+  included), but a child that deliberately detaches — `setsid`, a new
+  process group, a double-fork daemon — escapes the group kill.
 - **Ints beyond ±2^53 can't cross the bridge.** The call fails with
   `INTERNAL: integer … exceeds the JSON safe-integer range` — an
   explicit error rather than a silently rounded value. Return large
