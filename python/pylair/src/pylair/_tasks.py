@@ -275,9 +275,7 @@ class TaskRegistry:
             # Credit that outran its call: hold it for registration instead
             # of losing it (control lane is independent of the data lane).
             if len(self._pending_credit) < 4096:
-                self._pending_credit[task_id] = (
-                    self._pending_credit.get(task_id, 0) + n
-                )
+                self._pending_credit[task_id] = self._pending_credit.get(task_id, 0) + n
             return False
         task.credit += n
         task.credit_event.set()

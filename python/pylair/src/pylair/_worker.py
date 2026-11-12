@@ -38,10 +38,42 @@ def _exit_with_parent() -> None:
         return
     parent = os.getppid()
 
+    # The group-reap itself must live in a separate PROCESS. A watcher thread
+    # in the worker can be starved by a native call holding the GIL — and on
+    # Linux pdeathsig kills the worker the instant the runtime dies, long
+    # before such a thread could fire, leaving the group behind. The reaper
+    # is forked here, while the worker is still single-threaded and before
+    # user imports; it sits in this process group watching the worker (its
+    # own ppid) and the runtime (a kill-0 probe). Either dying ends the whole
+    # group — worker exit also sweeps grandchildren a finished call spawned.
+    try:
+        worker = os.getpid()
+        if os.fork() == 0:
+            try:
+                # Inherited fds must not pin the pipes: this copy of fd 1 is
+                # the result channel — holding it would hide EOF forever.
+                os.closerange(0, 3)
+                while True:
+                    time.sleep(0.5)
+                    if os.getppid() != worker:
+                        break
+                    try:
+                        os.kill(parent, 0)
+                    except ProcessLookupError:
+                        break
+                    except OSError:
+                        pass  # EPERM: process exists
+                os.killpg(0, signal.SIGKILL)
+            finally:
+                os._exit(1)
+    except OSError:
+        pass  # fork failed — the watchers below remain the fallback
+
     # Linux: kernel-level backstop for the watcher below — PR_SET_PDEATHSIG
     # fires even if a native call is holding the GIL (which would stall the
     # polling thread). If the runtime died before prctl ran, getppid already
-    # changed: kill ourselves now — the race the ppid check exists for.
+    # changed: kill ourselves now — the race the ppid check exists for. The
+    # reaper above reaps the group this leaves behind.
     if sys.platform.startswith("linux"):
         try:
             import ctypes
