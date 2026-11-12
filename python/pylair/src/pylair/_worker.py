@@ -36,7 +36,13 @@ def _exit_with_parent() -> None:
     """
     if sys.platform == "win32":
         return
-    parent = os.getppid()
+    # The runtime tells us the ppid to expect — a worker still in
+    # interpreter startup when the runtime died is already reparented,
+    # and getppid alone would anchor every watcher below on init. Die
+    # now rather than run unsupervised.
+    parent = int(os.environ.get("PYLAIR_WORKER_PARENT") or os.getppid())
+    if os.getppid() != parent:
+        os.kill(os.getpid(), signal.SIGKILL)
 
     # The group-reap itself must live in a separate PROCESS. A watcher thread
     # in the worker can be starved by a native call holding the GIL — and on

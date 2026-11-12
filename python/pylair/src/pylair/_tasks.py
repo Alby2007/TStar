@@ -218,6 +218,10 @@ class TaskRegistry:
             kwargs: dict[str, Any] = {
                 "stdin": asyncio.subprocess.PIPE,
                 "stdout": asyncio.subprocess.PIPE,
+                # The worker compares its ppid against this at startup —
+                # a mismatch means the runtime died during the exec and
+                # it is already orphaned (see _worker._exit_with_parent).
+                "env": {**os.environ, "PYLAIR_WORKER_PARENT": str(os.getpid())},
             }
             if sys.platform == "win32":
                 kwargs["creationflags"] = 0  # taskkill /T handles the tree
