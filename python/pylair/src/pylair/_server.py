@@ -57,8 +57,11 @@ class Server:
                 return
             try:
                 self._channel.write_frame(body)
-            except OSError:
-                return  # frame fd dead — host is gone
+            except (OSError, ValueError):
+                # Frame fd dead — host is gone. OSError covers dead fds;
+                # ValueError covers a closed buffered stream at shutdown
+                # ("I/O operation on closed file").
+                return
             except Exception as e:  # noqa: BLE001 - writer must never die
                 _log(f"writer dropped a frame: {e!r}")
 

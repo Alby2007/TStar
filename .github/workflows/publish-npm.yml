@@ -30,9 +30,9 @@ jobs:
     env:
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -81,6 +81,24 @@ jobs:
             # stable, newest RC is what we want latest to mean. Idempotent,
             # so it also heals a tag left behind by a partial run.
             npm dist-tag add "$name@${{ inputs.version }}" latest
+          done
+
+      - name: Verify all three are installable
+        if: ${{ !inputs.dry_run }}
+        # A green publish must mean installable. Registry propagation
+        # lags a bit, so poll each package until it resolves or the
+        # budget runs out — then fail instead of tagging a phantom release.
+        run: |
+          for p in packages/client packages/cli packages/create-pylair; do
+            name=$(node -p "require('./$p/package.json').name")
+            for i in $(seq 1 20); do
+              if npm view "$name@${{ inputs.version }}" version --prefer-online >/dev/null 2>&1; then
+                echo "$name@${{ inputs.version }} live on the registry"
+                break
+              fi
+              [ "$i" = 20 ] && { echo "::error::$name@${{ inputs.version }} not resolvable after ~2min"; exit 1; }
+              sleep 6
+            done
           done
 
       - name: Tag the release
