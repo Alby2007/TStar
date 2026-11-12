@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
-#[cfg(not(target_os = "linux"))]
-use tokio::process::Command as TokioCommand;
+use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, timeout};
 
@@ -1258,17 +1256,20 @@ fn jitter(d: Duration) -> Duration {
 /// would SIGKILL a perfectly healthy runtime. The anchor can only die
 /// with the whole process, so the signal means exactly "the host is gone".
 ///
-/// `Child::from_std` has no kill_on_drop, but the monitor task below owns
-/// the child and kills/reaps it explicitly on every exit path — the drop
-/// backstop was redundant with that ownership.
+/// The fork itself must happen on the anchor thread, so the runtime
+/// handle is carried in and entered there — `Command::spawn` is a plain
+/// synchronous call that only needs the context to register the child.
 #[cfg(target_os = "linux")]
 fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(dunce::simplified(&spec.program));
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|e| io::Error::other(format!("no runtime for spawn: {e}")))?;
+    let mut cmd = TokioCommand::new(dunce::simplified(&spec.program));
     cmd.args(&spec.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .process_group(0);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
@@ -1278,28 +1279,28 @@ fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
     }
     cmd.envs(spec.env.iter().cloned());
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.as_std_mut().pre_exec(|| {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let (tx, rx) = std::sync::mpsc::channel::<io::Result<std::process::Child>>();
+    let (tx, rx) = std::sync::mpsc::channel::<io::Result<Child>>();
     std::thread::Builder::new()
         .name("pylair-pdeath-anchor".into())
         .spawn(move || {
-            // The JoinHandle detaches on return — the thread lives until
-            // the process does.
+            // Enter the runtime so the child's registration resolves, then
+            // fork HERE — the JoinHandle detaches on return and this thread
+            // lives until the process does.
+            let _guard = rt.enter();
             let _ = tx.send(cmd.spawn());
             loop {
                 std::thread::park();
             }
         })?;
-    let std_child = rx
-        .recv()
-        .map_err(|_| io::Error::other("pdeathsig anchor died before spawn"))??;
-    Child::from_std(std_child)
+    rx.recv()
+        .map_err(|_| io::Error::other("pdeathsig anchor died before spawn"))?
 }
 
 async fn spawn_child(

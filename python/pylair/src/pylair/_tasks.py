@@ -305,7 +305,8 @@ class TaskRegistry:
                     return {"cancelled": True, "status": "terminated"}
                 except asyncio.CancelledError:
                     return {"cancelled": True, "status": "terminated"}
-                except BaseException:
+                # An outcome we can't classify means "may still be running".
+                except BaseException:  # noqa: BLE001 - deliberate catch-all
                     return {"cancelled": True, "status": "termination_in_progress"}
             if task.kind == "sync":
                 # Inline sync runs on an executor thread — it cannot be

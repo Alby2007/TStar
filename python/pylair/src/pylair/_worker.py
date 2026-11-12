@@ -49,8 +49,10 @@ def _exit_with_parent() -> None:
             ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
             if os.getppid() != parent:
                 os.kill(os.getpid(), signal.SIGKILL)
-        except Exception:
-            pass  # the ppid watcher below remains the fallback
+        except (ImportError, OSError) as e:
+            # No ctypes or a libc without prctl — the ppid watcher below
+            # remains the fallback, so a setup failure is not fatal.
+            print(f"[pylair] worker: pdeathsig setup failed: {e!r}", file=sys.stderr)
 
     def watch() -> None:
         while True:
