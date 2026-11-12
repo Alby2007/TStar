@@ -382,13 +382,73 @@ fn children_of(pid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// (state, starttime token) for a watched pid. Linux reads
+/// /proc/<pid>/stat — parsed after the last ')' so a comm containing
+/// spaces/parens can't shift the columns (starttime is field 22, index
+/// 19 of the post-')' tokens). Other unix has no /proc — ps prints
+/// state + start time instead.
 #[cfg(unix)]
-fn alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
+fn proc_state_start(pid: u32) -> Option<(char, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let mut f = rest.split_whitespace();
+        let state = f.next()?.chars().next()?;
+        let start = f.nth(18)?.to_string();
+        Some((state, start))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout);
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let state = line.chars().next()?;
+        let start = line[1..].trim().to_string();
+        Some((state, start))
+    }
+}
+
+/// Identity token for a watched pid: captured at discovery so a recycled
+/// pid later reads as not-ours instead of a survivor.
+#[cfg(unix)]
+fn token(pid: u32) -> String {
+    proc_state_start(pid).map(|(_, s)| s).unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn token(pid: u32) -> String {
+    // Process start time in ticks — unique enough to spot pid reuse.
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).StartTime.Ticks"),
+        ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A watched pid survives only while the same process is genuinely
+/// alive: kill -0 sees zombies as alive (a zombie is dead, just unreaped
+/// — not a survivor), and a pid recycled by another process is not our
+/// child (starttime won't match).
+#[cfg(unix)]
+fn alive_since(pid: u32, start: &str) -> bool {
+    match proc_state_start(pid) {
+        Some(('Z' | 'X', _)) | None => false,
+        Some((_, s)) => s == start,
+    }
 }
 
 #[cfg(windows)]
@@ -402,6 +462,11 @@ fn alive(pid: u32) -> bool {
     stdout
         .lines()
         .any(|l| l.split("\",\"").nth(1).and_then(|f| f.parse::<u32>().ok()) == Some(pid))
+}
+
+#[cfg(windows)]
+fn alive_since(pid: u32, start: &str) -> bool {
+    alive(pid) && token(pid) == start
 }
 
 /// Abrupt host kill — SIGKILL on unix, taskkill /F on Windows. Deliberately
@@ -479,6 +544,7 @@ async fn host_sigkill_does_not_orphan_wedged_runtime() {
     }
     let _reap = Reap(kids.clone());
     assert!(!kids.is_empty(), "host never spawned a runtime child");
+    let watched: Vec<(u32, String)> = kids.iter().map(|p| (*p, token(*p))).collect();
 
     // Abruptly kill the "app" — no Drop, no kill_on_drop, no graceful path.
     kill_host(host_pid);
@@ -486,7 +552,7 @@ async fn host_sigkill_does_not_orphan_wedged_runtime() {
 
     // PDEATHSIG / Job Object cleanup is immediate — a tight bound is honest.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while kids.iter().any(|p| alive(*p)) {
+    while watched.iter().any(|(p, s)| alive_since(*p, s)) {
         assert!(
             std::time::Instant::now() < deadline,
             "runtime children {kids:?} survived the host's abrupt kill — \
@@ -532,12 +598,13 @@ async fn host_sigkill_healthy_runtime_exits_on_eof() {
     }
     let _reap = Reap(kids.clone());
     assert!(!kids.is_empty(), "host never spawned a runtime child");
+    let watched: Vec<(u32, String)> = kids.iter().map(|p| (*p, token(*p))).collect();
 
     kill_host(host_pid);
     let _ = host.wait();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while kids.iter().any(|p| alive(*p)) {
+    while watched.iter().any(|(p, s)| alive_since(*p, s)) {
         assert!(
             std::time::Instant::now() < deadline,
             "healthy runtime children {kids:?} survived the host's abrupt kill"
@@ -601,13 +668,15 @@ async fn host_sigkill_does_not_orphan_isolated_worker() {
     assert!(worker_pid != 0, "runtime never spawned a worker child");
 
     let _reap = Reap(vec![runtime_pid, worker_pid]);
+    let rt = (runtime_pid, token(runtime_pid));
+    let wk = (worker_pid, token(worker_pid));
     kill_host(host_pid);
     let _ = host.wait();
 
     // EOF drain (macOS), PDEATHSIG + the worker's own watcher (Linux), or
     // the Job Object (Windows): whatever the path, NOTHING may survive.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while alive(runtime_pid) || alive(worker_pid) {
+    while alive_since(rt.0, &rt.1) || alive_since(wk.0, &wk.1) {
         assert!(
             std::time::Instant::now() < deadline,
             "worker {worker_pid} survived after runtime {runtime_pid} exited — \
