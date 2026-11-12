@@ -69,21 +69,23 @@ jobs:
         if: ${{ (inputs.source || 'pack') == 'pack' }}
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/packs"
+          # Workspace-relative paths: $RUNNER_TEMP is D:\... on Windows and
+          # GNU tar parses the drive colon as a remote host:file spec — even
+          # --force-local only protects the -f operand, not -C.
+          mkdir -p packs
+          PACKS=$(pwd)/packs
           for p in packages/client packages/cli packages/create-pylair; do
-            (cd "$p" && npm pack --pack-destination "$RUNNER_TEMP/packs" >/dev/null)
+            (cd "$p" && npm pack --pack-destination "$PACKS" >/dev/null)
           done
-          ls -la "$RUNNER_TEMP/packs"
+          ls -la packs
 
       - name: Scaffold from the packed create-pylair tarball
         if: ${{ (inputs.source || 'pack') == 'pack' }}
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/cp-src"
-          # --force-local: on Windows git-bash, C:\ paths look like remote
-          # host:file specs to tar.
-          tar --force-local -xzf "$RUNNER_TEMP"/packs/create-pylair-*.tgz -C "$RUNNER_TEMP/cp-src"
-          node "$RUNNER_TEMP/cp-src/package/dist/index.js" app-under-test
+          mkdir -p cp-src
+          tar --force-local -xzf packs/create-pylair-*.tgz -C cp-src
+          node cp-src/package/dist/index.js app-under-test
 
       - name: Scaffold from the registry (@next)
         if: ${{ inputs.source == 'registry' }}
@@ -96,7 +98,7 @@ jobs:
           if [ "$SOURCE" = pack ]; then
             # Tarballs FIRST — the scaffolded pins point at versions that
             # aren't on the registry yet, so a bare npm install 404s.
-            npm install "$RUNNER_TEMP"/packs/pylair-client-*.tgz "$RUNNER_TEMP"/packs/pylair-cli-*.tgz
+            npm install ../packs/pylair-client-*.tgz ../packs/pylair-cli-*.tgz
           fi
           npm install
           uv sync
