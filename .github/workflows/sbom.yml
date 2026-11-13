@@ -1,0 +1,64 @@
+name: SBOM
+
+# CycloneDX SBOMs for all shipped ecosystems, attached to an EXISTING
+# GitHub release. Dispatched by a human after the release is created —
+# this only adds assets; it never creates, publishes, or tags.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach SBOMs to (e.g. npm-v0.1.0-rc.8)"
+        required: true
+
+permissions:
+  contents: write # upload release assets — nothing else needs write
+
+jobs:
+  sbom:
+    name: Generate + attach SBOMs
+    runs-on: ubuntu-22.04
+    steps:
+      # Generate against the TAG's tree, not the dispatch-time main —
+      # the SBOM must describe what the release shipped.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      # Fail fast if the release isn't there — no half-uploaded runs.
+      - name: Release must already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" > /dev/null
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Install Rust SBOM tool
+        run: cargo install cargo-cyclonedx --locked --version 0.5.10
+
+      - name: Rust SBOM — tauri-plugin-pylair
+        run: |
+          mkdir -p sbom
+          (cd crates/tauri-plugin-pylair && cargo cyclonedx --format json --spec-version 1.5)
+          mv crates/tauri-plugin-pylair/*.cdx.json sbom/
+
+      - name: npm workspace SBOM (pnpm via cdxgen)
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          npx --yes @cyclonedx/cdxgen@12.9.0 -t pnpm -o sbom/npm-workspace.cdx.json .
+
+      - name: Python SBOMs — pylair + pylair-ollama (prod deps)
+        run: |
+          uv export --project python/pylair --no-dev --no-hashes --no-emit-project -o /tmp/pylair-prod.txt
+          uv export --project integrations/ollama --no-dev --no-hashes --no-emit-project -o /tmp/ollama-prod.txt
+          uvx --from cyclonedx-bom==8.0.1 cyclonedx-py requirements /tmp/pylair-prod.txt -o sbom/pylair.cdx.json
+          uvx --from cyclonedx-bom==8.0.1 cyclonedx-py requirements /tmp/ollama-prod.txt -o sbom/pylair-ollama.cdx.json
+
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" sbom/*.cdx.json --clobber --repo "$GITHUB_REPOSITORY"
