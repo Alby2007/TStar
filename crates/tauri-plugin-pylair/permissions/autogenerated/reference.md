@@ -152,6 +152,32 @@ Denies the python_retry command without any pre-configured scope.
 <tr>
 <td>
 
+`pylair:allow-python-selftest-b-report`
+
+</td>
+<td>
+
+Enables the python_selftest_b_report command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`pylair:deny-python-selftest-b-report`
+
+</td>
+<td>
+
+Denies the python_selftest_b_report command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `pylair:allow-python-selftest-report`
 
 </td>

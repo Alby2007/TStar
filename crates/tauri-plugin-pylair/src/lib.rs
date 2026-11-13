@@ -466,6 +466,30 @@ impl<R: Runtime> Builder<R> {
                 Ok(())
             })
             .on_event(|app, event| {
+                // Two-window event-scoping self-test: a second webview
+                // exists only under the flag. Its capability grants
+                // emit/emitTo on purpose — the test proves the delivery
+                // fix itself, not the deny-emit stopgap. Window creation
+                // must wait for RunEvent::Ready (plugin setup runs before
+                // the event loop starts) AND must run off the main thread:
+                // create_window dispatches to the loop and blocks on the
+                // ack, which deadlocks inside an event callback.
+                if let tauri::RunEvent::Ready = event {
+                    if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_some() {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = tauri::WebviewWindowBuilder::new(
+                                &app,
+                                "win-b",
+                                tauri::WebviewUrl::App("index.html".into()),
+                            )
+                            .build()
+                            {
+                                eprintln!("self-test win-b creation failed: {e}");
+                            }
+                        });
+                    }
+                }
                 // A destroyed window leaves the subscriber set; a reload does
                 // NOT remove it (label survives reloads — an in-flight stream
                 // to a reloaded page just has no listener, which is fine).
@@ -516,6 +540,7 @@ impl<R: Runtime> Builder<R> {
                 python_state,
                 python_shutdown,
                 python_selftest_report,
+                python_selftest_b_report,
             ])
             .build()
     }
@@ -627,6 +652,34 @@ fn python_selftest_report<R: Runtime>(
     println!("webview-self-test: {result}");
     app.exit(if ok { 0 } else { 5 });
     Ok(())
+}
+
+/// Intruder's verdict for the two-window self-test. win-b cannot send it
+/// via JS emit/emit_to: a `core:event:deny-emit(-to)` entry (as the default
+/// template ships for the main webview) denies those commands origin-wide —
+/// Tauri's authority ignores `windows:` scoping for denials — so the report
+/// relays through this ACL-checked command and the Rust side emits. Rust
+/// emit paths are not subject to webview permissions. Unlike
+/// python_selftest_report this does not exit the app, so win-b can hold it
+/// without gaining shutdown power. Inert unless PYLAIR_SELF_TEST_WEBVIEW.
+#[tauri::command]
+fn python_selftest_b_report<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    report: Value,
+) -> Result<(), ErrorObj> {
+    if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_none() {
+        return Err(ErrorObj {
+            code: protocol::INVALID_REQUEST,
+            message: "webview self-test not enabled".into(),
+            data: None,
+        });
+    }
+    app.emit_to("main", "pylair://selftest-b", report)
+        .map_err(|e| ErrorObj {
+            code: protocol::INTERNAL,
+            message: e.to_string(),
+            data: None,
+        })
 }
 
 #[tauri::command]

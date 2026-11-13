@@ -51,7 +51,9 @@ export default function App() {
         [...t.slice(-7), `${s.from} → ${s.to} — ${s.detail}`],
       );
     }).then((u) => (unlisten = u));
-    refreshStatus();
+    // Under the webview self-test every task id must belong to the
+    // self-test itself — a UI-driven call here would race it for ids.
+    if (!(globalThis as { __PYLAIR_SELF_TEST__?: boolean }).__PYLAIR_SELF_TEST__) refreshStatus();
     return () => unlisten?.();
   }, []);
 
