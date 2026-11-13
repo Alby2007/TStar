@@ -22,9 +22,7 @@
 - [Type codegen](https://github.com/PylairHQ/Pylair/blob/main/docs/codegen.md): Python signatures to generated TypeScript client stubs
 - [Wrap mode brief](https://github.com/PylairHQ/Pylair/blob/main/docs/wrap-mode-brief.md): wrapping existing Python web UIs (Gradio, Streamlit, FastAPI) — W1 in progress
 - [Ideas](https://github.com/PylairHQ/Pylair/blob/main/docs/ideas.md): parked out-of-scope ideas
-- Security model: `docs/security.md` exists on main as a stub; the full
-  security/threat model lands via the `docs-security` PR — link it once
-  merged.
+- [Security model](https://github.com/PylairHQ/Pylair/blob/main/docs/security.md): threat model, IPC surface, capabilities, bounded resources, process containment, and how to report a vulnerability
 
 ## Decision records
 

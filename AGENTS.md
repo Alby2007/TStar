@@ -127,10 +127,11 @@ from packed tarballs (`source=pack`, default) or the live registry
 ## Release rules — humans dispatch publishes, never agents
 
 - `publish-crates.yml`, `release.yml` (PyPI) and `publish-npm.yml` are
-  `workflow_dispatch`-only for a reason. **Agents never dispatch them**
-  and never touch `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, OIDC trusted-
-  publisher config, or repo environments/secrets — in workflows or
-  outside them.
+  `workflow_dispatch`-only for a reason. **Agents never dispatch them,**
+  and don't change publish auth, secrets or environments
+  (`CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, OIDC trusted-publisher config,
+  repo environments/secrets) unless the owner explicitly asks for that
+  change.
 - **The release train order** (from HANDOFF.md): crates.io
   `tauri-plugin-pylair` → PyPI `pylair` / `pylair-ollama` (release.yml's
   `package` input) → regenerate + commit the template `Cargo.lock` →
