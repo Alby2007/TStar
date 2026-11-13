@@ -42,6 +42,9 @@ test("scaffolds a complete app skeleton", () => {
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
   assert.match(py, /pylair==0\.1\.0rc6/);
+  const pkg = readFileSync(join(app, "package.json"), "utf8");
+  assert.match(pkg, /"@pylair\/client": "0\.1\.0-rc\.12"/);
+  assert.match(pkg, /"@pylair\/cli": "0\.1\.0-rc\.12"/);
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
   assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.8"/);
