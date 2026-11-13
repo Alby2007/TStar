@@ -70,6 +70,17 @@ wait_until() { # cond-fn timeout-sec
     return 1
 }
 
+# Resolve to the real (non-symlinked) path. Launching a .app through a
+# symlinked ancestor — /tmp -> /private/tmp is the classic one — trips
+# Tauri's StartingBinary check and the app panics at startup
+# (resource_dir: UnknownPath). mktemp under /tmp produces exactly such a
+# path, so every path this script derives must be real.
+realpath_p() {
+    if command -v realpath >/dev/null 2>&1; then realpath "$1"; else
+        (cd "$(dirname "$1")" && printf '%s/%s' "$(pwd -P)" "$(basename "$1")")
+    fi
+}
+
 # ---- process identity ---------------------------------------------------------
 # start-time token: `lstart` — same pid AND same start timestamp means the
 # same instance; a recycled pid fails the comparison.
@@ -135,12 +146,15 @@ wait_app_gone() { # app_pid timeout-sec
 
 # ---- phase: locate or build the binary ----------------------------------------
 LOGDIR=${TMPDIR:-/tmp}; WORKDIR_CREATED=0
+[ -n "$APP" ] && APP=$(realpath_p "$APP")
+[ -n "$EXE" ] && EXE=$(realpath_p "$EXE")
 if [ -n "$APP" ] && [ -z "$EXE" ]; then
     base=$(basename "$APP" .app)
     EXE="$APP/Contents/MacOS/$base"
 fi
 if [ -z "$EXE" ]; then
-    WORKDIR=${WORKDIR:-$(mktemp -d /tmp/pylair-dogfood-XXXXXX)}
+    if [ -n "$WORKDIR" ]; then mkdir -p "$WORKDIR"; else WORKDIR=$(mktemp -d /tmp/pylair-dogfood-XXXXXX); fi
+    WORKDIR=$(realpath_p "$WORKDIR")
     WORKDIR_CREATED=1
     APP_NAME=${APP_NAME:-dogfood-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ')}
     echo "scaffolding $APP_NAME (pylair@$VERSION) in $WORKDIR"
