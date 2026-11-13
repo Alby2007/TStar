@@ -601,11 +601,13 @@ async fn python_call_stream<R: Runtime>(
 }
 
 /// Forward one call's stream items to its per-call channel. A dead
-/// consumer — `Channel::send` fails when the webview is gone — reaps the
-/// owner's tasks and stops forwarding, so no stream slot or credit is
-/// left tied up. Uses `cancel_owner`: the awaited send cannot be dropped
-/// by a full command queue the way a `try_send` cancel can. Returns the
-/// forwarder's join handle (tests await it).
+/// consumer — `Channel::send` fails when the webview is gone — reaps
+/// that task and stops forwarding, so no stream slot or credit is left
+/// tied up. The reap is per-task, not per-label: a webview closed and
+/// reopened under the same label can hold newer live calls that a stale
+/// forwarder must not kill. Uses `cancel_task`: the awaited send cannot
+/// be dropped by a full command queue the way a `try_send` cancel can.
+/// Returns the forwarder's join handle (tests await it).
 #[doc(hidden)]
 pub fn forward_stream(
     on_event: tauri::ipc::Channel<Value>,
@@ -628,7 +630,7 @@ pub fn forward_stream(
                 }
             };
             if on_event.send(payload).is_err() {
-                rt.cancel_owner(owner.clone()).await;
+                rt.cancel_task(task, owner.clone()).await;
                 break;
             }
         }

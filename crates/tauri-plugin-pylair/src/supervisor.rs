@@ -743,6 +743,25 @@ impl Handle {
         let _ = self.cmd.send(Command::CancelOwned { owner }).await;
     }
 
+    /// Cancel exactly `task` as its owner — used by the stream forwarder
+    /// when the call's channel dies. Unlike `cancel` this awaits the
+    /// command send, so a momentarily-full queue cannot silently drop the
+    /// reap the way a `try_send` could; the outcome is discarded — the
+    /// dead consumer could never observe it. Cancelling one task leaves
+    /// same-owner siblings alone (a window closed and reopened under the
+    /// same label may hold newer live calls).
+    pub async fn cancel_task(&self, task: u64, owner: String) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .cmd
+            .send(Command::Cancel {
+                task,
+                respond: tx,
+                caller: Some(owner),
+            })
+            .await;
+    }
+
     /// Grant more stream pull-credit to `task` as `caller`.
     pub async fn grant_credit(
         &self,

@@ -214,3 +214,93 @@ async fn dead_channel_cancels_task_and_releases_stream_slot() {
     .unwrap();
     h.shutdown().await;
 }
+
+#[tokio::test]
+async fn dead_channel_reaps_only_that_task_not_same_owner_siblings() {
+    // The forwarder used to `cancel_owner` on send failure — correct when
+    // the window is truly gone, but a webview closed and reopened under
+    // the SAME label could have its newer live calls killed by a stale
+    // forwarder. The reap must be scoped to the dead task only.
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
+    let mut cfg = fast_config();
+    cfg.limits.max_concurrent_streams = 2;
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    // Task A gets a dead consumer; task B — same owner label — gets a
+    // live one that counts deliveries.
+    let (task_a, items_a) = timeout(
+        T,
+        h.call_stream("infinite_counted", json!({}), Some("win-a".into())),
+    )
+    .await
+    .expect("call_stream A timed out")
+    .unwrap();
+    let (task_b, items_b) = timeout(
+        T,
+        h.call_stream("infinite_counted", json!({}), Some("win-a".into())),
+    )
+    .await
+    .expect("call_stream B timed out")
+    .unwrap();
+
+    let dead = Channel::<serde_json::Value>::new(|_body| {
+        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "consumer gone").into())
+    });
+    timeout(
+        T,
+        tauri_plugin_pylair::forward_stream(dead, items_a, h.clone(), task_a, "win-a".into()),
+    )
+    .await
+    .expect("forwarder did not exit on send failure")
+    .expect("forwarder panicked");
+
+    let b_seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = b_seen.clone();
+    let live = Channel::<serde_json::Value>::new(move |_body| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    });
+    let b_forwarder =
+        tauri_plugin_pylair::forward_stream(live, items_b, h.clone(), task_b, "win-a".into());
+
+    // A is reaped (foreign-owner probe: Rejected while live, tombstone
+    // after) while B keeps receiving chunks the whole time.
+    timeout(T, async {
+        loop {
+            match h.cancel(task_a, Some("win-b".into())).await {
+                Ok(CancelOutcome::Completed | CancelOutcome::NotFound) => break,
+                Ok(outcome) => {
+                    assert_eq!(
+                        outcome,
+                        CancelOutcome::Rejected,
+                        "foreign cancel must be rejected or see a tombstone, got {outcome:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("probe cancel errored: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("task A was never reaped after its channel died");
+
+    // B is still live: owned by win-a, a foreign cancel is rejected and
+    // its channel has been receiving real chunks all along.
+    match timeout(T, h.cancel(task_b, Some("win-b".into()))).await {
+        Ok(Ok(CancelOutcome::Rejected)) => {}
+        other => panic!("task B must still be live and owned by win-a, got {other:?}"),
+    }
+    timeout(T, async {
+        while b_seen.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("task B's channel must have kept receiving while A was reaped");
+
+    // Cleanup: B's real owner may cancel it; the forwarder then ends.
+    let _ = timeout(T, h.cancel(task_b, Some("win-a".into()))).await;
+    let _ = timeout(T, b_forwarder).await;
+    h.shutdown().await;
+}
