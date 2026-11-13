@@ -97,6 +97,11 @@ parameters strictly, on every call mode including isolated workers:
   the function may still handle it; failures there surface as
   `INTERNAL` as usual. Scalar coercion (e.g. `"5"` → `int`) is *not*
   attempted — a wrong primitive is rejected, not converted.
+- **Honest gaps**: unknown keys inside a structured value are ignored
+  (a dataclass is built only from keys matching its fields), `Literal`
+  annotations are mapped for codegen but not validated at the boundary,
+  and a `None` default admits `null` even without `Optional`
+  (`x: str = None`).
 
 All boundary failures are caller bugs reported before any task is
 spawned: `INVALID_PARAMS` (`-32602`), never an `INTERNAL` `TypeError`

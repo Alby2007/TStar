@@ -482,3 +482,21 @@ def test_isolated_calls_validate_the_same_way(runtime):
     assert (
         runtime.recv_until(lambda m: m.get("id") == 5, timeout=30)["result"] == "none"
     )
+
+
+def test_none_default_admits_null(runtime):
+    runtime.recv()
+    # `x: str = None` — the default admits null even without Optional.
+    runtime.send(call(1, "maybe", task=1, input={"x": None}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == "None"
+    runtime.send(call(2, "maybe", task=2, input={"x": "s"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["result"] == "'s'"
+    runtime.send(call(3, "maybe", task=3, input={"x": 5}))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    # Same rule through an isolated worker.
+    runtime.send(call(4, "isolated_maybe", task=4, input={"x": None}))
+    assert (
+        runtime.recv_until(lambda m: m.get("id") == 4, timeout=30)["result"] == "None"
+    )

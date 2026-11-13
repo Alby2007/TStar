@@ -161,3 +161,24 @@ def test_kwargs_var_keyword_allows_extras():
         return a
 
     assert _json.coerce_kwargs(f, {"a": 1, "z": 9})["z"] == 9
+
+
+def test_kwargs_none_default_admits_none_without_optional():
+    # `x: str = None` — pre-Optional style; the None default makes
+    # null a legal value even though the bare annotation rejects it.
+    def f(x: str = None):  # noqa: RUF013
+        return x
+
+    assert _json.coerce_kwargs(f, {"x": None}) == {"x": None}
+    assert _json.coerce_kwargs(f, {"x": "s"}) == {"x": "s"}
+    assert _json.coerce_kwargs(f, {}) == {}
+    # …but a non-None value is still validated against the annotation.
+    with pytest.raises(_json.InvalidParams, match="param 'x'.*expected str"):
+        _json.coerce_kwargs(f, {"x": 5})
+
+    # A non-None default does NOT admit null.
+    def g(x: str = "d"):
+        return x
+
+    with pytest.raises(_json.InvalidParams, match="expected str, got null"):
+        _json.coerce_kwargs(g, {"x": None})

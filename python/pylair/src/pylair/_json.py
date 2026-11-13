@@ -281,6 +281,10 @@ def coerce_kwargs(fn: Any, input: dict) -> dict:
     for name, param in params.items():
         if name not in out or param.kind is inspect.Parameter.VAR_KEYWORD:
             continue
+        # `x: str = None` — a None default admits null even when the
+        # annotation isn't Optional (pre-PEP-484 style is everywhere).
+        if out[name] is None and param.default is None:
+            continue
         ann = hints.get(name, param.annotation)
         try:
             out[name] = coerce(ann, out[name])

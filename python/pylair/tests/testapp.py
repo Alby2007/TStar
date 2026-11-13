@@ -253,3 +253,14 @@ def isolated_spy(a: int) -> int:
 @expose(isolated=True)
 def isolated_pick(c: str | None = None) -> str:
     return c or "none"
+
+
+@expose
+def maybe(x: str = None) -> str:  # noqa: RUF013 - implicit-optional on purpose
+    # A None *default* admits None even without an Optional annotation.
+    return repr(x)
+
+
+@expose(isolated=True)
+def isolated_maybe(x: str = None) -> str:  # noqa: RUF013
+    return repr(x)
