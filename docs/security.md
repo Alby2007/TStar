@@ -264,6 +264,12 @@ posture, per `docs/decisions/0003-wrap-mode.md`:
   CPython build and Python dependencies they contain.
 - Signing keys and secrets never live in the repo; CI signing uses
   repository secrets (project brief §11).
+- `cargo audit` reports **RUSTSEC-2024-0429** (`glib 0.18.5`, unsound) —
+  a transitive dependency of Tauri's Linux GTK chain
+  (`tauri → wry → webkit2gtk → gtk`), so it affects Linux builds only.
+  There is no fix we can apply until Tauri moves off gtk-rs 0.18; the
+  advisory is tracked upstream and disclosed here as accepted residual
+  risk.
 
 ## 11. Reporting
 

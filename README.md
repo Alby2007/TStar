@@ -107,6 +107,11 @@ integration → `M6` reference app + RC.
   explicit error rather than a silently rounded value. Return large
   integers as strings until `{"$bigint"}` tagging lands
   (`docs/ideas.md`).
+- **`cargo audit` flags `glib 0.18.5` (RUSTSEC-2024-0429, unsound).**
+  It reaches Linux builds only, transitively through Tauri's GTK chain
+  (`tauri → wry → webkit2gtk → gtk`); the advisory is tracked upstream
+  and disclosed in `docs/security.md` §10 — no fix exists until Tauri
+  moves off gtk-rs 0.18.
 
 ## Layout
 
