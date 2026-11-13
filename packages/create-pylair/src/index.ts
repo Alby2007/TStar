@@ -45,9 +45,9 @@ export function substitutions(name: string, identifier: string, local?: string):
   } else {
     subs.__PYLAIR_PY__ = "pylair==0.1.0rc5";
     subs.__PYLAIR_JS_PKG__ = "@pylair/client";
-    subs.__PYLAIR_JS__ = "0.1.0-rc.9";
-    subs.__PYLAIR_CLI__ = "0.1.0-rc.9";
-    subs.__PYLAIR_RS__ = `tauri-plugin-pylair = "=0.1.0-rc.6"`;
+    subs.__PYLAIR_JS__ = "0.1.0-rc.10";
+    subs.__PYLAIR_CLI__ = "0.1.0-rc.10";
+    subs.__PYLAIR_RS__ = `tauri-plugin-pylair = "=0.1.0-rc.7"`;
   }
   return subs;
 }
