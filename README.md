@@ -112,6 +112,15 @@ integration → `M6` reference app + RC.
   (`tauri → wry → webkit2gtk → gtk`); the advisory is tracked upstream
   and disclosed in `docs/security.md` §10 — no fix exists until Tauri
   moves off gtk-rs 0.18.
+- **macOS, rc.8: launching through a symlinked path panics at startup.**
+  Tauri rejects an executable path containing a symlinked ancestor —
+  `/tmp` → `/private/tmp` is the common case — as process-relaunch
+  hardening, so `app.path().resource_dir()` errors and
+  `tauri-plugin-pylair ≤ 0.1.0-rc.5` crashed with
+  `resource_dir: UnknownPath`. Launch the app's real path instead.
+  Fixed in the next train: the plugin falls back to resolving resources
+  from the canonicalized executable and reports an actionable startup
+  error when neither lookup succeeds.
 
 ## Layout
 
