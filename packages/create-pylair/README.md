@@ -9,7 +9,7 @@ npm create pylair my-app
 
 **Release candidate:** while there's no stable release, `latest` tracks
 the newest RC — the command above gives you the newest RC. Pin an exact
-version for reproducibility: `npm create pylair@0.1.0-rc.5 my-app`.
+version for reproducibility: `npm create pylair@<version> my-app`.
 
 ## Prerequisites
 
