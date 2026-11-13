@@ -21,7 +21,7 @@ MAX_STREAM_CREDIT = int(os.environ.get("PYLAIR_MAX_STREAM_CREDIT", "4096"))
 MAX_ISOLATED_WORKERS = int(os.environ.get("PYLAIR_MAX_ISOLATED_WORKERS", "8"))
 # One chunk frame can never legitimately exceed the frame cap; a value
 # this large ends the stream with a typed error instead (RC.8A).
-from pylair._transport import MAX_FRAME
+from pylair._transport import MAX_DEPTH, MAX_FRAME
 
 
 def _log(msg: str) -> None:
@@ -167,6 +167,20 @@ class TaskRegistry:
                 await self._wait_for_credit(task)
                 value = await agen.__anext__()
                 task.credit -= 1
+                # A chunk deeper than the host's parser limit is a
+                # malformed frame on arrival — end THIS stream with the
+                # typed error instead of killing the runtime.
+                if _json.exceeds_depth(value, MAX_DEPTH - 4):
+                    self._finish(
+                        task,
+                        proto.error_response(
+                            task.call_id,
+                            proto.LIMIT_EXCEEDED,
+                            "stream chunk exceeds the depth cap",
+                            {"limit": "max_depth", "max": MAX_DEPTH},
+                        ),
+                    )
+                    return
                 # A chunk over the frame cap would be rejected by the host
                 # reader and kill the runtime — end THIS stream with the
                 # typed error instead (RC.8A).

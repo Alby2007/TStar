@@ -14,6 +14,10 @@ import struct
 import sys
 
 MAX_FRAME = int(os.environ.get("PYLAIR_MAX_FRAME", str(16 * 1024 * 1024)))
+# The host parses frames with serde_json, which refuses JSON nested
+# deeper than ~128 — a deeper result must fail ITS call before it can be
+# sent as an unparseable frame and kill the runtime (protocol §2).
+MAX_DEPTH = int(os.environ.get("PYLAIR_MAX_DEPTH", "100"))
 _LEN = struct.Struct(">I")
 
 

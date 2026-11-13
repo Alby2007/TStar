@@ -340,3 +340,47 @@ def test_shutdown_emits_ack_and_task_terminals(runtime):
     assert err.get("code") == proto.TASK_CANCELLED, (
         f"stream terminal across shutdown was {msgs!r}"
     )
+
+
+# ---- depth cap ---------------------------------------------------------------
+# serde_json on the host refuses frames nested deeper than 128, so a
+# legitimate deep Python result is indistinguishable from a malformed
+# frame — the runtime must check depth itself and fail only that call.
+
+
+def _nest(n: int):
+    out = 1
+    for _ in range(n):
+        out = {"d": out}
+    return out
+
+
+def test_deep_result_fails_only_that_call(runtime):
+    runtime.recv()  # hello
+    runtime.send(call(1, "deep", task=1, input={"n": 200}))
+    runtime.send(call(2, "add", task=2, input={"a": 2, "b": 3}))
+    err = runtime.recv_until(lambda m: m.get("id") == 1)
+    assert err["error"]["code"] == proto.LIMIT_EXCEEDED
+    assert err["error"]["data"]["limit"] == "max_depth"
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["result"] == 5
+    runtime.send(call(3, "add", task=3, input={"a": 1, "b": 1}))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["result"] == 2
+
+
+def test_deep_stream_chunk_fails_only_the_stream(runtime):
+    runtime.recv()
+    runtime.send(call(4, "deep_stream", task=4, input={"n": 200}))
+    runtime.send(grant(4))
+    terminal = runtime.recv_until(lambda m: m.get("id") == 4)
+    assert terminal["error"]["code"] == proto.LIMIT_EXCEEDED
+    runtime.send(call(5, "add", task=5, input={"a": 1, "b": 2}))
+    assert runtime.recv_until(lambda m: m.get("id") == 5)["result"] == 3
+
+
+def test_deep_isolated_result_fails_only_that_call(runtime):
+    runtime.recv()
+    runtime.send(call(6, "isolated_deep", task=6, input={"n": 200}))
+    err = runtime.recv_until(lambda m: m.get("id") == 6, timeout=30)
+    assert err["error"]["code"] == proto.LIMIT_EXCEEDED
+    runtime.send(call(7, "add", task=7, input={"a": 2, "b": 2}))
+    assert runtime.recv_until(lambda m: m.get("id") == 7)["result"] == 4

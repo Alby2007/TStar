@@ -179,3 +179,42 @@ def test_stalled_host_exits_with_distinct_reason():
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+# ---- depth cap (_send) --------------------------------------------------------
+
+
+def _nest(n: int):
+    out = 1
+    for _ in range(n):
+        out = {"d": out}
+    return out
+
+
+def test_deep_response_becomes_limit_error():
+    s, loop, _t = _server_with_loop()
+    s._send({"jsonrpc": "2.0", "id": 7, "result": _nest(200)})
+    body = s._out.get()
+    import json as _j
+
+    msg = _j.loads(body)
+    assert msg["id"] == 7
+    assert msg["error"]["code"] == proto.LIMIT_EXCEEDED
+    assert msg["error"]["data"]["limit"] == "max_depth"
+    loop.call_soon_threadsafe(loop.stop)
+
+
+def test_deep_notification_is_dropped_not_queued(capsys):
+    # A notification has no caller to report to: dropping it (with a log)
+    # beats writing a frame the host cannot parse.
+    s, loop, _t = _server_with_loop()
+    s._send(
+        {
+            "jsonrpc": "2.0",
+            "method": "stream.chunk",
+            "params": {"task": 1, "seq": 0, "value": _nest(200)},
+        }
+    )
+    assert s._out.stats()[0] == 0
+    loop.call_soon_threadsafe(loop.stop)
+    assert "depth" in capsys.readouterr().err

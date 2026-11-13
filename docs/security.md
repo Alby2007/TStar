@@ -240,9 +240,17 @@ environment, and network. The security claims are about the *edges*:
 
 Environment hygiene narrows the edge further: packaged spawns scrub the
 `PYTHON*` config vars (`PYTHONHOME`, `PYTHONSTARTUP`, `PYTHONEXECUTABLE`,
-`PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONPLATLIBDIR`) and set
-`PYTHONNOUSERSITE`/`PYTHONUTF8`, so the bundled interpreter can't be
-redirected by whatever launched the app. AppImage `APPDIR` entries are
+`PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONPLATLIBDIR`, `PYTHONWARNINGS`,
+`PYTHONBREAKPOINT`) and set `PYTHONNOUSERSITE`/`PYTHONUTF8`, so the
+bundled interpreter can't be redirected by whatever launched the app.
+`PYTHONSAFEPATH=1` keeps the child's cwd off `sys.path` — a `json.py` or
+`pylair/` in the launch directory would otherwise shadow the stdlib or
+the runtime itself for `python -m` — and the packaged cwd is pinned to
+the bundled resources dir rather than the directory the app was
+launched from. That dir is not necessarily writable (a signed macOS
+`.app`, an installed package): app code should resolve the OS app-data
+directory for files it writes, never relative paths off cwd. Isolated
+workers inherit all of this. AppImage `APPDIR` entries are
 stripped from `LD_LIBRARY_PATH`/`PATH` (exact-prefix match — sibling dirs
 survive). Dev overrides (`PYLAIR_APP_MODULE`, `PYLAIR_PYTHON`,
 `PYLAIR_PYTHONPATH`) are honored **in debug builds only** — a packaged

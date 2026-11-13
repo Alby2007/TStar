@@ -1917,17 +1917,39 @@ async fn spawn_child(
         }
     });
 
-    // stderr: always drained, forwarded as events (protocol §9)
+    // stderr: always drained, forwarded as events (protocol §9). Raw
+    // bytes + lossy UTF-8: an invalid byte must never end the drain —
+    // a full pipe deadlocks the child. The sink between drain and the
+    // bounded event channel owns the documented drop-oldest policy.
     let ev = events.clone();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if ev.try_send(RuntimeEvent::Stderr(line)).is_err() {
-                // channel full — drop oldest policy is the sink's problem;
-                // we must keep draining regardless to avoid pipe deadlock
+    let sink = Arc::new(StderrSink::new());
+    {
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let mut rdr = BufReader::with_capacity(16 * 1024, stderr);
+            let mut lines = StderrLines::new();
+            loop {
+                match rdr.fill_buf().await {
+                    Ok([]) => break, // EOF — child stderr closed
+                    Ok(b) => {
+                        let n = b.len();
+                        for line in lines.feed(b) {
+                            sink.push(line);
+                        }
+                        rdr.consume(n);
+                    }
+                    // A real I/O error (not bad UTF-8, which can't get
+                    // here — we never decode through lines()).
+                    Err(_) => break,
+                }
             }
-        }
-    });
+            if let Some(last) = lines.finish() {
+                sink.push(last);
+            }
+            sink.finish();
+        });
+    }
+    tokio::spawn(async move { sink.forward(ev).await });
 
     Ok(ChildIo {
         frame_out: frame_tx,
@@ -1936,6 +1958,163 @@ async fn spawn_child(
         exited: exit_rx,
         kill: kill_tx,
     })
+}
+
+/// stderr line + queue plumbing (protocol §9: drain unconditionally,
+/// drop OLDEST with a "[dropped N lines]" marker under backpressure).
+///
+/// One delivered line caps at this many raw bytes; the rest of the line
+/// is swallowed and the delivered text ends with the trunc marker.
+const STDERR_LINE_CAP: usize = 8 * 1024;
+/// Lines buffered between the always-draining reader and the bounded
+/// event channel. Full → oldest entries are evicted and counted.
+const STDERR_QUEUE_CAP: usize = 512;
+const STDERR_TRUNC_MARK: &str = "…[truncated]";
+
+/// Bounded, lossy stderr line assembler: splits raw bytes on `\n`,
+/// converts each line with `from_utf8_lossy` (bad bytes become `U+FFFD`,
+/// never an error), and caps a single line at `STDERR_LINE_CAP` input
+/// bytes — an over-long line is delivered truncated with a visible
+/// marker instead of growing the buffer without bound.
+struct StderrLines {
+    buf: Vec<u8>,
+    /// Swallowing the tail of an over-cap line until its `\n`.
+    over: bool,
+}
+
+impl StderrLines {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(1024),
+            over: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in chunk {
+            if b == b'\n' {
+                out.push(self.take());
+            } else if !self.over {
+                if self.buf.len() < STDERR_LINE_CAP {
+                    self.buf.push(b);
+                } else {
+                    // A byte is actually being dropped — only now is the
+                    // line truncated. A line of exactly STDERR_LINE_CAP
+                    // bytes is delivered unmarked.
+                    self.over = true;
+                }
+            } // else: swallow — cap already reached for this line
+        }
+        out
+    }
+
+    /// Flush a partial line at EOF (no trailing newline).
+    fn finish(&mut self) -> Option<String> {
+        (!self.buf.is_empty() || self.over).then(|| self.take())
+    }
+
+    fn take(&mut self) -> String {
+        let mut s = String::from_utf8_lossy(&self.buf).into_owned();
+        if self.over {
+            s.push_str(STDERR_TRUNC_MARK);
+        }
+        self.buf.clear();
+        self.over = false;
+        s
+    }
+}
+
+enum SinkItem {
+    Line(String),
+    /// Drain ended — forward exits after the queue empties.
+    Eof,
+}
+
+#[derive(Default)]
+struct SinkState {
+    q: VecDeque<SinkItem>,
+    /// Lines evicted but not yet reported. The forwarder emits the
+    /// cumulative "[dropped N stderr lines]" marker at delivery time —
+    /// markers can't be evicted and the count can never be lost or
+    /// double-counted.
+    dropped: u64,
+}
+
+/// The drop-oldest bound the event channel can't express: a bounded
+/// queue between the always-draining pipe reader (never blocks) and the
+/// `mpsc` forwarder (blocks on backpressure). Under overflow the oldest
+/// undelivered line is evicted and counted; the next pushed line is
+/// preceded by a `[dropped N stderr lines]` marker — the documented
+/// §9/§5 contract `try_send` (drop-newest, silent) could not provide.
+struct StderrSink {
+    state: std::sync::Mutex<SinkState>,
+    notify: tokio::sync::Notify,
+}
+
+impl StderrSink {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SinkState::default()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn push(&self, line: String) {
+        {
+            let mut st = self.state.lock().unwrap();
+            while st.q.len() >= STDERR_QUEUE_CAP {
+                match st.q.pop_front() {
+                    Some(SinkItem::Line(_)) => st.dropped += 1,
+                    // Eof only ever sits at the tail of a draining queue;
+                    // if we ever see it at the front the invariant broke —
+                    // keep it rather than swallow it.
+                    Some(SinkItem::Eof) => {
+                        st.q.push_back(SinkItem::Eof);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            st.q.push_back(SinkItem::Line(line));
+        }
+        self.notify.notify_one();
+    }
+
+    fn finish(&self) {
+        self.state.lock().unwrap().q.push_back(SinkItem::Eof);
+        self.notify.notify_one();
+    }
+
+    /// Forward queued lines onto the event channel; exits on Eof or a
+    /// closed receiver. Blocks only on `send` — never on the reader.
+    async fn forward(self: Arc<Self>, ev: mpsc::Sender<RuntimeEvent>) {
+        loop {
+            // Register interest before polling so a push between the
+            // check and the wait can't be missed (Notify keeps a permit,
+            // but this order is the canonical no-race form).
+            let notified = self.notify.notified();
+            let (item, dropped) = {
+                let mut st = self.state.lock().unwrap();
+                (st.q.pop_front(), std::mem::take(&mut st.dropped))
+            };
+            if dropped > 0 {
+                let marker = format!("[dropped {dropped} stderr lines]");
+                if ev.send(RuntimeEvent::Stderr(marker)).await.is_err() {
+                    return;
+                }
+            }
+            match item {
+                Some(SinkItem::Line(line)) => {
+                    if ev.send(RuntimeEvent::Stderr(line)).await.is_err() {
+                        return;
+                    }
+                }
+                Some(SinkItem::Eof) => return,
+                None => notified.await,
+            }
+        }
+    }
 }
 
 /// stdout reader without a writer — the reader task only consumes.
@@ -2129,6 +2308,67 @@ fn assign_to_job_object(pid: Option<u32>) -> Option<JobHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_lines_lossy_and_capped() {
+        let mut l = StderrLines::new();
+        // Invalid UTF-8 mid-stream: arrives as U+FFFD, does not stop parsing.
+        let out = l.feed(b"\xff\xfe bad \x80\nsecond line\n");
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains('\u{FFFD}'));
+        assert_eq!(out[1], "second line");
+        // A line over the cap is truncated with the marker, then parsing
+        // resumes on the next line.
+        let mut big = vec![b'x'; STDERR_LINE_CAP + 500];
+        big.extend_from_slice(b"\nok\n");
+        let out = l.feed(&big);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].len() <= STDERR_LINE_CAP + STDERR_TRUNC_MARK.len());
+        assert!(out[0].ends_with(STDERR_TRUNC_MARK));
+        assert_eq!(out[1], "ok");
+        // Exactly at the cap nothing was dropped: no marker. One byte
+        // over and the marker returns.
+        let mut exact = vec![b'e'; STDERR_LINE_CAP];
+        exact.extend_from_slice(b"\n");
+        let out = l.feed(&exact);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].ends_with(STDERR_TRUNC_MARK));
+        assert_eq!(out[0].len(), STDERR_LINE_CAP);
+        let mut one_over = vec![b'o'; STDERR_LINE_CAP + 1];
+        one_over.extend_from_slice(b"\n");
+        let out = l.feed(&one_over);
+        assert!(out[0].ends_with(STDERR_TRUNC_MARK));
+        // Partial line held until newline or finish.
+        assert!(l.feed(b"no newline yet").is_empty());
+        assert_eq!(l.finish().as_deref(), Some("no newline yet"));
+    }
+
+    #[tokio::test]
+    async fn stderr_sink_drops_oldest_with_marker() {
+        let sink = Arc::new(StderrSink::new());
+        for i in 0..(STDERR_QUEUE_CAP + 10) {
+            sink.push(format!("line-{i}"));
+        }
+        sink.finish();
+        let (tx, mut rx) = mpsc::channel(STDERR_QUEUE_CAP * 2);
+        let fwd = tokio::spawn({
+            let s = sink.clone();
+            async move { s.forward(tx).await }
+        });
+        let mut got = Vec::new();
+        while let Some(RuntimeEvent::Stderr(l)) = rx.recv().await {
+            got.push(l);
+        }
+        fwd.await.unwrap();
+        // 522 pushes into a 512 queue: the last 10 pushes each evict one
+        // head line — oldest first, newest survives, and ONE marker
+        // reports the cumulative count at delivery time.
+        assert_eq!(got.last().unwrap(), "line-521");
+        assert_eq!(got.first().unwrap(), "[dropped 10 stderr lines]");
+        assert!(!got.contains(&"line-0".to_string()));
+        assert!(!got.contains(&"line-9".to_string()));
+        assert!(got.contains(&"line-10".to_string()));
+    }
 
     #[cfg(windows)]
     #[test]
