@@ -137,6 +137,10 @@ def test_stalled_host_exits_with_distinct_reason():
     # Tiny cap so the flood fills it quickly; the byte cap stays large.
     env["PYLAIR_OUT_MAX_FRAMES"] = "32"
     env["PYLAIR_OUT_MAX_BYTES"] = str(1 << 30)
+    # Credit headroom far above any realistic OS pipe buffer (~1.3 MiB of
+    # chunks): if the pipe ever swallowed the whole flood, the queue would
+    # never fill and the "stalled host" path could not be exercised.
+    env["PYLAIR_MAX_STREAM_CREDIT"] = "32768"
     proc = subprocess.Popen(
         [sys.executable, "-m", "pylair", "testapp"],
         stdin=subprocess.PIPE,
@@ -164,7 +168,7 @@ def test_stalled_host_exits_with_distinct_reason():
         )
         for msg in (
             call,
-            proto.notification("stream.credit", {"task": 1, "n": 4096}),
+            proto.notification("stream.credit", {"task": 1, "n": 16384}),
         ):
             body = __import__("json").dumps(msg).encode()
             proc.stdin.write(_LEN.pack(len(body)) + body)
@@ -173,7 +177,10 @@ def test_stalled_host_exits_with_distinct_reason():
         deadline = time.time() + 30
         while proc.poll() is None and time.time() < deadline:
             time.sleep(0.1)
-        assert proc.poll() is not None, "runtime did not exit on stalled host"
+        assert proc.poll() is not None, (
+            "runtime did not exit on stalled host; stderr tail:\n"
+            + "".join(stderr_lines)[-2000:]
+        )
         joined = "".join(stderr_lines)
         assert "outbound queue full" in joined, joined[-2000:]
     finally:
