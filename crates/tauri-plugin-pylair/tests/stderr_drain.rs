@@ -184,10 +184,13 @@ for i in range(20000):
         Some(&19999),
         "newest line lost — the drain dropped newest, not oldest"
     );
-    // Lines we DID keep must be a prefix plus a suffix — the dropped
-    // span is in the middle, not at the end.
+    // Delivered lines keep flood order: drop-oldest evicts the head and
+    // never reorders. Whether a head prefix survives at all depends on
+    // the forwarder winning a scheduling race against the flood — not a
+    // property of the design, so it is not asserted (macOS flake, run
+    // #175): a starved forwarder legitimately sees only a late suffix.
     assert!(
-        numbered.contains(&0) || numbered.contains(&1),
-        "oldest lines missing entirely — queue may have dropped the head of the flood too late"
+        numbered.windows(2).all(|w| w[0] < w[1]),
+        "delivered lines out of order — drop-oldest must preserve arrival order"
     );
 }
