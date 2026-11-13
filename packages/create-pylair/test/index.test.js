@@ -41,10 +41,10 @@ test("scaffolds a complete app skeleton", () => {
   assert.equal(conf.identifier, "com.example.myapp");
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
-  assert.match(py, /pylair==0\.1\.0rc5/);
+  assert.match(py, /pylair==0\.1\.0rc6/);
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
-  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.7"/);
+  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.8"/);
   // Webviews may listen but must not inject events — a forged
   // pylair://stream terminal resolves another window's call.
   const caps = readFileSync(join(app, "src-tauri/capabilities/default.json"), "utf8");
