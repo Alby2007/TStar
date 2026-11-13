@@ -1618,7 +1618,9 @@ fn cancel_outcome(out: &Result<Value, ErrorObj>) -> CancelOutcome {
             Some("termination_in_progress") => CancelOutcome::TerminationUncertain,
             _ => CancelOutcome::Cancelled,
         },
-        // task_not_found from the runtime = it finished before we asked.
+        // cancelled:false — the task already finished, or the pending
+        // buffer refused it. A cancel that merely outraced registration
+        // comes back cancelled:true + status:"pending" instead.
         Ok(_) => CancelOutcome::Completed,
         Err(_) => CancelOutcome::TerminationUncertain,
     }

@@ -89,7 +89,7 @@ All messages carry `"jsonrpc": "2.0"`.
 | method | params | response result |
 |---|---|---|
 | `call` | `{fn, input, task}` | fn's return value (JSON); for generator fns, see §3.1 |
-| `cancel` | `{task}` | `{cancelled: true/false, status?, reason?}` |
+| `cancel` | `{task}` | `{cancelled: true/false, status?, reason?}` — see §3.2 |
 | `shutdown` | `{grace_ms}` | `{}` then process exits 0 |
 | `ping` | `{seq}` | must produce a `pong {seq}` notification — see §5 |
 
@@ -158,6 +158,34 @@ on a generator while it holds credit for that task.
   pauses it.
 - `cancel` is independent of credit: a task is cancellable whether it
   is producing, waiting on credit, or fully drained.
+
+### 3.2 Cancel acknowledgement
+
+`cancel` returns `{cancelled, status?, reason?}`:
+
+- `cancelled: true` — the runtime accepted the cancel. `status` refines
+  where it landed:
+  - absent — the task was live and has been cancelled.
+  - `"pending"` — the task id is not registered **yet**: the host's
+    control lane can overtake the data lane, so a `cancel` may arrive
+    before its `call`. The runtime records the id in a bounded pending
+    set and cancels the task at registration — the call still gets a
+    terminal `TASK_CANCELLED` response. Because the host only forwards
+    cancels for tasks of the current generation, a not-yet-registered id
+    is always a call still in flight, so `pending` is an acceptance, not
+    a miss.
+  - `"terminated"` — an isolated worker was killed and reaped.
+  - `"may_continue"` — inline sync work that cannot be interrupted; it
+    may run to completion.
+  - `"termination_in_progress"` — termination was requested but is not
+    confirmed.
+- `cancelled: false, reason: "task_not_found"` — the task already
+  finished (its terminal was emitted and the entry reaped), or the
+  bounded pending set refused a new id. The host maps this to
+  `completed`.
+
+A `pending` ack therefore means "will be cancelled", never "already
+finished" — the host reports `cancelled`, not `completed`.
 
 ## 4. Handshake and lifecycle
 

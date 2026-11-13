@@ -247,8 +247,11 @@ async fn cancel_after_pipe_dies_is_delivery_failed() {
 ///    lane, so Python may see `cancel` before `call`. The task is held in
 ///    _pending_cancels and cancelled at registration — and its call's
 ///    terminal MUST still arrive (a pre-first-step task emits nothing
-///    without the finisher; RC.8B fixed that hang). The cancel's own
-///    outcome depends on which frame won the race — either is explicit.
+///    without the finisher; RC.8B fixed that hang). Either way the race
+///    goes, the cancel's outcome is `Cancelled`: a live task reports
+///    cancelled:true, an unregistered one reports status:"pending" —
+///    the runtime records it and applies it at registration, so it is
+///    never reported Completed.
 #[tokio::test]
 async fn cancel_that_outruns_registration_still_terminates_stream() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
@@ -263,10 +266,11 @@ async fn cancel_that_outruns_registration_still_terminates_stream() {
         .await
         .expect("cancel must complete")
         .expect("cancel outcome is named");
-    assert!(
-        matches!(out, CancelOutcome::Cancelled | CancelOutcome::Completed),
-        "racing cancel reported {out:?} — expected Cancelled (lost the \
-         race, cancelled live) or Completed (won it, not yet registered)"
+    assert_eq!(
+        out,
+        CancelOutcome::Cancelled,
+        "racing cancel reported {out:?} — pending registration must \
+         still report Cancelled, never Completed"
     );
 
     // Whichever way the race went, the caller's terminal is the SAME

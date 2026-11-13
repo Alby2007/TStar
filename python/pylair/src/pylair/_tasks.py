@@ -346,11 +346,18 @@ class TaskRegistry:
 
     async def cancel(self, task_id: int | str) -> dict:
         task = self._tasks.get(task_id)
-        if task is None or task.done:
-            # A cancel can outrun the call that creates the task — remember
-            # it so the task is cancelled on arrival, never run untracked.
+        if task is None:
+            # A cancel can outrun the call that creates the task (the
+            # host's control lane beats the data lane) — record it so it
+            # lands at registration, never run untracked. The supervisor
+            # only forwards cancels for in-generation tasks, so an
+            # unknown id means the call frame is still in flight: the
+            # cancel is accepted pending arrival, not refused.
             if len(self._pending_cancels) < 4096:
                 self._pending_cancels.add(task_id)
+                return {"cancelled": True, "status": "pending"}
+            return {"cancelled": False, "reason": "task_not_found"}
+        if task.done:
             return {"cancelled": False, "reason": "task_not_found"}
         if task.asyncio_task is not None and not task.asyncio_task.done():
             task.asyncio_task.cancel()

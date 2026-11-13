@@ -96,6 +96,13 @@ at `@expose` time, not at cancel time.
   `not_found` (no such task in this runtime generation — a stale id can
   never control a new task), `rejected` (this webview does not own the
   task), or `delivery_failed` (the control frame could not be queued).
+- **Cancel that outruns its call:** the control lane can overtake the
+  data lane, so the runtime may see `cancel` before `call`. It records
+  the id and acknowledges `{cancelled: true, status: "pending"}` —
+  applied at registration, terminal `TASK_CANCELLED` still delivered —
+  so the host reports `cancelled`, never `completed`. Only a task that
+  truly finished (or an id the bounded pending set refused) answers
+  `cancelled: false` → `completed`.
 - **Cancel an unknown/finished task:** `not_found` / `completed` —
   distinct outcomes, never an error for the caller.
 - **Ownership is enforced, not advisory.** Only the webview that started
