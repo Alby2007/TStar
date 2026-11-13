@@ -34,6 +34,27 @@ your app needs JS-side `emit`, add `"core:event:allow-emit"` back in
 your own capability block (deny rules win, so remove the deny entries
 too). See `docs/security.md` for the full event-scoping model.
 
+## Windows: no console window
+
+The scaffolded `src-tauri/src/main.rs` starts with Tauri's standard line:
+
+```rust
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+```
+
+so `pylair build` produces a GUI binary — launching the installed app no
+longer pops a console window. Debug builds (`tauri dev`) keep the console
+for log output. Apps scaffolded before this line existed: add the same
+two lines at the top of `src-tauri/src/main.rs` to get the behavior.
+
+Two scripting notes for a GUI-subsystem exe: it detaches from the
+console, so PowerShell's `&` returns immediately and `$LASTEXITCODE` is
+stale — wait on the process instead
+(`Start-Process -Wait -PassThru`, then read `.ExitCode`). And
+`--self-test` output still reaches the terminal that launched it — the
+plugin attaches the parent's console for the self-test paths.
+
 Pylair builds on [Tauri](https://tauri.app) but is not affiliated with
 or endorsed by the Tauri project.
 
