@@ -1,0 +1,47 @@
+name: Dependency audits
+
+# Weekly + on-demand dependency audits across all three ecosystems.
+# Read-only and never a PR gate — findings surface as job failures in
+# this workflow only, so they can't block merges.
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC — off the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      # Prebuilt cargo-audit; scans the workspace Cargo.lock including
+      # target-gated deps (glib/gtk chain) regardless of host OS.
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+
+  pnpm-audit:
+    name: pnpm audit (prod deps only)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm audit --prod
+
+  pip-audit:
+    name: pip-audit (pylair + pylair-ollama, prod deps)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Export production dependency sets
+        run: |
+          uv export --project python/pylair --no-dev --no-hashes --no-emit-project -o /tmp/pylair-prod.txt
+          uv export --project integrations/ollama --no-dev --no-hashes --no-emit-project -o /tmp/ollama-prod.txt
+      - name: Audit
+        run: uvx pip-audit -r /tmp/pylair-prod.txt -r /tmp/ollama-prod.txt
