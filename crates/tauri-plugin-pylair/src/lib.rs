@@ -335,8 +335,6 @@ pub mod events {
     pub const STDERR: &str = "pylair://stderr";
     /// The exposes manifest after handshake.
     pub const EXPOSES: &str = "pylair://exposes";
-    /// Stream items: `{task, seq?, value?, done, result?|error?}`.
-    pub const STREAM: &str = "pylair://stream";
 }
 
 /// Managed state holding the supervisor handle.
@@ -582,22 +580,40 @@ async fn python_call<R: Runtime>(
 }
 
 /// Start a streaming call. Returns the task id; chunks and the terminal
-/// arrive on the `pylair://stream` event, addressed to the owning webview.
+/// arrive on the per-call `on_event` channel — delivery is bound to the
+/// invoking webview, no shared event bus (event-scoping fix).
 #[tauri::command]
 async fn python_call_stream<R: Runtime>(
-    app: tauri::AppHandle<R>,
     window: tauri::WebviewWindow<R>,
     reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
+    on_event: tauri::ipc::Channel<Value>,
     fn_name: String,
     input: Value,
 ) -> Result<u64, ErrorObj> {
     subscribed(&window, &reg);
     let label = window.label().to_string();
-    let (task, mut items) =
+    let (task, items) =
         rt.0.call_stream(&fn_name, input, Some(label.clone()))
             .await?;
-    let reg_state: Registry = app.state::<Registry>().inner().clone();
+    forward_stream(on_event, items, rt.0.clone(), task, label);
+    Ok(task)
+}
+
+/// Forward one call's stream items to its per-call channel. A dead
+/// consumer — `Channel::send` fails when the webview is gone — reaps the
+/// owner's tasks and stops forwarding, so no stream slot or credit is
+/// left tied up. Uses `cancel_owner`: the awaited send cannot be dropped
+/// by a full command queue the way a `try_send` cancel can. Returns the
+/// forwarder's join handle (tests await it).
+#[doc(hidden)]
+pub fn forward_stream(
+    on_event: tauri::ipc::Channel<Value>,
+    mut items: supervisor::StreamRx,
+    rt: Handle,
+    task: u64,
+    owner: String,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         while let Some(item) = items.recv().await {
             let payload = match item {
@@ -611,13 +627,12 @@ async fn python_call_stream<R: Runtime>(
                     json!({"task": task, "done": true, "error": e})
                 }
             };
-            // Scoped to the webview that started the stream (P1-8).
-            if app.emit_to(&label, events::STREAM, payload).is_err() {
-                reg_state.lock().unwrap().drop_label(&label);
+            if on_event.send(payload).is_err() {
+                rt.cancel_owner(owner.clone()).await;
+                break;
             }
         }
-    });
-    Ok(task)
+    })
 }
 
 #[tauri::command]

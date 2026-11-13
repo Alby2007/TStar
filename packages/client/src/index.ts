@@ -1,15 +1,35 @@
 /**
  * @pylair/client — typed calls into the managed Python runtime.
  *
- * Transport: `plugin:pylair|python_*` commands + `pylair://*` events
- * (see crates/tauri-plugin-pylair/src/lib.rs `events` and
- * docs/protocol-v1.md). The bridge is injectable for testing/headless use.
+ * Transport: `plugin:pylair|python_*` commands. Call/stream delivery
+ * rides a per-call `tauri::ipc::Channel` bound to the invoking webview —
+ * not an event bus. `pylair://*` events remain for broadcast lifecycle
+ * (state/stderr/exposes). See docs/protocol-v1.md. The bridge is
+ * injectable for testing/headless use.
  */
 
-/** Minimal bridge over Tauri invoke/listen — injectable for tests. */
+/**
+ * Minimal bridge over Tauri invoke/listen — injectable for tests.
+ *
+ * `invokeChannel` carries the per-call event channel: the plugin command
+ * requires an `onEvent` `tauri::ipc::Channel`, so each call/stream gets
+ * its own delivery — there is no shared stream event bus to listen to
+ * (that bus was the event-scoping leak). Breaking vs the pre-channel
+ * interface: a custom bridge must now implement `invokeChannel`.
+ */
 export interface IpcBridge {
   invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T>;
   listen<T = unknown>(event: string, cb: (payload: T) => void): Promise<() => void>;
+  /**
+   * Invoke a streaming command with a per-call event sink. `onEvent`
+   * receives StreamEvents for THIS invocation only; the implementation
+   * binds it to a `Channel` passed as the `onEvent` argument.
+   */
+  invokeChannel<T = number>(
+    cmd: string,
+    args: Record<string, unknown>,
+    onEvent: (ev: StreamEvent) => void,
+  ): Promise<T>;
 }
 
 /** Python-side error object (docs/protocol-v1.md §8). */
@@ -93,11 +113,12 @@ export interface StreamEvent {
   error?: { code: number; message: string; data?: unknown };
 }
 
+// Broadcast lifecycle events — stream/result delivery is NOT an event;
+// it rides the per-call channel bound to the invoking webview.
 const EVT = {
   state: "pylair://state",
   stderr: "pylair://stderr",
   exposes: "pylair://exposes",
-  stream: "pylair://stream",
 } as const;
 
 const CMD = {
@@ -125,6 +146,13 @@ function defaultBridge(): Promise<IpcBridge> {
       invoke: (cmd, args) => core.invoke(cmd, args),
       listen: <T,>(ev: string, cb: (p: T) => void) =>
         event.listen<T>(ev, (e) => cb(e.payload)),
+      invokeChannel: (cmd, args, onEvent) => {
+        // onmessage is wired BEFORE invoke — the first chunk can race
+        // the invoke response and must not be lost.
+        const channel = new core.Channel<StreamEvent>();
+        channel.onmessage = onEvent;
+        return core.invoke(cmd, { ...args, onEvent: channel });
+      },
     };
   });
   return _defaultBridge;
@@ -192,62 +220,39 @@ function fromWire(v: unknown): unknown {
 }
 
 // ---- internal stream machinery ---------------------------------------------
+//
+// Every call — plain or streaming — goes through `python_call_stream` so it
+// always has a task id (needed for cancellation). Delivery arrives on the
+// per-call `Channel` passed at invoke time: each invocation only ever sees
+// its own events, so no task-map routing or early-event buffering exists.
 
 /**
- * Every call — plain or streaming — goes through `python_call_stream` so it
- * always has a task id (needed for cancellation). Plain calls simply see a
- * single terminal stream event.
+ * Live task ids in THIS window — not for routing (channels do that), only
+ * so a page unload can cancel them. A reload kills every channel but
+ * `Channel::send` does NOT reliably error on a reload (the webview object
+ * survives; the eval lands in a dead JS context and the callback is a
+ * no-op), so without this hook a reloaded window's tasks would keep
+ * running — and keep a stream slot — until they end on their own.
  */
-interface ActiveTask {
-  onItem: (ev: StreamEvent) => void;
-}
+const liveTasks = new Set<number>();
+let unloadHooked = false;
 
-const tasks = new Map<number, ActiveTask>();
-let streamListener: Promise<() => void> | null = null;
-
-/**
- * Events for a task id nobody has registered yet. The Rust forwarder starts
- * emitting as soon as Python replies, which can beat the `invoke` response
- * that carries the task id back to JS. Every task here was started by this
- * client, so an unknown id is an in-flight invoke: hold its events and
- * replay them on registration. Entries expire so a cancelled/abandoned
- * invoke cannot leak.
- */
-const EARLY_TTL_MS = 30_000;
-const early = new Map<number, { events: StreamEvent[]; timer: ReturnType<typeof setTimeout> }>();
-
-function holdEarly(ev: StreamEvent): void {
-  let e = early.get(ev.task);
-  if (!e) {
-    const timer = setTimeout(() => early.delete(ev.task), EARLY_TTL_MS);
-    (timer as { unref?: () => void }).unref?.();
-    e = { events: [], timer };
-    early.set(ev.task, e);
+function trackLive(task: number): void {
+  // No DOM lib in this package — globalThis is the window in a webview.
+  const g = globalThis as {
+    addEventListener?: (event: string, cb: () => void) => void;
+  };
+  if (typeof g.addEventListener === "function" && !unloadHooked) {
+    unloadHooked = true;
+    g.addEventListener("pagehide", () => {
+      // Best effort: teardown may cut the invoke off, but when it lands
+      // the tasks die instead of running orphaned under a dead channel.
+      void ipc().then((b) => {
+        for (const task of liveTasks) b.invoke(CMD.cancel, { task }).catch(() => {});
+      });
+    });
   }
-  e.events.push(ev);
-}
-
-/** Register a task and replay anything that arrived before it existed. */
-function register(task: number, t: ActiveTask): void {
-  tasks.set(task, t);
-  const e = early.get(task);
-  if (!e) return;
-  early.delete(task);
-  clearTimeout(e.timer);
-  for (const ev of e.events) {
-    t.onItem(ev);
-    if (ev.done) break;
-  }
-}
-
-async function ensureStreamListener(): Promise<void> {
-  streamListener ??= (async () =>
-    (await ipc()).listen<StreamEvent>(EVT.stream, (ev) => {
-      const t = tasks.get(ev.task);
-      if (t) t.onItem(ev);
-      else holdEarly(ev);
-    }))();
-  await streamListener;
+  liveTasks.add(task);
 }
 
 function wireAbort(signal: AbortSignal | undefined, task: number): void {
@@ -302,31 +307,40 @@ export async function call<T = unknown>(
   opts: CallOptions = {},
 ): Promise<T> {
   const b = await ipc();
-  await ensureStreamListener();
-  const task = await b
-    .invoke<number>(CMD.callStream, {
-      fnName: fn,
-      input: toWire(input) as Record<string, unknown>,
-    })
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const result = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  // The terminal can arrive before the invoke resolves — the callback is
+  // bound at invoke time, so nothing is lost. `task` must be a let bound
+  // before invokeChannel runs: the callback can fire during the invoke.
+  let settled = false;
+  let disarm = () => {};
+  let task = -1;
+  task = await b
+    .invokeChannel<number>(
+      CMD.callStream,
+      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      (ev) => {
+        if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
+        settled = true;
+        liveTasks.delete(task);
+        disarm();
+        if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
+        else resolve(fromWire(ev.result) as T);
+      },
+    )
     .catch((e) => {
       throw asPythonError(e);
     });
   wireAbort(opts.signal, task);
-  return new Promise<T>((resolve, reject) => {
-    const disarm = armDeadline(opts, task, (e) => {
-      tasks.delete(task);
-      reject(e);
-    });
-    register(task, {
-      onItem: (ev) => {
-        if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
-        disarm();
-        tasks.delete(task);
-        if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
-        else resolve(fromWire(ev.result) as T);
-      },
-    });
-  });
+  if (!settled) {
+    trackLive(task);
+    disarm = armDeadline(opts, task, reject);
+  }
+  return result;
 }
 
 const CREDIT_BATCH = 32;
@@ -338,34 +352,33 @@ export async function* stream<T = unknown>(
   opts: CallOptions = {},
 ): AsyncGenerator<T, void, void> {
   const b = await ipc();
-  await ensureStreamListener();
-  const task = await b
-    .invoke<number>(CMD.callStream, {
-      fnName: fn,
-      input: toWire(input) as Record<string, unknown>,
-    })
-    .catch((e) => {
-      throw asPythonError(e);
-    });
-  wireAbort(opts.signal, task);
-
   const queue: StreamEvent[] = [];
   let wake: (() => void) | null = null;
   let pendingCredit = 0;
   let finished = false; // terminal event seen: producer already done
   let expired: PythonError | null = null;
+  // Bound at invoke time — events queue locally even if they beat the
+  // invoke response back.
+  const task = await b
+    .invokeChannel<number>(
+      CMD.callStream,
+      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      (ev) => {
+        queue.push(ev);
+        wake?.();
+      },
+    )
+    .catch((e) => {
+      throw asPythonError(e);
+    });
+  wireAbort(opts.signal, task);
+  trackLive(task);
   const disarm = armDeadline(opts, task, (e) => {
     expired = e;
     finished = true; // the deadline already sent the cancel
     wake?.();
   });
 
-  register(task, {
-    onItem: (ev) => {
-      queue.push(ev);
-      wake?.();
-    },
-  });
   try {
     for (;;) {
       while (queue.length === 0) {
@@ -392,7 +405,7 @@ export async function* stream<T = unknown>(
     }
   } finally {
     disarm();
-    tasks.delete(task);
+    liveTasks.delete(task);
     // Consumer walked away (break / return() / throw) before the producer
     // finished: stop it instead of leaving it running and granting credit.
     if (!finished) void b.invoke(CMD.cancel, { task }).catch(() => {});
@@ -685,12 +698,9 @@ export const python = {
   onExposes,
 };
 
-/** For tests: reset all listeners/tasks between cases. */
+/** For tests: reset the injected bridge between cases. */
 export function _resetForTests(): void {
-  tasks.clear();
-  for (const e of early.values()) clearTimeout(e.timer);
-  early.clear();
-  streamListener = null;
+  liveTasks.clear();
   _bridge = null;
   _defaultBridge = null;
 }
