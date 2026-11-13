@@ -22,6 +22,7 @@ a NaN score must fail one call, never the runtime (protocol §2).
 from __future__ import annotations
 
 import base64
+import binascii
 import dataclasses
 import datetime as _dt
 import enum
@@ -97,19 +98,40 @@ def loads(raw: str | bytes) -> Any:
     return json.loads(raw, object_hook=_object_hook)
 
 
-# ---- input coercion: dict -> annotated types ------------------------------
+# ---- input validation + coercion: dict -> annotated types ------------------
+
+_SHORT_LIMIT = 80
+
+
+def _typename(ann: Any) -> str:
+    return getattr(ann, "__name__", str(ann))
+
+
+def _short(value: Any) -> str:
+    """repr for error messages — never echo a huge user-supplied value."""
+    r = repr(value)
+    return r if len(r) <= _SHORT_LIMIT else r[:_SHORT_LIMIT] + "…"
 
 
 def coerce(annotation: Any, value: Any) -> Any:
-    """Rebuild `value` (wire JSON) into `annotation`'s type where possible."""
-    if annotation is inspect.Parameter.empty or value is None:
+    """Validate `value` (wire JSON) against `annotation` and rebuild the
+    annotated type. Raises InvalidParams on mismatch — a value that can't
+    hold the annotation must never reach the function body. Annotations
+    this layer doesn't model pass through unchanged."""
+    if (
+        annotation is inspect.Parameter.empty
+        or annotation is Any
+        or annotation is object
+    ):
         return value
 
     origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
 
-    # Optional[T] / Union[...] — try each arm, first success wins.
+    # Optional[T] / Union[...] — valid if any arm matches.
     if origin in (typing.Union, types.UnionType):
+        if value is None and type(None) in args:
+            return None
         for arm in args:
             if arm is type(None):
                 continue
@@ -117,67 +139,119 @@ def coerce(annotation: Any, value: Any) -> Any:
                 return coerce(arm, value)
             except Exception:  # noqa: BLE001,S112 - try the next union arm
                 continue
-        return value
+        raise InvalidParams(f"expected {annotation}, got {_short(value)}")
+
+    # null is only valid for Optional (handled above).
+    if value is None:
+        raise InvalidParams(f"expected {_typename(annotation)}, got null")
+
+    # Primitives: strict wire types. bool precedes int — isinstance(True, int)
+    # is True, and JSON true is never a valid int/float.
+    if annotation is bool:
+        if isinstance(value, bool):
+            return value
+        raise InvalidParams(f"expected bool, got {_short(value)}")
+    if annotation is int:
+        # JSON can't distinguish 3 from 3.0 — whole floats are ints.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise InvalidParams(f"expected int, got {_short(value)}")
+    if annotation is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        raise InvalidParams(f"expected float, got {_short(value)}")
+    if annotation is str:
+        if isinstance(value, str):
+            return value
+        raise InvalidParams(f"expected str, got {_short(value)}")
 
     if inspect.isclass(annotation) and dataclasses.is_dataclass(annotation):
-        if isinstance(value, dict):
-            fields = {f.name: f for f in dataclasses.fields(annotation)}
-            try:
-                # Under `from __future__ import annotations` f.type is a
-                # string — resolved hints are required for nested types.
-                hints = typing.get_type_hints(annotation)
-            except Exception:  # noqa: BLE001 - fall back to raw field types
-                hints = {}
+        if not isinstance(value, dict):
+            raise InvalidParams(
+                f"expected object for {_typename(annotation)}, got {_short(value)}"
+            )
+        fields = {f.name: f for f in dataclasses.fields(annotation)}
+        try:
+            # Under `from __future__ import annotations` f.type is a
+            # string — resolved hints are required for nested types.
+            hints = typing.get_type_hints(annotation)
+        except Exception:  # noqa: BLE001 - fall back to raw field types
+            hints = {}
+        try:
             kwargs = {
                 k: coerce(hints.get(k, fields[k].type), v)
                 for k, v in value.items()
                 if k in fields
             }
             return annotation(**kwargs)
-        return value
+        except InvalidParams:
+            raise
+        except Exception as e:
+            raise InvalidParams(f"{_typename(annotation)}: {e}") from e
 
     if origin in (list, set, frozenset) or annotation is list:
+        if not isinstance(value, list):
+            raise InvalidParams(
+                f"expected list for {_typename(annotation)}, got {_short(value)}"
+            )
         (item_t,) = args or (inspect.Parameter.empty,)
-        if isinstance(value, list):
-            items = [coerce(item_t, v) for v in value]
-            return set(items) if origin in (set, frozenset) else items
-        return value
+        items = [coerce(item_t, v) for v in value]
+        return set(items) if origin in (set, frozenset) else items
 
-    if origin is tuple and isinstance(value, list):
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise InvalidParams(f"expected list for tuple, got {_short(value)}")
         if len(args) == 2 and args[1] is Ellipsis:
             return tuple(coerce(args[0], v) for v in value)
         return tuple(coerce(t, v) for t, v in zip(args, value, strict=False))
 
     if origin is dict or annotation is dict:
+        if not isinstance(value, dict):
+            raise InvalidParams(f"expected object for dict, got {_short(value)}")
         val_t = args[1] if len(args) == 2 else inspect.Parameter.empty
-        if isinstance(value, dict):
-            return {k: coerce(val_t, v) for k, v in value.items()}
-        return value
+        return {k: coerce(val_t, v) for k, v in value.items()}
 
-    if annotation in (_dt.datetime, _dt.date, _dt.time) and isinstance(value, str):
-        try:
-            return annotation.fromisoformat(value)
-        except ValueError:
-            return value
+    if annotation in (_dt.datetime, _dt.date, _dt.time):
+        if isinstance(value, str):
+            try:
+                return annotation.fromisoformat(value)
+            except ValueError:
+                pass
+        raise InvalidParams(
+            f"expected ISO-8601 {_typename(annotation)}, got {_short(value)}"
+        )
 
-    if annotation is bytes and isinstance(value, str):
-        # TS may send a bare base64 string for a bytes-annotated param.
-        try:
-            return base64.b64decode(value)
-        except Exception:  # noqa: BLE001 - not base64; pass through
-            return value
+    if annotation is bytes:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            # TS may send a bare base64 string for a bytes-annotated param.
+            try:
+                return base64.b64decode(value, validate=True)
+            except (binascii.Error, ValueError):
+                raise InvalidParams(
+                    f"expected base64 bytes, got {_short(value)}"
+                ) from None
+        raise InvalidParams(f"expected base64 bytes, got {_short(value)}")
 
     if inspect.isclass(annotation) and issubclass(annotation, enum.Enum):
         try:
             return annotation(value)
         except ValueError:
-            return value
+            raise InvalidParams(
+                f"expected {_typename(annotation)}, got {_short(value)}"
+            ) from None
 
     return value
 
 
 def coerce_kwargs(fn: Any, input: dict) -> dict:
-    """Coerce an incoming `input` dict by `fn`'s parameter annotations."""
+    """Validate an incoming `input` dict against `fn`'s signature and coerce
+    values to the annotated types. Raises InvalidParams for missing required
+    params, unexpected keys (unless `**kwargs`), or a value the annotation
+    can't hold — the function body never sees bad input."""
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
@@ -186,9 +260,26 @@ def coerce_kwargs(fn: Any, input: dict) -> dict:
         hints = typing.get_type_hints(fn)
     except Exception:  # noqa: BLE001 - unresolved refs fall back to raw anns
         hints = {}
+    params = sig.parameters
+
+    has_varkw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if not has_varkw:
+        for k in input:
+            if k not in params:
+                raise InvalidParams(f"unexpected parameter '{k}'")
+
+    for name, p in params.items():
+        if (
+            p.default is inspect.Parameter.empty
+            and p.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            and name not in input
+        ):
+            raise InvalidParams(f"missing required parameter '{name}'")
+
     out = dict(input)
-    for name, param in sig.parameters.items():
-        if name not in out:
+    for name, param in params.items():
+        if name not in out or param.kind is inspect.Parameter.VAR_KEYWORD:
             continue
         ann = hints.get(name, param.annotation)
         try:

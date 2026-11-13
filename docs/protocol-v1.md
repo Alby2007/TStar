@@ -66,8 +66,11 @@ hang or OOM the host.
   types the runtime encodes `bytes`/`bytearray` as `{"$b64": "<base64>"}`
   (decoded symmetrically on input), `@dataclass` as its field dict,
   `datetime`/`date`/`time` as ISO 8601 strings, `Enum` as its value, and
-  `set` as a list. Incoming params are coerced back by annotation — a
-  dataclass-annotated parameter receives an instance, not a dict.
+  `set` as a list. Incoming params are validated then coerced by
+  annotation — a dataclass-annotated parameter receives an instance,
+  not a dict, and a value the annotation can't hold (wrong primitive,
+  missing required key, unexpected key) is `INVALID_PARAMS` before the
+  function body runs.
 - **Serialization happens on the event loop**, before a message reaches
   the writer thread. A result that can't serialize (numpy/tensor
   objects, `NaN`/`Infinity` — `allow_nan=False` since bare `NaN` is not

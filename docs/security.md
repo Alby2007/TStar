@@ -69,16 +69,17 @@ the `@expose` decorator at import time. On a `call`, the runtime:
 1. looks up `fn` in the registry — anything else fails with
    `FUNCTION_NOT_FOUND` (`-32601`);
 2. requires `input` to be a JSON object;
-3. coerces each argument against the function's signature — but the
-   coercion is *structural*, not a type check. It reconstructs annotated
-   composite types (dataclasses, containers, `Enum`, `bytes`,
-   `datetime`); a reconstruction failure is `INVALID_PARAMS` (`-32602`),
-   a caller error, not a function exception. Primitive annotations
-   (`int`/`str`/`float`/`bool`) are **not checked**: a wrong primitive
-   passes through unchanged (`add(a: int, b: int)` called with
-   `{"a": "x", "b": "y"}` runs and returns `"xy"`), and a missing or
-   extra key raises `TypeError` inside the function, which comes back as
-   `INTERNAL`, not `INVALID_PARAMS`.
+3. validates each argument against the function's signature before
+   dispatch (`_json.coerce_kwargs`). Annotated parameters are checked
+   strictly — a wrong primitive (`add(a: int, b: int)` called with
+   `{"a": "x"}`), a missing required key, or an unexpected extra key is
+   `INVALID_PARAMS` (`-32602`), a caller error: the function body never
+   runs, on every call mode including isolated workers. Structured
+   annotations (dataclasses, containers, `Enum`, `bytes`, `datetime`)
+   are still reconstructed by coercion; a reconstruction failure is
+   `INVALID_PARAMS` too. Unannotated parameters and annotations with no
+   wire mapping pass through unchecked — validation is an input
+   contract for typed functions, not a substitute for the allow-list.
 
 There is no eval/exec/getattr-by-wire path anywhere. Even the isolated
 worker — which resolves its target via `getattr(module, fn)` — receives a

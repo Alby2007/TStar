@@ -1,6 +1,7 @@
 """Wire-codec unit tests — the JSON safety guards in pylair._json."""
 
 import dataclasses
+import enum
 
 import pytest
 
@@ -55,3 +56,108 @@ def test_dumps_still_rejects_nan():
 def test_dumps_float_unaffected():
     # Big floats keep double semantics — only int precision is guarded.
     assert _json.loads(_json.dumps({"x": 1e300}))["x"] == 1e300
+
+
+# ---- input validation (coerce/coerce_kwargs) --------------------------------
+# Wrong primitives must be INVALID_PARAMS at the boundary, never reach the
+# function body (and never surface as an INTERNAL TypeError from the call).
+
+
+def test_int_rejects_string_bool_and_fractional():
+    assert _json.coerce(int, 5) == 5
+    assert _json.coerce(int, 3.0) == 3  # JSON cannot tell 3 from 3.0
+    for bad in ("x", 3.5, True, False, None, {"a": 1}, [1]):
+        with pytest.raises(_json.InvalidParams, match="expected int"):
+            _json.coerce(int, bad)
+
+
+def test_float_accepts_int_rejects_bool_and_str():
+    assert _json.coerce(float, 2) == 2.0
+    assert _json.coerce(float, 2.5) == 2.5
+    for bad in ("x", True, None, {"a": 1}):
+        with pytest.raises(_json.InvalidParams, match="expected float"):
+            _json.coerce(float, bad)
+
+
+def test_str_and_bool_are_strict():
+    assert _json.coerce(str, "x") == "x"
+    assert _json.coerce(bool, True) is True
+    for bad in (5, 1.5, True, None, [1]):
+        with pytest.raises(_json.InvalidParams, match="expected str"):
+            _json.coerce(str, bad)
+    for bad in (1, 0, "true", None):
+        with pytest.raises(_json.InvalidParams, match="expected bool"):
+            _json.coerce(bool, bad)
+
+
+def test_optional_and_union_accept_matching_arm():
+    opt = int | None
+    assert _json.coerce(opt, None) is None
+    assert _json.coerce(opt, 4) == 4
+    with pytest.raises(_json.InvalidParams):
+        _json.coerce(opt, "x")
+    union = int | str
+    assert _json.coerce(union, 4) == 4
+    assert _json.coerce(union, "x") == "x"
+    with pytest.raises(_json.InvalidParams):
+        _json.coerce(union, 3.5)
+
+
+def test_structured_failures_raise_not_passthrough():
+    @dataclasses.dataclass
+    class P:
+        x: int
+
+    class E(enum.Enum):
+        A = "a"
+
+    for ann, bad in [
+        (P, 5),
+        (list[int], "x"),
+        (list[int], [1, "x"]),  # element validation recurses
+        (dict[str, int], {"k": "v"}),
+        (E, "nope"),
+        (bytes, 5),
+    ]:
+        with pytest.raises(_json.InvalidParams):
+            _json.coerce(ann, bad)
+
+
+def test_kwargs_missing_and_extra_keys():
+    def f(a: int, b: int = 0):
+        return a + b
+
+    assert _json.coerce_kwargs(f, {"a": 1}) == {"a": 1}
+    with pytest.raises(_json.InvalidParams, match="missing.*'a'"):
+        _json.coerce_kwargs(f, {"b": 1})
+    with pytest.raises(_json.InvalidParams, match="unexpected.*'c'"):
+        _json.coerce_kwargs(f, {"a": 1, "c": 2})
+
+
+def test_kwargs_unannotated_param_passes_through():
+    def f(x, y: int = 0):
+        return x
+
+    out = _json.coerce_kwargs(f, {"x": "anything", "y": 3})
+    assert out == {"x": "anything", "y": 3}
+
+
+def test_kwargs_message_truncates_large_values():
+    def f(a: int):
+        return a
+
+    try:
+        _json.coerce_kwargs(f, {"a": "x" * 5000})
+    except _json.InvalidParams as e:
+        assert "param 'a'" in str(e)
+        assert "expected int" in str(e)
+        assert "x" * 5000 not in str(e)
+    else:
+        raise AssertionError("expected InvalidParams")
+
+
+def test_kwargs_var_keyword_allows_extras():
+    def f(a: int, **kw):
+        return a
+
+    assert _json.coerce_kwargs(f, {"a": 1, "z": 9})["z"] == 9
