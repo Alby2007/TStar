@@ -36,7 +36,7 @@ scope except where noted (wrap mode's loopback server, §9).
 
 ## 2. What the webview can reach — and nothing else
 
-The plugin's entire IPC surface is eight commands:
+The plugin's entire IPC surface is nine commands:
 
 | command | what it does | default permission |
 |---|---|---|
@@ -48,6 +48,7 @@ The plugin's entire IPC surface is eight commands:
 | `python_retry` | respawn a `failed` runtime | opt-in only |
 | `python_shutdown` | stop the runtime | opt-in only |
 | `python_selftest_report` | end the installed-webview self-test | template grants; inert w/o env flag |
+| `python_selftest_b_report` | relay the two-window self-test verdict | opt-in only; no shipped capability |
 
 There are **no** fs, env, shell, exec, or network commands in the plugin.
 The only way from the webview into Python is `call`/`call_stream`, and the
@@ -59,7 +60,10 @@ permission by accident opens nothing.
 `pylair:default` deliberately excludes `python_retry` and
 `python_shutdown` — supervisor control is a power an app opts into with
 `pylair:allow-python-retry` / `pylair:allow-python-shutdown`, not part of
-the everyday set.
+the everyday set. `python_selftest_b_report` is likewise opt-in only: the
+capability that grants it (`selftest-winb.json`) is carried by the
+reference app and injected into scaffolded apps by CI — it is not part of
+the shipped template.
 
 ## 3. The `@expose` allowlist — no arbitrary execution
 
@@ -158,8 +162,11 @@ remaining broadcast events; an app needing JS-side `emit` cannot get it
 back through capabilities while the deny stays — the only paths left
 are Rust-side `emit_to` calls. That is also why the self-test's `win-b`
 reports through `python_selftest_b_report` (an ACL-checked command that
-emits for it) instead of `emitTo`, and why its emit/emitTo grants only
-matter in apps that ship without the denies (the reference app).
+emits for it) instead of `emitTo` — and why `selftest-winb.json` is not
+part of the shipped template: it grants `emit`/`emitTo` to a `win-b`
+label and references a permission a freshly scaffolded app may not
+resolve. The reference app carries it; CI injects it into scaffolded
+apps before building them.
 
 Scope boundaries, stated plainly: ownership checks are the boundary for
 `cancel`/`grant_credit`/task reap-on-destroy; capability grants are the

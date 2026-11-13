@@ -7,7 +7,9 @@ longer exists — call/stream delivery rides a required per-call
 neither the leak nor any of the forgeries below can occur. The
 two-window repro is now a permanent installed-app self-test:
 `PYLAIR_SELF_TEST_WEBVIEW` opens a second webview `win-b` with
-`core:event:allow-emit`/`allow-emit-to` **deliberately granted**, which
+`core:event:allow-emit`/`allow-emit-to` **deliberately granted** (via
+`selftest-winb.json` — carried by the reference app and CI-injected into
+scaffolded apps, never shipped in the template), which
 passively listens, attempts every forgery recorded here, and probes
 cancel/grant on the owner's task — the run goes green only when none of
 it lands. Broadcast `pylair://state|stderr|exposes` remain events.

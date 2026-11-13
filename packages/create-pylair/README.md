@@ -34,14 +34,15 @@ channel to its invoking webview — but `pylair://state`,
 webview could otherwise forge into other windows. `@pylair/client` only
 listens, so a stock app loses nothing — but if your app needs JS-side
 `emit`, add `"core:event:allow-emit"` back in your own capability block
-(deny rules win, so remove the deny entries too).
-`capabilities/selftest-winb.json` exists only for
-`PYLAIR_SELF_TEST_WEBVIEW` — it grants `emit`/`emitTo` (for the forgery
-attempts; the deny entries above still bar them on a scaffolded app)
-plus `pylair:allow-python-selftest-b-report`, the command the test's
-deliberately-hostile second window uses to relay its verdict back.
-`win-b` is never created in a normal run. See `docs/security.md` for
-the full event-scoping model.
+(deny rules win, so remove the deny entries too). The template ships no
+test capability: the `selftest-winb.json` used by
+`PYLAIR_SELF_TEST_WEBVIEW` lives in `examples/reference-app` and is
+injected into scaffolded apps by CI. It grants `emit`/`emitTo` (for the
+forgery attempts; the deny entries above still bar them on a scaffolded
+app) plus `pylair:allow-python-selftest-b-report`, the command the
+test's deliberately-hostile second window uses to relay its verdict
+back. `win-b` is never created in a normal run. See `docs/security.md`
+for the full event-scoping model.
 
 ## Windows: no console window
 
