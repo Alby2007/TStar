@@ -9,6 +9,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every uv invocation in this workflow resolves its interpreter under
+# UV_PYTHON: the bundled runtime ships CPython 3.12.x, so CI must test
+# what it ships — a fresh uv otherwise picks the newest stable release.
+# This also reaches uv runs inside scaffolded apps (acceptance legs),
+# which a repo .python-version file cannot.
+env:
+  UV_PYTHON: "3.12"
+
 jobs:
   js:
     name: JS (${{ matrix.os }})
@@ -96,6 +104,39 @@ jobs:
       # grandchild (process group on posix, taskkill /T on Windows).
       - working-directory: spikes/w0-wrap
         run: uv run --no-project python test_kill_tree.py
+
+  # Early-warning leg: the same suite on the newest stable CPython.
+  # `uv python install` pins nothing — it fetches the newest stable
+  # managed build, which the ">=3.12" request then resolves to (managed
+  # beats the runner's older system python). enable-cache is off so a
+  # pinned-3.12 venv can't be reused and hide the signal.
+  # continue-on-error means this job can never block a merge — it is NOT
+  # a required check; failures surface only in its logs/annotations.
+  python-edge:
+    name: Python edge (newest CPython, non-blocking, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    env:
+      UV_PYTHON: ">=3.12"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      - run: uv python install ">=3.12"
+      - run: uv python find
+      - working-directory: python/pylair
+        shell: bash
+        run: |
+          uv sync --frozen
+          uv run python -c "import sys; print(sys.version)"
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+          uv run pytest -q
 
   # M0 feasibility spike: build installers bundling python-build-standalone
   # + a uv-locked env on all three OSes, then prove the bundled payload runs

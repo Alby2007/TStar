@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# uvx/pip-audit and uv export spawn an interpreter too — pin it to the
+# bundled-runtime family rather than whatever uv considers newest.
+env:
+  UV_PYTHON: "3.12"
+
 jobs:
   cargo-audit:
     name: cargo audit

@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write # upload release assets — nothing else needs write
 
+env:
+  # Same interpreter pin as the CI legs — SBOM tooling spawns Python via uvx.
+  UV_PYTHON: "3.12"
+
 jobs:
   sbom:
     name: Generate + attach SBOMs
