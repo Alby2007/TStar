@@ -33,6 +33,9 @@ on:
 
 env:
   SOURCE: ${{ inputs.source || 'pack' }}
+  # Scaffolded-app `uv sync` resolves outside the repo, so .python-version
+  # can't reach it — pin every uv call to the bundled-runtime family.
+  UV_PYTHON: "3.12"
 
 jobs:
   acceptance:
