@@ -1996,8 +1996,12 @@ impl StderrLines {
             if b == b'\n' {
                 out.push(self.take());
             } else if !self.over {
-                self.buf.push(b);
-                if self.buf.len() >= STDERR_LINE_CAP {
+                if self.buf.len() < STDERR_LINE_CAP {
+                    self.buf.push(b);
+                } else {
+                    // A byte is actually being dropped — only now is the
+                    // line truncated. A line of exactly STDERR_LINE_CAP
+                    // bytes is delivered unmarked.
                     self.over = true;
                 }
             } // else: swallow — cap already reached for this line
@@ -2322,6 +2326,18 @@ mod tests {
         assert!(out[0].len() <= STDERR_LINE_CAP + STDERR_TRUNC_MARK.len());
         assert!(out[0].ends_with(STDERR_TRUNC_MARK));
         assert_eq!(out[1], "ok");
+        // Exactly at the cap nothing was dropped: no marker. One byte
+        // over and the marker returns.
+        let mut exact = vec![b'e'; STDERR_LINE_CAP];
+        exact.extend_from_slice(b"\n");
+        let out = l.feed(&exact);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].ends_with(STDERR_TRUNC_MARK));
+        assert_eq!(out[0].len(), STDERR_LINE_CAP);
+        let mut one_over = vec![b'o'; STDERR_LINE_CAP + 1];
+        one_over.extend_from_slice(b"\n");
+        let out = l.feed(&one_over);
+        assert!(out[0].ends_with(STDERR_TRUNC_MARK));
         // Partial line held until newline or finish.
         assert!(l.feed(b"no newline yet").is_empty());
         assert_eq!(l.finish().as_deref(), Some("no newline yet"));
