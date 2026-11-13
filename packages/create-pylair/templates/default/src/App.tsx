@@ -21,6 +21,28 @@ export default function App() {
       >
         Stream count(5)
       </button>
+      <button
+        onClick={async () => {
+          try {
+            setGreeting("add(2,3) = " + String(await call("add", { a: 2, b: 3 })));
+          } catch (e) {
+            setGreeting("ERR: " + (e instanceof Error ? e.message : JSON.stringify(e)));
+          }
+        }}
+      >
+        add(2, 3)
+      </button>
+      <button
+        onClick={async () => {
+          try {
+            setGreeting("add(x, 1) = " + String(await call("add", { a: "x", b: 1 })));
+          } catch (e) {
+            setGreeting("ERR: " + (e instanceof Error ? e.message : JSON.stringify(e)));
+          }
+        }}
+      >
+        add("x", 1)
+      </button>
       <p>{greeting}</p>
       <p>{nums.join(" ")}</p>
       <p>
