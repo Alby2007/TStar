@@ -91,6 +91,33 @@ fn scrub_appdir(spec: &mut SpawnSpec, env: impl Fn(&str) -> Option<String>) {
     }
 }
 
+/// Why a spawn spec could not be computed. Surfaced through plugin setup
+/// as a startup error instead of a panic.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SpawnSpecError {
+    /// `app.path().resource_dir()` failed AND no bundled resources were
+    /// found next to the executable either. Carries Tauri's error — on
+    /// macOS it names the symlinked ancestor Tauri refuses to run under.
+    ResourceDir(String),
+}
+
+impl std::fmt::Display for SpawnSpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResourceDir(e) => write!(
+                f,
+                "resource_dir() failed ({e}) and no bundled resources were \
+                 found next to the executable. On macOS this happens when \
+                 the app is launched through a symlinked path (e.g. /tmp \
+                 -> /private/tmp): launch the app's real path instead."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SpawnSpecError {}
+
 /// Dev-or-release spec: `pylair dev` exports PYLAIR_APP_MODULE / PYLAIR_PYTHON
 /// / PYLAIR_PYTHONPATH / PYLAIR_RESTART_TRIGGER → the project venv; a packaged
 /// build resolves `resource_dir`. Apps use this as the plugin's spec fn.
@@ -98,7 +125,7 @@ pub fn app_spawn_spec<R: Runtime>(
     app: &tauri::AppHandle<R>,
     app_module: &str,
     source_dir: &str,
-) -> SpawnSpec {
+) -> Result<SpawnSpec, SpawnSpecError> {
     // Development overrides are honored in debug builds only: a packaged app
     // must never let the launching environment redirect which interpreter or
     // module it runs.
@@ -111,11 +138,26 @@ pub fn app_spawn_spec<R: Runtime>(
             }
             // NB: PYLAIR_RESTART_TRIGGER is read by the supervisor from its own
             // env (inherited from `pylair dev`) — not forwarded to the child.
-            return spec;
+            return Ok(spec);
         }
     }
-    let res = app.path().resource_dir().expect("resource_dir");
-    release_spawn_spec(&res, app_module, source_dir)
+    let res = bundled_resource_dir(app.path().resource_dir())?;
+    Ok(release_spawn_spec(&res, app_module, source_dir))
+}
+
+/// `resource_dir()` first, exe-relative fallback second. Tauri rejects an
+/// exe path containing a symlinked ancestor on macOS (the StartingBinary
+/// hardening behind `current_exe`) — a launch through `/tmp` errors out
+/// even though the bundle is perfectly readable. The fallback resolves
+/// resources relative to the canonicalized executable, so that launch
+/// still works; if both fail the error names the cause and the fix.
+fn bundled_resource_dir(
+    resource_dir: Result<PathBuf, tauri::Error>,
+) -> Result<PathBuf, SpawnSpecError> {
+    match resource_dir {
+        Ok(dir) => Ok(dir),
+        Err(e) => resources_from_exe().ok_or_else(|| SpawnSpecError::ResourceDir(e.to_string())),
+    }
 }
 
 // ── bundled self-test ───────────────────────────────────────────────
@@ -126,7 +168,15 @@ pub fn app_spawn_spec<R: Runtime>(
 //   gui      — inside setup(), exercising app.path().resource_dir() itself.
 
 fn resources_from_exe() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    // Canonicalize first: a launch through a symlinked path (e.g. /tmp on
+    // macOS → /private/tmp) is exactly the case Tauri's resource_dir()
+    // rejects; resolving to the real exe path is what makes this fallback
+    // succeed where resource_dir() failed.
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    resources_near_exe(&exe)
+}
+
+fn resources_near_exe(exe: &std::path::Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
     let stem = exe.file_stem()?.to_string_lossy();
     [
@@ -136,6 +186,8 @@ fn resources_from_exe() -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|p| p.join("python").exists())
+    // Normalize `..` away so callers get the real bundle path.
+    .and_then(|p| p.canonicalize().ok())
 }
 
 async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
@@ -227,7 +279,13 @@ pub async fn self_test_gui<R: Runtime>(
     app_module: &str,
     source_dir: &str,
 ) -> i32 {
-    let spec = app_spawn_spec(app, app_module, source_dir);
+    let spec = match app_spawn_spec(app, app_module, source_dir) {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!("self-test(gui): spawn spec failed: {e}");
+            return 2;
+        }
+    };
     self_test_call(spec, "gui").await
 }
 
@@ -289,7 +347,8 @@ fn subscribed<R: Runtime>(window: &tauri::WebviewWindow<R>, reg: &Registry) {
 /// `new` takes a fixed spec; `new_with` defers it to setup time, which is how
 /// apps resolve the bundled interpreter under `resource_dir` at release while
 /// using a dev venv when `PYLAIR_APP_MODULE` is set.
-type SpecFn<R> = Box<dyn Fn(&tauri::AppHandle<R>) -> SpawnSpec + Send + Sync>;
+type SpecFn<R> =
+    Box<dyn Fn(&tauri::AppHandle<R>) -> Result<SpawnSpec, SpawnSpecError> + Send + Sync>;
 
 pub struct Builder<R: Runtime = tauri::Wry> {
     spec: SpawnSpec,
@@ -307,8 +366,11 @@ impl<R: Runtime> Builder<R> {
     }
 
     /// Spec computed at plugin setup — receives the AppHandle so it can
-    /// resolve `path().resource_dir()`.
-    pub fn new_with(f: impl Fn(&tauri::AppHandle<R>) -> SpawnSpec + Send + Sync + 'static) -> Self {
+    /// resolve `path().resource_dir()`. A spec-fn error aborts startup
+    /// with the message as the Tauri plugin error, not a panic.
+    pub fn new_with(
+        f: impl Fn(&tauri::AppHandle<R>) -> Result<SpawnSpec, SpawnSpecError> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             spec: SpawnSpec::default(),
             lazy: Some(Box::new(f)),
@@ -330,7 +392,10 @@ impl<R: Runtime> Builder<R> {
         }
         plugin
             .setup(move |app, _api| {
-                let spec = self.lazy.as_ref().map(|f| f(app)).unwrap_or_else(|| self.spec.clone());
+                let spec = match self.lazy.as_ref() {
+                    Some(f) => f(app)?,
+                    None => self.spec.clone(),
+                };
                 let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<RuntimeEvent>(256);
                 // setup runs on the main thread with no reactor entered —
                 // spawn the actor via tauri's runtime, not bare tokio::spawn.
@@ -680,5 +745,135 @@ mod tests {
         assert_eq!(reg.broadcast_targets().len(), 2);
         reg.drop_label("panel");
         assert_eq!(reg.broadcast_targets(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn bundled_resource_dir_prefers_resource_dir_then_falls_back() {
+        // resource_dir() success wins outright.
+        let dir = PathBuf::from(if cfg!(windows) { "C:/res" } else { "/res" });
+        assert_eq!(bundled_resource_dir(Ok(dir.clone())).unwrap(), dir);
+        // resource_dir() failure falls back to exe-relative resources —
+        // with no bundle next to the test binary that also fails, and the
+        // error must name the cause and the fix, not panic.
+        let err = bundled_resource_dir(Err(tauri::Error::UnknownPath)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resource_dir()"),
+            "error lost the cause: {msg}"
+        );
+        assert!(
+            msg.contains("symlinked path"),
+            "error not actionable: {msg}"
+        );
+    }
+
+    #[test]
+    fn resources_near_exe_covers_each_bundle_layout() {
+        let tmp = std::env::temp_dir().join(format!("pylair-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // macOS .app: <exe>/../Resources/python — expectations are
+        // canonicalized too because the resolver returns real paths
+        // (on Windows that means a \\?\ prefix).
+        let mac = tmp.join("Fixture.app/Contents");
+        std::fs::create_dir_all(mac.join("Resources/python")).unwrap();
+        std::fs::create_dir_all(mac.join("MacOS")).unwrap();
+        let exe = mac.join("MacOS/fixture");
+        assert_eq!(
+            resources_near_exe(&exe).unwrap(),
+            mac.join("Resources").canonicalize().unwrap()
+        );
+        // deb/AppImage: <exe>/../lib/<stem>/python
+        let deb = tmp.join("debroot/usr");
+        std::fs::create_dir_all(deb.join("lib/myapp/python")).unwrap();
+        std::fs::create_dir_all(deb.join("bin")).unwrap();
+        assert_eq!(
+            resources_near_exe(&deb.join("bin/myapp")).unwrap(),
+            deb.join("lib/myapp").canonicalize().unwrap()
+        );
+        // NSIS: <exe dir>/python
+        let nsis = tmp.join("nsisroot");
+        std::fs::create_dir_all(nsis.join("python")).unwrap();
+        assert_eq!(
+            resources_near_exe(&nsis.join("app.exe")).unwrap(),
+            nsis.canonicalize().unwrap()
+        );
+        // No layout at all → None, never a guessed path.
+        let bare = tmp.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(resources_near_exe(&bare.join("app")).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The rc.8 panic: launched through a symlinked path (`/tmp` →
+    /// `/private/tmp` on macOS, or any symlinked ancestor dir), Tauri
+    /// rejects the exe path — the plugin must still find the bundle.
+    /// Spawns the test binary through a symlinked directory and asserts
+    /// `resources_from_exe` resolves the CANONICAL bundle, proving the
+    /// fallback works in the exact condition that broke resource_dir().
+    #[cfg(unix)]
+    #[test]
+    fn launched_via_symlinked_dir_still_resolves_resources() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        const CHILD_ENV: &str = "PYLAIR_LINKED_EXE_CHILD";
+        if std::env::var(CHILD_ENV).is_ok() {
+            // Child: report what the exe-relative resolver sees here.
+            let exe = std::env::current_exe().unwrap();
+            let res = resources_from_exe();
+            println!(
+                "exe={}\nres={}",
+                exe.display(),
+                res.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "NONE".into())
+            );
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("pylair-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let real = tmp.join("realdir/Fixture.app/Contents");
+        std::fs::create_dir_all(real.join("Resources/python")).unwrap();
+        std::fs::create_dir_all(real.join("MacOS")).unwrap();
+        let real_exe = real.join("MacOS/pylair-test-bin");
+        std::fs::copy(std::env::current_exe().unwrap(), &real_exe).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The launch path's ancestor is a symlink — the macOS /tmp case.
+        let linkdir = tmp.join("linkdir");
+        symlink(tmp.join("realdir"), &linkdir).unwrap();
+        let linked_exe = linkdir.join("Fixture.app/Contents/MacOS/pylair-test-bin");
+
+        // --exact needs the module-qualified name: this is a unit test
+        // inside `mod tests`, so its full name carries the `tests::`
+        // prefix (unlike the tests/*.rs files' top-level names).
+        let out = Command::new(linked_exe)
+            .args([
+                "tests::launched_via_symlinked_dir_still_resolves_resources",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn test binary through symlinked dir");
+        assert!(
+            out.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let res_line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("res="))
+            .unwrap_or_else(|| panic!("child reported no res= line; stdout: {stdout}"));
+        let want = real.join("Resources").canonicalize().unwrap();
+        assert_eq!(
+            PathBuf::from(res_line).canonicalize().unwrap(),
+            want,
+            "resources resolved to a non-canonical or wrong path (exe line: {})",
+            stdout.lines().next().unwrap_or("?")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
