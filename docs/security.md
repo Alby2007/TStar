@@ -69,8 +69,16 @@ the `@expose` decorator at import time. On a `call`, the runtime:
 1. looks up `fn` in the registry — anything else fails with
    `FUNCTION_NOT_FOUND` (`-32601`);
 2. requires `input` to be a JSON object;
-3. coerces each argument against the function's signature — failures are
-   `INVALID_PARAMS` (`-32602`), caller errors, not function exceptions.
+3. coerces each argument against the function's signature — but the
+   coercion is *structural*, not a type check. It reconstructs annotated
+   composite types (dataclasses, containers, `Enum`, `bytes`,
+   `datetime`); a reconstruction failure is `INVALID_PARAMS` (`-32602`),
+   a caller error, not a function exception. Primitive annotations
+   (`int`/`str`/`float`/`bool`) are **not checked**: a wrong primitive
+   passes through unchanged (`add(a: int, b: int)` called with
+   `{"a": "x", "b": "y"}` runs and returns `"xy"`), and a missing or
+   extra key raises `TypeError` inside the function, which comes back as
+   `INTERNAL`, not `INVALID_PARAMS`.
 
 There is no eval/exec/getattr-by-wire path anywhere. Even the isolated
 worker — which resolves its target via `getattr(module, fn)` — receives a
@@ -79,11 +87,13 @@ host set via `PYLAIR_APP_MODULE`, not a wire value.
 
 **Honest corollary:** `@expose` *is* the attack surface. An exposed
 function runs with the Python process's full privileges, and its `input`
-is JSON supplied by a possibly-hostile webview. Exposed functions should
-validate their inputs the way a server-side endpoint would —
-`INVALID_PARAMS` coercion checks types, not intent. If you expose a
-function that runs user-chosen code, you have re-introduced arbitrary
-execution yourself; the framework can't prevent that and doesn't try.
+is JSON supplied by a possibly-hostile webview. The boundary is the
+exposed-function allowlist plus Tauri capabilities — **not type
+checking**: coercion rebuilds composite shapes but validates neither
+primitives nor intent, so exposed functions should validate their inputs
+the way a server-side endpoint would. If you expose a function that runs
+user-chosen code, you have re-introduced arbitrary execution yourself;
+the framework can't prevent that and doesn't try.
 
 ## 4. Tauri capabilities gate every command
 
@@ -119,10 +129,17 @@ is the Tauri-reported window label — never a JS-supplied value:
   control a new task);
 - destroying a window cancels all of its tasks.
 
-Event delivery matches: stream chunks go only to the webview that started
-the stream; state/stderr/exposes go only to webviews that have used the
-bridge. Nothing is broadcast. A multi-window app cannot leak one window's
-stream into another (P1-8, covered by `tests/event_scoping.rs`).
+Event delivery is **best-effort scoping, not a security boundary**.
+Stream chunks are emitted with `emit_to` addressed at the owning
+webview's label, and state/stderr/exposes go to webviews that have used
+the bridge (P1-8, covered by `tests/event_scoping.rs` — which tests
+Rust-side targeted listeners only). But the client's `listen()` uses
+Tauri's default `target: Any`, which receives events regardless of their
+emit target, and `core:event` grants emit: any webview that can listen
+can read another window's stream events, and any webview with emit
+permission can forge them (per Tauri 2.12.5's `match_any_or_filter`,
+an `Any`-target listener bypasses the `emit_to` filter). Treat per-window event scoping as UX routing, not isolation;
+stricter delivery is under investigation.
 
 ## 5. Malformed input, in both directions
 
