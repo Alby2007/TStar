@@ -205,6 +205,22 @@ fn resources_near_exe(exe: &std::path::Path) -> Option<PathBuf> {
     .and_then(|p| p.canonicalize().ok())
 }
 
+/// A GUI-subsystem exe has no console of its own — `println!`/`eprintln!`
+/// (and panic reports) go nowhere. When the process was launched from a
+/// terminal — the self-test CI legs — steal the parent's console so the
+/// verdict still reaches it. Harmless no-op without a console host.
+#[cfg(windows)]
+fn attach_parent_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
     // Print the interpreter actually being spawned — on a clean machine
     // this is the proof the bundled runtime is what's running, not a
@@ -264,6 +280,7 @@ async fn self_test_call(spec: SpawnSpec, origin: &str) -> i32 {
 /// Headless: resources located relative to the executable — runs on a bare
 /// machine with no display and no system Python. Returns an exit code.
 pub fn self_test_headless(app_module: &str, source_dir: &str) -> i32 {
+    attach_parent_console();
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -294,6 +311,7 @@ pub async fn self_test_gui<R: Runtime>(
     app_module: &str,
     source_dir: &str,
 ) -> i32 {
+    attach_parent_console();
     let spec = match app_spawn_spec(app, app_module, source_dir) {
         Ok(spec) => spec,
         Err(e) => {
@@ -403,6 +421,9 @@ impl<R: Runtime> Builder<R> {
         // Installed-webview self-test: the client sees this flag and runs its
         // checks through the real bridge, then calls python_selftest_report.
         if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_some() {
+            // The verdict (and any panic) prints to stdout/stderr — a
+            // GUI-subsystem exe needs the parent's console for it to land.
+            attach_parent_console();
             plugin = plugin.js_init_script("window.__PYLAIR_SELF_TEST__ = true;".to_string());
         }
         plugin

@@ -340,6 +340,21 @@ jobs:
       - name: pylair build (stages interpreter, env, prunes, tauri build)
         working-directory: ${{ env.APP_DIR }}
         run: pnpm exec pylair build --bundles ${{ matrix.bundles }}
+      - name: Tripwire — release exe is a GUI binary (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ${{ env.APP_DIR }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "src-tauri/target/release/$env:APP_BIN.exe"
+          if (-not (Test-Path $exe)) { Write-Error "release exe not found: $exe"; exit 1 }
+          # PE optional-header Subsystem: 2 = WINDOWS_GUI, 3 = CONSOLE. A
+          # console-subsystem release exe pops a terminal on every launch.
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $exe).Path)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $sub = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          if ($sub -ne 2) { Write-Error "PE subsystem $sub — expected 2 (GUI)"; exit 1 }
+          Write-Output "PE subsystem = $sub (GUI)"
       - name: Self-test installed app (Linux, clean container, no Python)
         if: runner.os == 'Linux'
         working-directory: ${{ env.APP_DIR }}
@@ -416,8 +431,11 @@ jobs:
                 -Recurse -Filter "$env:APP_BIN.exe" -Depth 3 -ErrorAction SilentlyContinue |
                 Select-Object -First 1
           if (-not $exe) { Write-Error "installed $env:APP_BIN.exe not found"; exit 1 }
-          & $exe.FullName --self-test
-          if ($LASTEXITCODE -ne 0) { Write-Error "self-test exit $LASTEXITCODE"; exit 1 }
+          # GUI-subsystem exe: `&` returns immediately and $LASTEXITCODE is
+          # stale — wait on the process handle and read the real ExitCode.
+          $st = Start-Process -FilePath $exe.FullName -ArgumentList '--self-test' -PassThru
+          if (-not $st.WaitForExit(120000)) { $st.Kill(); Write-Error 'self-test timed out'; exit 1 }
+          if ($st.ExitCode -ne 0) { Write-Error "self-test exit $($st.ExitCode)"; exit 1 }
           # Webview self-test through the real bridge (ACL, events, cancel).
           $env:PYLAIR_SELF_TEST_WEBVIEW = '1'
           $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:TEMP -PassThru
@@ -427,6 +445,7 @@ jobs:
           # was found by manual dogfood; cover it in CI on every leg.
           $env:PYLAIR_SELF_TEST_WEBVIEW = $null
           $env:PYLAIR_SELF_TEST_WINDOW_CLOSE = '1'
-          & $exe.FullName
-          if ($LASTEXITCODE -ne 0) { Write-Error "window-close self-test exit $LASTEXITCODE"; exit 1 }
+          $wc = Start-Process -FilePath $exe.FullName -PassThru
+          if (-not $wc.WaitForExit(120000)) { $wc.Kill(); Write-Error 'window-close self-test timed out'; exit 1 }
+          if ($wc.ExitCode -ne 0) { Write-Error "window-close self-test exit $($wc.ExitCode)"; exit 1 }
           $env:PYLAIR_SELF_TEST_WINDOW_CLOSE = $null
