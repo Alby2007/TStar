@@ -117,7 +117,7 @@ wheels = [
 
 [[package]]
 name = "pylair-ollama"
-version = "0.0.0"
+version = "0.1.0rc2"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -130,7 +130,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "httpx", specifier = ">=0.28" }]
+requires-dist = [{ name = "httpx", specifier = ">=0.28,<1.0" }]
 
 [package.metadata.requires-dev]
 dev = [
