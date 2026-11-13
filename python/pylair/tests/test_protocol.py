@@ -153,7 +153,10 @@ def test_cancel_unknown_task(runtime):
     runtime.recv()
     runtime.send(proto.request(1, "cancel", {"task": 999}))
     resp = runtime.recv()
-    assert resp["result"]["cancelled"] is False
+    # An unknown id is recorded as a pending cancel — under supervisor
+    # routing it can only mean the call frame is still in flight.
+    assert resp["result"]["cancelled"] is True
+    assert resp["result"]["status"] == "pending"
 
 
 def test_cancel_stream(runtime):
@@ -177,9 +180,11 @@ def test_cancel_before_registration_still_terminates(runtime):
     # cancel first, call second — both queued in the same pipe order.
     runtime.send(proto.request(9, "cancel", {"task": 9}))
     runtime.send(call(3, "sleep_forever", task=9))
-    # The cancel ack reports not-found (the task didn't exist yet)...
+    # The cancel ack reports pending — the cancel is recorded and will
+    # apply at registration, so the honest outcome is cancelled...
     ack = runtime.recv_until(lambda m: m.get("id") == 9)
-    assert ack["result"]["cancelled"] is False
+    assert ack["result"]["cancelled"] is True
+    assert ack["result"]["status"] == "pending"
     # ...but the call's terminal must still arrive, and it must be the
     # cancelled outcome — never a hang or a completed result.
     terminal = runtime.recv_until(lambda m: m.get("id") == 3)
