@@ -36,7 +36,7 @@ fn eager_spec_setup_does_not_panic_and_manages_runtime() {
 #[test]
 fn lazy_spec_setup_does_not_panic() {
     let app = tauri::test::mock_builder()
-        .plugin(Builder::<MockRuntime>::new_with(|_app| sleeper()).build())
+        .plugin(Builder::<MockRuntime>::new_with(|_app| Ok(sleeper())).build())
         .build(mock_context(noop_assets()))
         .expect("app builds with the lazy plugin");
     assert!(app.try_state::<PyRuntime>().is_some());
