@@ -77,19 +77,35 @@ wire. The runtime now encodes:
   accepts them via annotation coercion where the arg is annotated)
 - `Enum` → its value; `set`/`frozenset` → list
 
-**Param coercion** (`coerce_kwargs`): before dispatch, each incoming
-kwarg is coerced by its annotation — dict → dataclass instance,
-`list[T]`/`dict[K,V]` recurse, `Optional`/`Union` tries arms in order,
-enums rebuild by value, ISO strings become `datetime`. Two honest
-modes:
+**Param validation + coercion** (`coerce_kwargs`): before dispatch,
+each incoming kwarg is checked against the signature — annotated
+parameters strictly, on every call mode including isolated workers:
 
-- **Construction failures** (missing dataclass field, unconstructable
-  value) raise `InvalidParams` → wire `INVALID_PARAMS` — a caller bug,
-  reported before any task is spawned.
-- **Unmapped annotations** (anything without a wire encoding) pass the
-  raw JSON value through — Python is duck-typed and the function may
-  still handle it; failures there surface as `INTERNAL` as usual.
-  Scalar coercion (e.g. `"5"` → `int`) is *not* attempted.
+- **Primitives**: `int` accepts ints and whole-number floats (JSON
+  can't tell `3` from `3.0`); `float` accepts int/float; `str` accepts
+  strings; `bool` accepts booleans. `bool` is never a valid `int` or
+  `float`. `Optional[T]`/`Union` accepts any matching arm; `null` only
+  where `None` is an arm.
+- **Structured types**: dict → dataclass, `list[T]`/`dict[K,V]` recurse
+  element validation, `Optional`/`Union` tries arms in order, enums
+  rebuild by value, ISO strings become `datetime`, base64 → `bytes`. A
+  reconstruction failure is `InvalidParams` → wire `INVALID_PARAMS`.
+- **Arity**: a missing required parameter or an unexpected extra key is
+  `INVALID_PARAMS` naming the parameter (`**kwargs` permits extras).
+- **Unchecked**: unannotated parameters and annotations with no wire
+  mapping pass the raw JSON value through — Python is duck-typed and
+  the function may still handle it; failures there surface as
+  `INTERNAL` as usual. Scalar coercion (e.g. `"5"` → `int`) is *not*
+  attempted — a wrong primitive is rejected, not converted.
+- **Honest gaps**: unknown keys inside a structured value are ignored
+  (a dataclass is built only from keys matching its fields), `Literal`
+  annotations are mapped for codegen but not validated at the boundary,
+  and a `None` default admits `null` even without `Optional`
+  (`x: str = None`).
+
+All boundary failures are caller bugs reported before any task is
+spawned: `INVALID_PARAMS` (`-32602`), never an `INTERNAL` `TypeError`
+from inside the function.
 
 ## Limits to know
 

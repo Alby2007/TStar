@@ -215,3 +215,52 @@ async def deep_stream(n: int):
 @expose(isolated=True)
 def isolated_deep(n: int):
     return _nest(n)
+
+
+_spy_calls = 0
+
+
+@expose
+def spy(a: int) -> int:
+    # Witness for input validation: on a rejected call this body must
+    # never run — count invocations so tests can prove it.
+    global _spy_calls
+    _spy_calls += 1
+    return a
+
+
+@expose
+def spy_count() -> int:
+    return _spy_calls
+
+
+@expose
+def int_or_str(v: int | str):
+    return v
+
+
+@expose
+def passthrough(x):
+    # Unannotated parameters are not checked — any wire value passes.
+    return type(x).__name__
+
+
+@expose(isolated=True)
+def isolated_spy(a: int) -> int:
+    return a
+
+
+@expose(isolated=True)
+def isolated_pick(c: str | None = None) -> str:
+    return c or "none"
+
+
+@expose
+def maybe(x: str = None) -> str:  # noqa: RUF013 - implicit-optional on purpose
+    # A None *default* admits None even without an Optional annotation.
+    return repr(x)
+
+
+@expose(isolated=True)
+def isolated_maybe(x: str = None) -> str:  # noqa: RUF013
+    return repr(x)

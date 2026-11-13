@@ -384,3 +384,119 @@ def test_deep_isolated_result_fails_only_that_call(runtime):
     assert err["error"]["code"] == proto.LIMIT_EXCEEDED
     runtime.send(call(7, "add", task=7, input={"a": 2, "b": 2}))
     assert runtime.recv_until(lambda m: m.get("id") == 7)["result"] == 4
+
+
+# ---- input validation --------------------------------------------------------
+# Wrong primitives used to reach the function body (add("x","y") -> "xy");
+# missing/extra keys used to surface as an INTERNAL TypeError. Both are now
+# INVALID_PARAMS at the boundary, on every call mode including isolated.
+
+
+def test_wrong_primitive_is_invalid_params_and_body_never_runs(runtime):
+    runtime.recv()  # hello
+    runtime.send(call(1, "add", task=1, input={"a": "x", "b": "y"}))
+    err = runtime.recv_until(lambda m: m.get("id") == 1)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    assert "'a'" in err["error"]["message"]
+
+    runtime.send(call(2, "spy", task=2, input={"a": "not-an-int"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    runtime.send(call(3, "spy_count", task=3))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["result"] == 0
+
+
+def test_whole_float_for_int_ok_fraction_and_bool_rejected(runtime):
+    runtime.recv()
+    runtime.send(call(1, "add", task=1, input={"a": 3.0, "b": 2}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == 5
+    runtime.send(call(2, "add", task=2, input={"a": 3.5, "b": 2}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    runtime.send(call(3, "add", task=3, input={"a": True, "b": 2}))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+
+
+def test_missing_and_extra_keys_are_invalid_params(runtime):
+    runtime.recv()
+    runtime.send(call(1, "add", task=1, input={"a": 1}))
+    err = runtime.recv_until(lambda m: m.get("id") == 1)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    assert "'b'" in err["error"]["message"]
+    runtime.send(call(2, "add", task=2, input={"a": 1, "b": 2, "c": 3}))
+    err = runtime.recv_until(lambda m: m.get("id") == 2)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    assert "'c'" in err["error"]["message"]
+
+
+def test_optional_and_union_arms(runtime):
+    runtime.recv()
+    runtime.send(call(1, "pick", task=1, input={"c": "red"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == "red"
+    # `fallback: str | None` is the Optional arm — null is legal for it.
+    runtime.send(call(2, "pick", task=2, input={"c": "blue", "fallback": None}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["result"] == "blue"
+    # `c: Color` is NOT Optional — null is invalid for it.
+    runtime.send(call(6, "pick", task=6, input={"c": None}))
+    assert runtime.recv_until(lambda m: m.get("id") == 6)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    runtime.send(call(3, "pick", task=3, input={"c": 5}))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    runtime.send(call(4, "int_or_str", task=4, input={"v": "x"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 4)["result"] == "x"
+    runtime.send(call(5, "int_or_str", task=5, input={"v": 3.5}))
+    assert runtime.recv_until(lambda m: m.get("id") == 5)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+
+
+def test_unannotated_param_still_passes_through(runtime):
+    runtime.recv()
+    runtime.send(call(1, "passthrough", task=1, input={"x": "str"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == "str"
+    runtime.send(call(2, "passthrough", task=2, input={"x": 42}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["result"] == "int"
+
+
+def test_isolated_calls_validate_the_same_way(runtime):
+    runtime.recv()
+    runtime.send(call(1, "isolated_spy", task=1, input={"a": "x"}))
+    err = runtime.recv_until(lambda m: m.get("id") == 1, timeout=30)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    runtime.send(call(2, "isolated_spy", task=2, input={"a": 1, "b": 2}))
+    err = runtime.recv_until(lambda m: m.get("id") == 2, timeout=30)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    runtime.send(call(3, "isolated_spy", task=3, input={}))
+    err = runtime.recv_until(lambda m: m.get("id") == 3, timeout=30)
+    assert err["error"]["code"] == proto.INVALID_PARAMS
+    runtime.send(call(4, "isolated_spy", task=4, input={"a": 7}))
+    assert runtime.recv_until(lambda m: m.get("id") == 4, timeout=30)["result"] == 7
+    runtime.send(call(5, "isolated_pick", task=5, input={"c": None}))
+    assert (
+        runtime.recv_until(lambda m: m.get("id") == 5, timeout=30)["result"] == "none"
+    )
+
+
+def test_none_default_admits_null(runtime):
+    runtime.recv()
+    # `x: str = None` — the default admits null even without Optional.
+    runtime.send(call(1, "maybe", task=1, input={"x": None}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == "None"
+    runtime.send(call(2, "maybe", task=2, input={"x": "s"}))
+    assert runtime.recv_until(lambda m: m.get("id") == 2)["result"] == "'s'"
+    runtime.send(call(3, "maybe", task=3, input={"x": 5}))
+    assert runtime.recv_until(lambda m: m.get("id") == 3)["error"]["code"] == (
+        proto.INVALID_PARAMS
+    )
+    # Same rule through an isolated worker.
+    runtime.send(call(4, "isolated_maybe", task=4, input={"x": None}))
+    assert (
+        runtime.recv_until(lambda m: m.get("id") == 4, timeout=30)["result"] == "None"
+    )

@@ -263,7 +263,9 @@ def test_invalid_b64_tag_is_a_call_error_not_death(runtime):
         }
     )
     resp = runtime.recv()
-    assert resp["error"]["code"] == -32000  # INTERNAL from the function
+    # Input validation rejects the un-decodable tag at the boundary now —
+    # INVALID_PARAMS, not a TypeError inside the function body.
+    assert resp["error"]["code"] == -32602  # INVALID_PARAMS
     runtime.send(
         {
             "jsonrpc": "2.0",
