@@ -839,15 +839,18 @@ mod tests {
         let real_exe = real.join("MacOS/pylair-test-bin");
         std::fs::copy(std::env::current_exe().unwrap(), &real_exe).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The launch path's ancestor is a symlink — the macOS /tmp case.
         let linkdir = tmp.join("linkdir");
-        symlink(&tmp.join("realdir"), &linkdir).unwrap();
+        symlink(tmp.join("realdir"), &linkdir).unwrap();
         let linked_exe = linkdir.join("Fixture.app/Contents/MacOS/pylair-test-bin");
 
-        let out = Command::new(&linked_exe)
+        // --exact needs the module-qualified name: this is a unit test
+        // inside `mod tests`, so its full name carries the `tests::`
+        // prefix (unlike the tests/*.rs files' top-level names).
+        let out = Command::new(linked_exe)
             .args([
-                "launched_via_symlinked_dir_still_resolves_resources",
+                "tests::launched_via_symlinked_dir_still_resolves_resources",
                 "--exact",
                 "--nocapture",
             ])
@@ -863,7 +866,7 @@ mod tests {
         let res_line = stdout
             .lines()
             .find_map(|l| l.strip_prefix("res="))
-            .expect("child reported no res= line");
+            .unwrap_or_else(|| panic!("child reported no res= line; stdout: {stdout}"));
         let want = real.join("Resources").canonicalize().unwrap();
         assert_eq!(
             PathBuf::from(res_line).canonicalize().unwrap(),
