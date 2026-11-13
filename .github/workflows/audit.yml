@@ -17,9 +17,25 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-      # Prebuilt cargo-audit; scans the workspace Cargo.lock including
-      # target-gated deps (glib/gtk chain) regardless of host OS.
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+      # Direct cargo-audit — replaced rustsec/audit-check, which needs a
+      # token to post check runs; this job stays contents: read. Pinned
+      # with --locked (0.23.0 skipped: only days old at pin time).
+      # Warnings (unmaintained/unsound — e.g. glib RUSTSEC-2024-0429,
+      # proc-macro-error RUSTSEC-2024-0370) exit 0 by default; only real
+      # vulnerabilities fail the job. Tighten with `--deny warnings`.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      # Workspace lock — includes target-gated deps (the glib/gtk
+      # chain) regardless of the runner's OS.
+      - name: Audit workspace Cargo.lock
+        run: cargo audit --file Cargo.lock
+      # The template lock ships verbatim inside the create-pylair npm
+      # tarball — every scaffolded app resolves against it.
+      - name: Audit template Cargo.lock (ships in create-pylair)
+        run: cargo audit --file packages/create-pylair/templates/default/src-tauri/Cargo.lock
 
   pnpm-audit:
     name: pnpm audit (prod deps only)
