@@ -57,9 +57,9 @@ integration → `M6` reference app + RC.
   exists, only its owning webview (the Tauri window label — never a
   JS-supplied id) can cancel it or grant it stream credit, a task id
   from a dead runtime generation controls nothing, and closing the
-  owner window cancels its tasks. Event delivery is likewise scoped
-  (streams reach only their owning window); invocation scoping beyond
-  capabilities is planned with wrap mode. The exposure exists only if
+  owner window cancels its tasks. Event delivery is best-effort routing,
+  not a webview isolation boundary (see Known limitations); invocation
+  scoping beyond capabilities is planned with wrap mode. The exposure exists only if
   you widen a capability (more windows, `remote.urls`) or load untrusted
   content in a privileged window.
 - **Inline sync functions can't be interrupted.** A non-isolated sync
@@ -107,6 +107,14 @@ integration → `M6` reference app + RC.
   explicit error rather than a silently rounded value. Return large
   integers as strings until `{"$bigint"}` tagging lands
   (`docs/ideas.md`).
+- **Per-window event scoping is not a security boundary.** Stream
+  chunks are emitted with `emit_to` to the owning window's label, but
+  the client's `listen()` uses Tauri's default `target: Any`, which
+  receives events regardless of their emit target — any webview that
+  can listen can read another window's stream events, and any webview
+  with `core:event` emit permission (part of `core:default`) can forge
+  them. Task *control* (cancel, stream credit) stays owner-scoped and
+  is unaffected. Stricter event delivery is under investigation.
 - **`cargo audit` flags `glib 0.18.5` (RUSTSEC-2024-0429, unsound).**
   It reaches Linux builds only, transitively through Tauri's GTK chain
   (`tauri → wry → webkit2gtk → gtk`); the advisory is tracked upstream
