@@ -138,8 +138,22 @@ Tauri's default `target: Any`, which receives events regardless of their
 emit target, and `core:event` grants emit: any webview that can listen
 can read another window's stream events, and any webview with emit
 permission can forge them (per Tauri 2.12.5's `match_any_or_filter`,
-an `Any`-target listener bypasses the `emit_to` filter). Treat per-window event scoping as UX routing, not isolation;
+an `Any`-target listener bypasses the `emit_to` filter). Treat
+per-window event scoping as UX routing, not isolation;
 stricter delivery is under investigation.
+
+**Forging is denied in the template; the leak is not.** The scaffolded
+capability adds `core:event:deny-emit` and `core:event:deny-emit-to` —
+deny rules win over `core:default`'s allow entries, so a scaffolded
+app's webviews cannot inject events into other windows (the forge half
+of the `docs/design/event-scoping.md` findings). Nothing in
+`@pylair/client` or the template emits, so this costs a stock app
+nothing; an app that needs JS-side `emit` re-grants it per window
+(`"core:event:allow-emit"` in its own capability block) — and accepts
+that any webview holding it can forge events again. Passive receipt is
+untouched: an `Any`-target listener still sees `emit_to`-addressed
+events, so cross-window stream reads remain possible until delivery
+moves to a per-call channel.
 
 ## 5. Malformed input, in both directions
 

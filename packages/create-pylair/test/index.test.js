@@ -45,6 +45,11 @@ test("scaffolds a complete app skeleton", () => {
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
   assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.7"/);
+  // Webviews may listen but must not inject events — a forged
+  // pylair://stream terminal resolves another window's call.
+  const caps = readFileSync(join(app, "src-tauri/capabilities/default.json"), "utf8");
+  assert.match(caps, /core:event:deny-emit"/);
+  assert.match(caps, /core:event:deny-emit-to"/);
   rmSync(dir, { recursive: true });
 });
 
