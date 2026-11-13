@@ -225,7 +225,5 @@ def exceeds_depth(obj: Any, limit: int) -> bool:
             it = node
         else:
             continue
-        stack.extend(
-            (v, depth + 1) for v in it if isinstance(v, _CONTAINER_TYPES)
-        )
+        stack.extend((v, depth + 1) for v in it if isinstance(v, _CONTAINER_TYPES))
     return False
