@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a defect in Pylair or a scaffolded app
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in every field — version and
+        launch details decide which code path is even running.
+
+        **Do not paste tokens, API keys, signing material, or secrets.**
+        Redact auth headers and environment dumps before attaching logs.
+  - type: input
+    id: versions
+    attributes:
+      label: Pylair versions
+      description: Which artifacts you are running — all that apply.
+      placeholder: "e.g. create-pylair 0.1.0-rc.10, tauri-plugin-pylair 0.1.0-rc.7, pylair 0.1.0rc5"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS, version, and CPU architecture
+      placeholder: "e.g. Windows 11 23H2 x64, macOS 15.4 arm64, Ubuntu 24.04 x64"
+    validations:
+      required: true
+  - type: dropdown
+    id: launch
+    attributes:
+      label: How was the app launched?
+      description: Dev mode behaves differently from a packaged install — pick the closest match.
+      options:
+        - "Dev mode (pylair dev / tauri dev / cargo run)"
+        - "Built executable (unpacked binary)"
+        - "Installed via installer (MSI / NSIS / dmg / deb / AppImage)"
+        - "Other (describe below)"
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened vs what you expected
+      description: Actual behavior first, then the expected behavior. Include the smallest repro you can.
+      placeholder: "What happened: …\nWhat I expected: …"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: |
+        Relevant output only — app stderr, the runtime's stderr lines
+        (`[runtime stderr]`), or the panic message. Attach or paste
+        between triple backticks. **Redact tokens and secrets.**
+      render: shell
+    validations:
+      required: false
