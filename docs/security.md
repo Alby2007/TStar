@@ -230,7 +230,10 @@ stripped from `LD_LIBRARY_PATH`/`PATH` (exact-prefix match — sibling dirs
 survive). Dev overrides (`PYLAIR_APP_MODULE`, `PYLAIR_PYTHON`,
 `PYLAIR_PYTHONPATH`) are honored **in debug builds only** — a packaged
 app ignores them, so the launching environment can't swap which
-interpreter or module runs.
+interpreter or module runs. On Windows the interpreter spawns with
+`CREATE_NO_WINDOW` so the GUI app shows no stray console; set
+`PYLAIR_CONSOLE` (any value) in the launching environment to keep the
+window for debugging — it grants no extra privilege, just visibility.
 
 ## 9. Wrap mode (W1, in progress)
 
