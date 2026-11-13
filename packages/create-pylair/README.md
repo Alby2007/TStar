@@ -23,6 +23,17 @@ A first `pylair build` also needs GitHub access once: it downloads the
 bundled Python runtime and Tauri's installer toolchain (WiX/NSIS on
 Windows). Later builds reuse the caches.
 
+## Capabilities
+
+The scaffolded `src-tauri/capabilities/default.json` grants
+`core:default` plus `pylair:default`, and additionally **denies**
+`core:event:deny-emit` / `core:event:deny-emit-to`: a webview that
+could emit could forge `pylair://stream` events into another window.
+`@pylair/client` only listens, so a stock app loses nothing — but if
+your app needs JS-side `emit`, add `"core:event:allow-emit"` back in
+your own capability block (deny rules win, so remove the deny entries
+too). See `docs/security.md` for the full event-scoping model.
+
 Pylair builds on [Tauri](https://tauri.app) but is not affiliated with
 or endorsed by the Tauri project.
 
