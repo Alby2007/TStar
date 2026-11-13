@@ -175,6 +175,18 @@ commands can still invoke them and start calls or streams. Channel
 delivery does not limit who may invoke; it guarantees only that a
 call's data reaches the webview that invoked it.
 
+Reloads are a webview-lifecycle edge the channel cannot see: a fresh
+document replaces the JS context but `Channel::send` can keep returning
+`Ok` through the engine's eval path — payloads land in a dead context
+and nothing calls back. The plugin's `on_page_load` hook closes that
+gap server-side: at `PageLoadEvent::Started` — a document-commit event
+on every engine (WebView2 `ContentLoading`, WKWebView
+`didCommitNavigation`, WebKitGTK `LoadCommitted`), which same-document
+navigations like anchors and `history.pushState` never fire — every
+task the old document owned is cancelled, bounded by a task-id
+watermark so a call the new document raced in before the reap lands is
+spared. The client's `pagehide` hook remains as a best-effort belt.
+
 ## 5. Malformed input, in both directions
 
 The frame channel is a private fd pair the host wired at spawn — nothing

@@ -44,6 +44,12 @@ test's deliberately-hostile second window uses to relay its verdict
 back. `win-b` is never created in a normal run. See `docs/security.md`
 for the full event-scoping model.
 
+Reloads lose their JS context but could strand task slots if left to
+channel error detection alone: the plugin's `on_page_load` hook cancels
+the old document's tasks server-side when a navigation commits
+(same-document navigations do not trigger it), and the client's
+`pagehide` hook stays as a best-effort fallback.
+
 ## Windows: no console window
 
 The scaffolded `src-tauri/src/main.rs` starts with Tauri's standard line:

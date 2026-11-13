@@ -12,9 +12,12 @@
 //! webview survives the navigation, `eval` lands in a dead JS context,
 //! the callback no-ops, and `send` still returns `Ok` (see
 //! `Channel::from_callback_fn`). The forwarder can only act on an actual
-//! send failure, so the reload path is additionally covered client-side:
-//! a `pagehide` hook cancels the window's live tasks. This test pins the
-//! Rust-side contract — send failure must mean cancellation.
+//! send failure, so reloads are covered server-side instead: the plugin's
+//! `on_page_load` hook reaps the old document's tasks via
+//! `cancel_owner_before` when a navigation commits (the client-side
+//! `pagehide` hook stays as best effort). This test pins the Rust-side
+//! contracts — send failure must mean per-task cancellation, and the
+//! page-load watermark must spare the new document's calls.
 //! (No webviews involved — runs on every OS.)
 
 use serde_json::json;
@@ -302,5 +305,76 @@ async fn dead_channel_reaps_only_that_task_not_same_owner_siblings() {
     // Cleanup: B's real owner may cancel it; the forwarder then ends.
     let _ = timeout(T, h.cancel(task_b, Some("win-a".into()))).await;
     let _ = timeout(T, b_forwarder).await;
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn page_load_watermark_reaps_only_pre_navigation_tasks() {
+    // The plugin's on_page_load hook calls cancel_owner_before(label, wm)
+    // when a new document commits: tasks the OLD document owned die; a
+    // call the NEW document raced in before the command lands (id >= wm)
+    // survives. The hook itself needs a real webview engine — the mock
+    // runtime produces no page loads — so this pins the supervisor
+    // primitive it relies on.
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
+    let mut cfg = fast_config();
+    cfg.limits.max_concurrent_streams = 2;
+    let h = spawn_h(real_runtime_spec(), cfg, ev);
+    wait_state(&h, State::Ready).await;
+
+    // Old document's task.
+    let (task_old, _items_old) = timeout(
+        T,
+        h.call_stream("infinite_counted", json!({}), Some("win-a".into())),
+    )
+    .await
+    .expect("call_stream old timed out")
+    .unwrap();
+
+    // PageLoadEvent::Started commits — the watermark is taken here.
+    let wm = h.task_watermark();
+    assert!(task_old < wm, "old task must predate the watermark");
+
+    // The new document races a call in BEFORE the reap command lands.
+    let (task_new, _items_new) = timeout(
+        T,
+        h.call_stream("infinite_counted", json!({}), Some("win-a".into())),
+    )
+    .await
+    .expect("call_stream new timed out")
+    .unwrap();
+    assert!(task_new >= wm, "new task must be at/after the watermark");
+
+    h.cancel_owner_before("win-a".into(), wm).await;
+
+    // Old task is reaped (foreign probe: Rejected while live, tombstone
+    // after).
+    timeout(T, async {
+        loop {
+            match h.cancel(task_old, Some("win-b".into())).await {
+                Ok(CancelOutcome::Completed | CancelOutcome::NotFound) => break,
+                Ok(outcome) => {
+                    assert_eq!(
+                        outcome,
+                        CancelOutcome::Rejected,
+                        "foreign cancel must be rejected or see a tombstone, got {outcome:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("probe cancel errored: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("old-document task was never reaped");
+
+    // The raced-in new-document task survives — still owned by win-a.
+    match timeout(T, h.cancel(task_new, Some("win-b".into()))).await {
+        Ok(Ok(CancelOutcome::Rejected)) => {}
+        other => panic!("new-document task must survive the watermark reap, got {other:?}"),
+    }
+
+    // Cleanup: its real owner may cancel it.
+    let _ = timeout(T, h.cancel(task_new, Some("win-a".into()))).await;
     h.shutdown().await;
 }

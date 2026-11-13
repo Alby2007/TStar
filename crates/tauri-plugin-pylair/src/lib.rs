@@ -489,8 +489,9 @@ impl<R: Runtime> Builder<R> {
                     }
                 }
                 // A destroyed window leaves the subscriber set; a reload does
-                // NOT remove it (label survives reloads — an in-flight stream
-                // to a reloaded page just has no listener, which is fine).
+                // NOT remove it (the label survives — the new document keeps
+                // receiving broadcast lifecycle/stderr events, which is what
+                // subscribers want). Its tasks are reaped by on_page_load.
                 if let tauri::RunEvent::WindowEvent {
                     label,
                     event: tauri::WindowEvent::Destroyed,
@@ -519,6 +520,30 @@ impl<R: Runtime> Builder<R> {
                                 handle.shutdown(),
                             )
                             .await;
+                        });
+                    }
+                }
+            })
+            .on_page_load(|webview, payload| {
+                // A new document replaces the page's JS context: every call
+                // the old document owned is orphaned — its Channel::send can
+                // still return Ok through eval, so send-failure reaping
+                // cannot catch this. PageLoadEvent::Started fires at the
+                // document commit (WebView2 ContentLoading, WKWebView
+                // didCommitNavigation, WebKitGTK LoadCommitted): reloads and
+                // dev-server full reloads land here; same-document
+                // navigations (anchors, history.pushState, SPA routes) do
+                // not. The watermark keeps the race airtight — only tasks
+                // allocated BEFORE this navigation are reaped; a call the
+                // new document races in registers an id >= the mark and
+                // survives. The client-side pagehide hook stays as belt.
+                if payload.event() == tauri::webview::PageLoadEvent::Started {
+                    if let Some(rt) = webview.try_state::<PyRuntime>() {
+                        let h = rt.0.clone();
+                        let before = h.task_watermark();
+                        let owner = webview.label().to_string();
+                        tauri::async_runtime::spawn(async move {
+                            h.cancel_owner_before(owner, before).await;
                         });
                     }
                 }

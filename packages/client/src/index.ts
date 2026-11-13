@@ -231,8 +231,9 @@ function fromWire(v: unknown): unknown {
  * so a page unload can cancel them. A reload kills every channel but
  * `Channel::send` does NOT reliably error on a reload (the webview object
  * survives; the eval lands in a dead JS context and the callback is a
- * no-op), so without this hook a reloaded window's tasks would keep
- * running — and keep a stream slot — until they end on their own.
+ * no-op). The plugin's on_page_load hook already reaps the document's
+ * tasks server-side when a navigation commits; this hook stays as a best
+ * effort belt for engines that never surface a load event.
  */
 const liveTasks = new Set<number>();
 let unloadHooked = false;
