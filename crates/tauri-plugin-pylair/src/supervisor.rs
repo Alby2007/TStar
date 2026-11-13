@@ -1804,6 +1804,17 @@ async fn spawn_child(
             cmd.env_remove(k);
         }
         cmd.envs(spec.env.iter().cloned());
+        #[cfg(windows)]
+        {
+            // The bundled python.exe is console-subsystem: launched from our
+            // GUI-subsystem app it would pop an empty console window unless
+            // CREATE_NO_WINDOW suppresses it. Orthogonal to containment —
+            // the Job Object attaches by handle after spawn, and stdio
+            // stays on the pipes either way.
+            cmd.creation_flags(child_creation_flags(
+                std::env::var_os("PYLAIR_CONSOLE").as_deref(),
+            ));
+        }
         #[cfg(unix)]
         {
             // Own process group so killpg can reach grandchildren (§10).
@@ -2011,8 +2022,12 @@ async fn monitor_child(
             if job.is_none() {
                 // No Job Object: taskkill /T is the only way to reach the tree.
                 if let Some(pid) = tree_pid {
+                    // taskkill is console-subsystem too — same suppression.
                     let _ = tokio::process::Command::new("taskkill")
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .creation_flags(child_creation_flags(
+                            std::env::var_os("PYLAIR_CONSOLE").as_deref(),
+                        ))
                         .output()
                         .await;
                 }
@@ -2037,6 +2052,21 @@ async fn kill_tree(child: &mut Child) {
         }
     }
     let _ = child.start_kill();
+}
+
+/// Windows creation flags for console-subsystem children (the bundled
+/// python.exe, taskkill). Without CREATE_NO_WINDOW a GUI-subsystem app
+/// gets an empty console window per child. PYLAIR_CONSOLE (any value)
+/// keeps the window for debugging; the bridge uses pipes, never the
+/// console, so suppression is safe.
+#[cfg(windows)]
+fn child_creation_flags(console_env: Option<&std::ffi::OsStr>) -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if console_env.is_some() {
+        0
+    } else {
+        CREATE_NO_WINDOW
+    }
 }
 
 /// windows-sys HANDLE is *mut c_void, which is !Send — wrap it so it can be
@@ -2099,6 +2129,19 @@ fn assign_to_job_object(pid: Option<u32>) -> Option<JobHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn console_flag_suppressed_unless_pylair_console() {
+        use std::ffi::OsStr;
+        // Default: CREATE_NO_WINDOW so the console-subsystem runtime stays
+        // invisible under a GUI app.
+        assert_eq!(child_creation_flags(None), 0x0800_0000);
+        // PYLAIR_CONSOLE present (any value) → no flag, window allowed.
+        for v in ["1", "0", ""] {
+            assert_eq!(child_creation_flags(Some(OsStr::new(v))), 0);
+        }
+    }
 
     #[test]
     fn pong_classification_boundaries() {
