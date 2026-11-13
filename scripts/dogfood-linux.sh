@@ -127,10 +127,10 @@ fi
 start_app() { # mode tag
     local mode=$1 tag=$2
     if [ "$mode" = close ]; then
-        PYLAIR_SELF_TEST_WINDOW_CLOSE=1 "${LAUNCH[@]}" "$EXE" \
+        PYLAIR_SELF_TEST_WINDOW_CLOSE=1 "${LAUNCH[@]}" "$EXE_REAL" \
             >"$LOGDIR/$tag.out" 2>"$LOGDIR/$tag.err" &
     else
-        "${LAUNCH[@]}" "$EXE" >"$LOGDIR/$tag.out" 2>"$LOGDIR/$tag.err" &
+        "${LAUNCH[@]}" "$EXE_REAL" >"$LOGDIR/$tag.out" 2>"$LOGDIR/$tag.err" &
     fi
 }
 
@@ -145,7 +145,8 @@ wait_app_gone() { # app_pid timeout-sec
 # ---- phase: locate or build the binary --------------------------------------
 LOGDIR=${TMPDIR:-/tmp}; WORKDIR_CREATED=0
 if [ -z "$EXE" ]; then
-    WORKDIR=${WORKDIR:-$(mktemp -d /tmp/pylair-dogfood-XXXXXX)}
+    if [ -n "$WORKDIR" ]; then mkdir -p "$WORKDIR"; else WORKDIR=$(mktemp -d /tmp/pylair-dogfood-XXXXXX); fi
+    WORKDIR=$(readlink -f "$WORKDIR")
     WORKDIR_CREATED=1
     APP_NAME=${APP_NAME:-dogfood-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' ')}
     echo "scaffolding $APP_NAME (pylair@$VERSION) in $WORKDIR"
