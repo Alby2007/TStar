@@ -251,13 +251,25 @@ deadlock) never crashes, so it never restarts.
 
 ### 5.1 Event delivery (host → webviews)
 
-Runtime events are **scoped, not broadcast**: state/stderr/exposes go to
-webviews that have invoked the bridge (`emit_to` per label); stream items
-go only to the webview that started the stream. Subscriptions outlive a
-page reload (labels persist), so a webview reloaded mid-stream receives
-chunks it has no listener for — they are dropped harmlessly and the call
-still completes; the producer is unaffected. A destroyed window is
-removed from the subscriber set.
+Call data and lifecycle events use different mechanisms:
+
+- **Call data is channel-bound — not an event.** `python_call_stream`
+  requires an `onEvent` `tauri::ipc::Channel` argument and sends every
+  stream item `{task, seq?, value?, done, result?|error?}` through it.
+  Delivery is bound to the invoking webview: a channel cannot be listened
+  to by another window, replayed elsewhere, or forged from JS — there is
+  no shared bus (the `pylair://stream` event was removed; see
+  `docs/design/event-scoping.md` for the leak/forgery record). When the
+  channel's consumer is gone (`send` fails), the forwarder reaps the
+  window's tasks and stops — no stream slot or credit is left tied up.
+  A webview **reload** kills the channel without reliably failing `send`
+  (the eval lands in a dead JS context), so the client additionally
+  cancels its live tasks on `pagehide`.
+- **Broadcast lifecycle stays broadcast.** `pylair://state`,
+  `pylair://stderr` and `pylair://exposes` are `emit_to`-addressed at
+  webviews that have invoked the bridge — routing, not a security
+  boundary: any `Any`-target listener receives them regardless of the
+  emit target. A destroyed window is removed from the subscriber set.
 
 - `cancel()` waits at most `cancel_timeout` (default 5s) for the runtime's
   acknowledgement and then fails with `RUNTIME_WEDGED`; a blocked runtime

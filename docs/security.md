@@ -130,31 +130,43 @@ is the Tauri-reported window label — never a JS-supplied value:
   control a new task);
 - destroying a window cancels all of its tasks.
 
-Event delivery is **best-effort scoping, not a security boundary**.
-Stream chunks are emitted with `emit_to` addressed at the owning
-webview's label, and state/stderr/exposes go to webviews that have used
-the bridge (P1-8, covered by `tests/event_scoping.rs` — which tests
-Rust-side targeted listeners only). But the client's `listen()` uses
-Tauri's default `target: Any`, which receives events regardless of their
-emit target, and `core:event` grants emit: any webview that can listen
-can read another window's stream events, and any webview with emit
-permission can forge them (per Tauri 2.12.5's `match_any_or_filter`,
-an `Any`-target listener bypasses the `emit_to` filter). Treat
-per-window event scoping as UX routing, not isolation;
-stricter delivery is under investigation.
+**Stream/result delivery is bound to the invoking webview** — it is not
+an event at all. `python_call_stream` requires an `onEvent`
+`tauri::ipc::Channel` argument; the plugin sends every chunk and the
+terminal through it, and `pylair://stream` no longer exists. A second
+webview cannot listen to a channel it was never handed, and there is no
+bus left to inject forged events into — so the leak and the forgeries
+documented in `docs/design/event-scoping.md` are both closed by
+construction, not by a permission stopgap. This is enforced by the
+installed two-window self-test (`PYLAIR_SELF_TEST_WEBVIEW`): a `win-b`
+holding `emit`/`emitTo` sees none of `main`'s call data, never gets a
+forged item accepted, and never wins a cancel/grant on `main`'s tasks.
 
-**Forging is denied in the template; the leak is not.** The scaffolded
-capability adds `core:event:deny-emit` and `core:event:deny-emit-to` —
-deny rules win over `core:default`'s allow entries, so a scaffolded
-app's webviews cannot inject events into other windows (the forge half
-of the `docs/design/event-scoping.md` findings). Nothing in
-`@pylair/client` or the template emits, so this costs a stock app
-nothing; an app that needs JS-side `emit` re-grants it per window
-(`"core:event:allow-emit"` in its own capability block) — and accepts
-that any webview holding it can forge events again. Passive receipt is
-untouched: an `Any`-target listener still sees `emit_to`-addressed
-events, so cross-window stream reads remain possible until delivery
-moves to a per-call channel.
+What remains broadcast: `pylair://state`, `pylair://stderr` and
+`pylair://exposes` go to webviews that have invoked the bridge
+(`emit_to` per label) — but any `Any`-target listener still receives
+them regardless of the emit target (Tauri 2.12.5's
+`match_any_or_filter`), so treat these events as readable by every
+webview in the app. They carry lifecycle and log data, not call
+results — though `stderr` can contain application log lines, which is
+why per-window stderr opt-in is a documented follow-up. The template
+still **denies** `core:event:deny-emit` and `core:event:deny-emit-to`.
+Deny rules are evaluated per *origin*, ignoring `windows:` scoping, and
+always win over allows — so the entries bar **every** local webview from
+`emit`/`emitTo`, not just `main`. A scaffolded webview cannot forge the
+remaining broadcast events; an app needing JS-side `emit` cannot get it
+back through capabilities while the deny stays — the only paths left
+are Rust-side `emit_to` calls. That is also why the self-test's `win-b`
+reports through `python_selftest_b_report` (an ACL-checked command that
+emits for it) instead of `emitTo`, and why its emit/emitTo grants only
+matter in apps that ship without the denies (the reference app).
+
+Scope boundaries, stated plainly: ownership checks are the boundary for
+`cancel`/`grant_credit`/task reap-on-destroy; capability grants are the
+boundary for *starting* work — any webview whose capability covers the
+commands can still invoke them and start calls or streams. Channel
+delivery does not limit who may invoke; it guarantees only that a
+call's data reaches the webview that invoked it.
 
 ## 5. Malformed input, in both directions
 
