@@ -94,6 +94,7 @@ fn scrub_appdir(spec: &mut SpawnSpec, env: impl Fn(&str) -> Option<String>) {
 /// Why a spawn spec could not be computed. Surfaced through plugin setup
 /// as a startup error instead of a panic.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SpawnSpecError {
     /// `app.path().resource_dir()` failed AND no bundled resources were
     /// found next to the executable either. Carries Tauri's error — on
