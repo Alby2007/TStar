@@ -45,9 +45,22 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
     spec.env.push(("PYTHONPATH".into(), pythonpath));
     spec.env.push(("PYTHONUTF8".into(), "1".into()));
     spec.env.push(("PYTHONNOUSERSITE".into(), "1".into()));
+    // `python -m` puts the child's cwd first on sys.path — a json.py,
+    // asyncio/ or pylair/ in the directory the user launched from would
+    // shadow the stdlib or the runtime itself (isolated workers inherit
+    // this env, so they are covered too). PYTHONSAFEPATH (3.11+, and our
+    // bundled runtime is 3.12) removes the implicit entry; PYTHONPATH
+    // above still resolves the app module and bundled site-packages.
+    spec.env.push(("PYTHONSAFEPATH".into(), "1".into()));
+    // Pin cwd to the bundle rather than whatever dir launched the app —
+    // deterministic for any code that opens relative paths, and empty
+    // of user-writable shadow candidates.
+    spec.cwd = Some(resources.to_path_buf());
     // The packaged interpreter must not inherit Python configuration from
     // whatever launched the app: an AppImage's AppRun exports PYTHONHOME
     // (pointing at the AppDir), which breaks the bundled stdlib lookup.
+    // PYTHONBREAKPOINT names a module imported by breakpoint() — a launch
+    // env var must not get code executed inside the runtime.
     spec.env_remove.extend(
         [
             "PYTHONHOME",
@@ -56,6 +69,8 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
             "PYTHONUSERBASE",
             "PYTHONINSPECT",
             "PYTHONPLATLIBDIR",
+            "PYTHONWARNINGS",
+            "PYTHONBREAKPOINT",
         ]
         .map(String::from),
     );
