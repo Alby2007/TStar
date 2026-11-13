@@ -200,12 +200,19 @@ def coerce_kwargs(fn: Any, input: dict) -> dict:
     return out
 
 
-def exceeds_depth(obj: Any, limit: int) -> bool:
-    """True if `obj` nests dicts/sequences deeper than `limit` levels.
+_CONTAINER_TYPES = (dict, list, tuple, set, frozenset)
 
-    Iterative — a recursive walk would hit Python's own recursion limit
-    on exactly the payloads this is meant to catch. dict keys are JSON
-    strings (never containers), so only values are descended.
+
+def exceeds_depth(obj: Any, limit: int) -> bool:
+    """True if `obj` nests containers deeper than `limit` JSON levels.
+
+    Only containers add JSON nesting depth (serde's recursion limit
+    counts `[`/`{` opens), so leaves are skipped instead of pushed —
+    a million-element flat result is one cheap scan, not a million
+    stack entries. Iterative: a recursive walk would hit Python's own
+    recursion limit on exactly the payloads this is meant to catch.
+    dict keys are JSON strings (never containers), so only values are
+    descended.
     """
     stack = [(obj, 1)]
     while stack:
@@ -213,7 +220,12 @@ def exceeds_depth(obj: Any, limit: int) -> bool:
         if depth > limit:
             return True
         if isinstance(node, dict):
-            stack.extend((v, depth + 1) for v in node.values())
-        elif isinstance(node, (list, tuple, set, frozenset)):
-            stack.extend((v, depth + 1) for v in node)
+            it = node.values()
+        elif isinstance(node, _CONTAINER_TYPES):
+            it = node
+        else:
+            continue
+        stack.extend(
+            (v, depth + 1) for v in it if isinstance(v, _CONTAINER_TYPES)
+        )
     return False
