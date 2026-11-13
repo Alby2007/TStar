@@ -128,7 +128,10 @@ jobs:
         with:
           enable-cache: false
       - run: uv python install ">=3.12"
-      - run: uv python find
+      # Explicit request: a bare `uv python find` resolves the repo-root
+      # .python-version ("3.12") ahead of UV_PYTHON, which fails on runners
+      # with no 3.12.x (ubuntu-22.04) and misreports on the rest.
+      - run: uv python find ">=3.12"
       - working-directory: python/pylair
         shell: bash
         run: |
