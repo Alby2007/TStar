@@ -20,7 +20,7 @@ import threading
 import time
 import traceback
 
-from pylair import _json
+from pylair import _json, _transport
 from pylair import _protocol as proto
 
 
@@ -127,7 +127,19 @@ def main() -> int:
         raw = sys.stdin.buffer.read()
         input = _json.loads(raw) if raw else {}
         result = fn(**_json.coerce_kwargs(fn, input))
-        payload = {"result": result}
+        if _json.exceeds_depth(result, _transport.MAX_DEPTH - 2):
+            # A result deeper than the host's parser limit would arrive
+            # as a malformed frame and kill the runtime — the parent maps
+            # `code` through, so fail this call with the typed error.
+            payload = {
+                "error": {
+                    "code": proto.LIMIT_EXCEEDED,
+                    "message": "result exceeds the depth cap",
+                    "data": {"limit": "max_depth", "max": _transport.MAX_DEPTH},
+                }
+            }
+        else:
+            payload = {"result": result}
     except _json.InvalidParams as e:
         # Caller sent values the signature can't hold — a params error,
         # not a worker failure; the parent maps `code` through.

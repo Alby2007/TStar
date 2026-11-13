@@ -190,3 +190,28 @@ async def block_loop(seconds: float) -> str:
     # diagnostic-vs-kill case (a bounded stall must not be killed).
     time.sleep(seconds)  # noqa: ASYNC251 - intentional event-loop starvation
     return "unblocked"
+
+
+def _nest(n: int):
+    """n-deep nested dict: {"d": {"d": … {"d": 1}}}."""
+    out = 1
+    for _ in range(n):
+        out = {"d": out}
+    return out
+
+
+@expose
+def deep(n: int):
+    # serde_json on the host refuses payloads nested deeper than 128 —
+    # a legal Python result must fail THIS call, not the runtime.
+    return _nest(n)
+
+
+@expose
+async def deep_stream(n: int):
+    yield _nest(n)
+
+
+@expose(isolated=True)
+def isolated_deep(n: int):
+    return _nest(n)

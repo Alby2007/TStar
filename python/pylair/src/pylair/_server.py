@@ -22,7 +22,7 @@ from pylair import _json
 from pylair import _protocol as proto
 from pylair._expose import exposed_functions, exposes_manifest
 from pylair._tasks import MAX_STREAM_CREDIT, TaskRegistry
-from pylair._transport import MAX_FRAME, FrameChannel, FrameTooLarge
+from pylair._transport import MAX_DEPTH, MAX_FRAME, FrameChannel, FrameTooLarge
 
 _EOF = object()
 _STOP = object()
@@ -120,6 +120,25 @@ class Server:
         self._loop_beat = time.monotonic()
 
     def _send(self, msg: dict) -> None:
+        # Depth check before serialization: a frame nested deeper than
+        # the host's parser limit is a malformed frame on arrival — fail
+        # just this call with the typed error instead of killing the
+        # runtime. A notification has no caller to report to: drop it.
+        if _json.exceeds_depth(msg, MAX_DEPTH):
+            rid = msg.get("id")
+            if isinstance(rid, (int, str)):
+                msg = proto.error_response(
+                    rid,
+                    proto.LIMIT_EXCEEDED,
+                    "response exceeds the depth cap",
+                    {"limit": "max_depth", "max": MAX_DEPTH},
+                )
+            else:
+                _log(
+                    f"dropping outbound frame over the depth cap ({MAX_DEPTH} levels, "
+                    f"{msg.get('method', 'response')}) — host could not parse it"
+                )
+                return
         # Serialize HERE, on the caller's thread (the event loop for task
         # results): a TypeError/ValueError can then be turned into an
         # INTERNAL response for that one call. The writer thread only ever

@@ -198,3 +198,22 @@ def coerce_kwargs(fn: Any, input: dict) -> dict:
             # where the function expects an object (docs/codegen.md).
             raise InvalidParams(f"param '{name}': {e}") from e
     return out
+
+
+def exceeds_depth(obj: Any, limit: int) -> bool:
+    """True if `obj` nests dicts/sequences deeper than `limit` levels.
+
+    Iterative — a recursive walk would hit Python's own recursion limit
+    on exactly the payloads this is meant to catch. dict keys are JSON
+    strings (never containers), so only values are descended.
+    """
+    stack = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, (list, tuple, set, frozenset)):
+            stack.extend((v, depth + 1) for v in node)
+    return False

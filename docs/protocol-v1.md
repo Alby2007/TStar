@@ -53,6 +53,12 @@ hang or OOM the host.
   payloads (images, audio) currently travel base64-in-JSON (+33% size);
   a temp-file-handle transport for bulk data is the documented future
   escape hatch (`docs/ideas.md`).
+- `MAX_DEPTH` defaults to **100** JSON nesting levels, configurable via
+  `PYLAIR_MAX_DEPTH`. The host parses with serde_json, which refuses
+  input nested deeper than ~128 — a response or `stream.chunk` value
+  over the runtime's own depth cap fails ONLY that call with
+  `LIMIT_EXCEEDED` (`"max_depth"`), never the runtime. A notification
+  that exceeds it (no caller to report to) is dropped and logged.
 - A peer that goes silent mid-frame is just slow; no read timeout on
   frames. Startup has its own deadline (§4) and steady-state liveness is
   covered by ping/pong (§5).
@@ -331,7 +337,8 @@ JSON-RPC reserved plus app-specific, all in `-32000..-32099`:
 
 `LIMIT_EXCEEDED` errors carry `data: {"limit": "<name>", "max": <n>}`
 naming which cap fired — e.g. `"max_concurrent_tasks"`,
-`"stream_buffer_bytes"`, `"max_stream_credit"`, `"max_frame"`. Clients
+`"stream_buffer_bytes"`, `"max_stream_credit"`, `"max_frame"`,
+`"max_depth"`. Clients
 surface it as `LimitExceededError` with `.limit`/`.max`. Limits are
 enforced per runtime (not per window) on the supervisor's `Limits`
 config; defaults are env-overridable via `PYLAIR_MAX_*` and the
