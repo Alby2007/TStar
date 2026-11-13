@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "event-scoping-repro",
+  "version": "0.0.0",
+  "identifier": "com.pylair.event-scoping-repro",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "win-a",
+        "title": "win-a: stream owner",
+        "url": "index.html",
+        "width": 560,
+        "height": 440
+      },
+      {
+        "label": "win-b",
+        "title": "win-b: listener + forger",
+        "url": "index.html",
+        "x": 580,
+        "width": 560,
+        "height": 440
+      }
+    ]
+  },
+  "bundle": { "active": false }
+}

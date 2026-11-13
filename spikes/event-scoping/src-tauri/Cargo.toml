@@ -1,0 +1,16 @@
+[package]
+name = "event-scoping-repro"
+version = "0.0.0"
+edition = "2021"
+description = "Throwaway two-window repro for the emit_to event-scoping claim"
+
+# The spike is its own workspace root — it must not join crates/*.
+[workspace]
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = "2"
+tauri-plugin-pylair = { path = "../../../crates/tauri-plugin-pylair" }
+serde_json = "1"

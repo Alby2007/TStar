@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "the same grants a scaffolded app gets (core:default + pylair:default) so the repro is faithful to the template",
+  "windows": ["win-a", "win-b"],
+  "permissions": ["core:default", "pylair:default"]
+}
