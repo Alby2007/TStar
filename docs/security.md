@@ -146,6 +146,13 @@ installed two-window self-test (`PYLAIR_SELF_TEST_WEBVIEW`): a `win-b`
 holding `emit`/`emitTo` sees none of `main`'s call data, never gets a
 forged item accepted, and never wins a cancel/grant on `main`'s tasks.
 
+The invoke answers `{task, protocol: 2}` so a mixed-version deploy fails
+loudly instead of hanging: an **old client + new plugin** gets Tauri's
+`invalid args 'onEvent'` rejection; a **new client + old plugin** gets a
+bare task id back (the old command ignored `onEvent`), which the client
+recognises, reports as an upgrade-required error, and cleans up by
+cancelling the orphaned task.
+
 What remains broadcast: `pylair://state`, `pylair://stderr` and
 `pylair://exposes` go to webviews that have invoked the bridge
 (`emit_to` per label) — but any `Any`-target listener still receives

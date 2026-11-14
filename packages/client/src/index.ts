@@ -25,7 +25,7 @@ export interface IpcBridge {
    * receives StreamEvents for THIS invocation only; the implementation
    * binds it to a `Channel` passed as the `onEvent` argument.
    */
-  invokeChannel<T = number>(
+  invokeChannel<T = unknown>(
     cmd: string,
     args: Record<string, unknown>,
     onEvent: (ev: StreamEvent) => void,
@@ -227,6 +227,45 @@ function fromWire(v: unknown): unknown {
 // its own events, so no task-map routing or early-event buffering exists.
 
 /**
+ * Bridge protocol version — `python_call_stream` answers
+ * `{task, protocol: 2}`. `2` marks per-call channel delivery; `1` was the
+ * bare task id + shared event bus. (Unrelated to the host↔Python wire
+ * protocol in docs/protocol-v1.md.)
+ */
+const BRIDGE_PROTOCOL = 2;
+
+interface StreamAck {
+  task: number;
+  protocol: number;
+}
+
+/**
+ * Read the task id out of a `python_call_stream` ack. An OLD plugin
+ * ignores the `onEvent` argument entirely and answers a bare task number
+ * — the task IS started but no channel delivery can ever arrive, so a
+ * bare-number answer would otherwise hang the call forever. Fail loudly
+ * and cancel the orphaned task (best effort — the old plugin may already
+ * have finished it). Anything else unexpected fails loudly too.
+ */
+function streamAckTask(ack: unknown): number {
+  if (
+    typeof ack === "object" &&
+    ack !== null &&
+    typeof (ack as StreamAck).task === "number" &&
+    (ack as StreamAck).protocol === BRIDGE_PROTOCOL
+  ) {
+    return (ack as StreamAck).task;
+  }
+  if (typeof ack === "number") {
+    void ipc().then((b) => b.invoke(CMD.cancel, { task: ack }).catch(() => {}));
+    throw new Error(
+      "this app's Pylair plugin is older than the client; upgrade tauri-plugin-pylair",
+    );
+  }
+  throw new Error(`unexpected python_call_stream response: ${JSON.stringify(ack)}`);
+}
+
+/**
  * Live task ids in THIS window — not for routing (channels do that), only
  * so a page unload can cancel them. A reload kills every channel but
  * `Channel::send` does NOT reliably error on a reload (the webview object
@@ -320,8 +359,8 @@ export async function call<T = unknown>(
   let settled = false;
   let disarm = () => {};
   let task = -1;
-  task = await b
-    .invokeChannel<number>(
+  const ack = await b
+    .invokeChannel<unknown>(
       CMD.callStream,
       { fnName: fn, input: toWire(input) as Record<string, unknown> },
       (ev) => {
@@ -336,6 +375,7 @@ export async function call<T = unknown>(
     .catch((e) => {
       throw asPythonError(e);
     });
+  task = streamAckTask(ack);
   wireAbort(opts.signal, task);
   if (!settled) {
     trackLive(task);
@@ -360,8 +400,8 @@ export async function* stream<T = unknown>(
   let expired: PythonError | null = null;
   // Bound at invoke time — events queue locally even if they beat the
   // invoke response back.
-  const task = await b
-    .invokeChannel<number>(
+  const ack = await b
+    .invokeChannel<unknown>(
       CMD.callStream,
       { fnName: fn, input: toWire(input) as Record<string, unknown> },
       (ev) => {
@@ -372,6 +412,7 @@ export async function* stream<T = unknown>(
     .catch((e) => {
       throw asPythonError(e);
     });
+  const task = streamAckTask(ack);
   wireAbort(opts.signal, task);
   trackLive(task);
   const disarm = armDeadline(opts, task, (e) => {

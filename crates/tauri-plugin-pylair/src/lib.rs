@@ -604,9 +604,24 @@ async fn python_call<R: Runtime>(
         .await
 }
 
-/// Start a streaming call. Returns the task id; chunks and the terminal
-/// arrive on the per-call `on_event` channel — delivery is bound to the
-/// invoking webview, no shared event bus (event-scoping fix).
+/// The `python_call_stream` answer. `protocol` is the client↔plugin
+/// bridge version (2 = per-call channel delivery), NOT the host↔Python
+/// wire protocol (`protocol::PROTOCOL_VERSION` = 1). It exists so a new
+/// client can spot an old plugin: the old command returned a bare task
+/// id and ignored `onEvent`, which would hang the call forever — a
+/// bare-number answer tells the client to fail loudly instead.
+const BRIDGE_PROTOCOL: u32 = 2;
+
+#[derive(serde::Serialize)]
+struct StreamAck {
+    task: u64,
+    protocol: u32,
+}
+
+/// Start a streaming call. Returns `{task, protocol}`; chunks and the
+/// terminal arrive on the per-call `on_event` channel — delivery is
+/// bound to the invoking webview, no shared event bus (event-scoping
+/// fix).
 #[tauri::command]
 async fn python_call_stream<R: Runtime>(
     window: tauri::WebviewWindow<R>,
@@ -615,14 +630,17 @@ async fn python_call_stream<R: Runtime>(
     on_event: tauri::ipc::Channel<Value>,
     fn_name: String,
     input: Value,
-) -> Result<u64, ErrorObj> {
+) -> Result<StreamAck, ErrorObj> {
     subscribed(&window, &reg);
     let label = window.label().to_string();
     let (task, items) =
         rt.0.call_stream(&fn_name, input, Some(label.clone()))
             .await?;
     forward_stream(on_event, items, rt.0.clone(), task, label);
-    Ok(task)
+    Ok(StreamAck {
+        task,
+        protocol: BRIDGE_PROTOCOL,
+    })
 }
 
 /// Forward one call's stream items to its per-call channel. A dead
@@ -876,6 +894,18 @@ mod tests {
         assert_eq!(reg.broadcast_targets().len(), 2);
         reg.drop_label("panel");
         assert_eq!(reg.broadcast_targets(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn stream_ack_carries_task_and_bridge_protocol() {
+        // A new client reads this object to detect an old plugin (which
+        // returned a bare task id) — the exact shape is the contract.
+        let v = serde_json::to_value(StreamAck {
+            task: 7,
+            protocol: BRIDGE_PROTOCOL,
+        })
+        .unwrap();
+        assert_eq!(v, json!({"task": 7, "protocol": 2}));
     }
 
     #[test]
