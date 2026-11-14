@@ -7,6 +7,7 @@
 import { spawnSync } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { build } from "./build.js";
 import { emit } from "./codegen.js";
 import { dev } from "./dev.js";
@@ -37,7 +38,8 @@ build options:
   --dir <path>          App directory (default: cwd)
   --bundles <list>      Comma-separated bundle kinds passed to tauri build
   --skip-fetch          Reuse already-staged resources/python
-  Any other flags are forwarded to tauri build.
+  Any other flags are forwarded to tauri build, including the value
+  after a --flag; everything after -- is forwarded verbatim.
 
   Builds are native-only: run on each target OS (no cross-compile).
   Unsigned by default — set signing env vars for distribution builds.
@@ -72,6 +74,51 @@ function findPython(): string {
 function spawnProbe(cmd: string): boolean {
   const { status, error } = spawnSync(cmd, ["-c", "import sys;sys.exit(0)"]);
   return !error && status === 0;
+}
+
+/** Split `pylair build` args into ours and tauri's. Pass-through flags
+ * forward `--flag`, `--flag value` (when the value doesn't start with
+ * `-`) and `--flag=value`; everything after a bare `--` forwards
+ * verbatim. Exported for tests. */
+export function parseBuildArgs(rest: string[]): {
+  dir?: string;
+  bundles?: string;
+  skipFetch: boolean;
+  tauriArgs: string[];
+} {
+  let dir: string | undefined;
+  let bundles: string | undefined;
+  let skipFetch = false;
+  const tauriArgs: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--") {
+      tauriArgs.push(...rest.slice(i + 1));
+      break;
+    }
+    const eq = a.indexOf("=");
+    const key = eq === -1 ? a : a.slice(0, eq);
+    const inline = eq === -1 ? undefined : a.slice(eq + 1);
+    if (key === "--dir") {
+      dir = inline ?? rest[++i];
+      continue;
+    }
+    if (key === "--bundles") {
+      bundles = inline ?? rest[++i];
+      continue;
+    }
+    if (key === "--skip-fetch") {
+      skipFetch = true;
+      continue;
+    }
+    if (a.startsWith("--")) {
+      tauriArgs.push(a);
+      if (inline === undefined && i + 1 < rest.length && !rest[i + 1].startsWith("-"))
+        tauriArgs.push(rest[++i]);
+    }
+  }
+  if (bundles !== undefined) tauriArgs.push("--bundles", bundles);
+  return { dir, bundles, skipFetch, tauriArgs };
 }
 
 function codegen(argv: string[]): number {
@@ -120,19 +167,11 @@ function main(argv: string[]): number | Promise<number> {
     }
   }
   if (command === "build") {
-    const dir = argValue(rest, "--dir") ?? process.cwd();
-    const bundles = argValue(rest, "--bundles");
-    const own = new Set(["--dir", "--bundles", "--skip-fetch"]);
-    const tauriArgs: string[] = [];
-    for (let i = 0; i < rest.length; i++) {
-      if (own.has(rest[i])) i += rest[i] === "--skip-fetch" ? 0 : 1;
-      else if (rest[i].startsWith("--")) tauriArgs.push(rest[i]);
-    }
-    if (bundles) tauriArgs.push("--bundles", bundles);
+    const { dir, skipFetch, tauriArgs } = parseBuildArgs(rest);
     return build({
-      appDir: dir,
+      appDir: dir ?? process.cwd(),
       tauriArgs,
-      skipFetch: rest.includes("--skip-fetch"),
+      skipFetch,
     }).then(
       () => 0,
       (e) => {
@@ -159,4 +198,7 @@ function main(argv: string[]): number | Promise<number> {
   return 1;
 }
 
-Promise.resolve(main(process.argv.slice(2))).then(process.exit);
+// Entry guard: importing this module in tests must not run the CLI.
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  Promise.resolve(main(process.argv.slice(2))).then(process.exit);
+}

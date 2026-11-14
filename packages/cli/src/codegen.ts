@@ -118,6 +118,16 @@ function collectDataclasses(s: Schema | undefined, out: Map<string, Schema>): vo
   for (const o of s.opts ?? []) collectDataclasses(o, out);
 }
 
+/** The doc line lands inside a `/** ... *​/` comment — `*​/` would end it
+ * early and emit live code, control/line-separator chars break the
+ * single line, and a trailing backslash must not run into the close. */
+function docComment(doc: string): string {
+  return doc
+    .replace(/\p{Cc}|\p{Cf}|\p{Zl}|\p{Zp}/gu, " ")
+    .replace(/\*\//g, "*\\/")
+    .replace(/\\+$/, " ");
+}
+
 /** Render the manifest as a TypeScript module. */
 export function emit(m: Manifest, source: string): string {
   if (m.error) throw new Error(`manifest error: ${m.error}`);
@@ -151,7 +161,7 @@ export function emit(m: Manifest, source: string): string {
 
   const fnames = new Set<string>();
   for (const f of fns) {
-    if (f.doc) out.push(`/** ${f.doc.split("\n")[0]} */`);
+    if (f.doc) out.push(`/** ${docComment(f.doc.split("\n")[0])} */`);
     // *args/**kwargs can't be expressed as named args over the bridge
     // (the wire input is a kwargs dict) — drop them from the stub.
     const vparams = f.params.filter((p) => !p.kind.includes("VAR_"));
