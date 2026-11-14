@@ -590,12 +590,28 @@ async function selfTestOwner(spec: SelfTestSpec): Promise<void> {
     everCancelled?: boolean;
     anyGrantSucceeded?: boolean;
     seenSample?: unknown[];
+    sawStderr?: number;
   }>((res) => {
     void ipc().then((b) => b.listen("pylair://selftest-b", res));
   });
 
-  // Task ids are sequential from 1 on a fresh app: stream = task 1,
-  // call = task 2, cancel-check = task 3. The intruder targets 1 and 2.
+  // The owner proves it still receives runtime stderr on its own window,
+  // while the intruder proves it receives none. log_stderr fires first so
+  // the line lands inside win-b's whole-lifetime listening window.
+  const ownStderr: string[] = [];
+  void onStderr((l) => ownStderr.push(l));
+  const stderrMarker = `SELFTEST-STDERR-${Date.now()}`;
+  await run("stderr-delivery", async () => {
+    await within(call("log_stderr", { msg: stderrMarker }), 30_000, "log_stderr");
+    for (let i = 0; i < 50 && !ownStderr.some((l) => l.includes(stderrMarker)); i++) {
+      await sleep(100);
+    }
+    if (!ownStderr.some((l) => l.includes(stderrMarker)))
+      throw new Error("main window did not receive its own stderr line");
+  });
+
+  // Task ids are sequential from 1 on a fresh app: the stderr probe = 1,
+  // stream = 2, call = 3, cancel-check = 4. The intruder targets 2 and 3.
   await run("stream-order", async () => {
     const got: number[] = [];
     await within(
@@ -641,6 +657,9 @@ async function selfTestOwner(spec: SelfTestSpec): Promise<void> {
       );
     if (b.everCancelled) throw new Error("win-b cancelled win-a's task");
     if (b.anyGrantSucceeded) throw new Error("win-b granted credit on win-a's task");
+    if (typeof b.sawStderr !== "number") throw new Error("win-b reported no stderr count");
+    if (b.sawStderr !== 0)
+      throw new Error(`win-b received ${b.sawStderr} stderr line(s) not addressed to it`);
   });
   await (await ipc()).invoke(CMD.selftestReport, { result: { ok, checks } });
 }
@@ -673,29 +692,37 @@ async function selfTestIntruder(): Promise<void> {
     sawEvents += 1;
   });
 
-  // Early-buffer attack: pre-fire a terminal for the owner's NEXT task id
-  // (task 2 — the plain call) before it exists.
-  void emit("pylair://stream", { task: 2, done: true, result: "FORGED-EARLY-BY-B" }).catch(() => {});
+  // Stderr scoping: the owner writes a marker line mid-test; a leaked
+  // delivery shows up here. Under per-window stderr opt-in this webview
+  // is not on the delivery list, so the count must stay zero.
+  let sawStderr = 0;
+  await listen<string>("pylair://stderr", () => {
+    sawStderr += 1;
+  });
 
-  // Wait until the runtime is up so task 1 (the owner's stream) is live.
+  // Early-buffer attack: pre-fire a terminal for the owner's NEXT task id
+  // (task 3 — the plain call) before it exists.
+  void emit("pylair://stream", { task: 3, done: true, result: "FORGED-EARLY-BY-B" }).catch(() => {});
+
+  // Wait until the runtime is up so task 2 (the owner's stream) is live.
   for (let i = 0; i < 120; i++) {
     const s = await invoke<string>("plugin:pylair|python_state").catch(() => "");
     if (s === "ready") break;
     await sleep(500);
   }
 
-  // Mid-stream forgeries at task 1: plain emit, emitTo("main"), terminal.
-  void emit("pylair://stream", { task: 1, seq: 999, value: "FORGED-BY-B", done: false }).catch(
+  // Mid-stream forgeries at task 2: plain emit, emitTo("main"), terminal.
+  void emit("pylair://stream", { task: 2, seq: 999, value: "FORGED-BY-B", done: false }).catch(
     () => {},
   );
   void emitTo("main", "pylair://stream", {
-    task: 1,
+    task: 2,
     seq: 998,
     value: "FORGED-EMITTO-BY-B",
     done: false,
   }).catch(() => {});
   setTimeout(() => {
-    void emit("pylair://stream", { task: 1, done: true, result: "FORGED-RESULT-BY-B" }).catch(
+    void emit("pylair://stream", { task: 2, done: true, result: "FORGED-RESULT-BY-B" }).catch(
       () => {},
     );
   }, 400);
@@ -706,9 +733,9 @@ async function selfTestIntruder(): Promise<void> {
   let anyGrantSucceeded = false;
   const acted = new Set(["cancelled", "terminated", "requested_may_continue", "termination_uncertain"]);
   for (let i = 0; i < 8; i++) {
-    const oc = await invoke<string>("plugin:pylair|python_cancel", { task: 1 }).catch(() => "");
+    const oc = await invoke<string>("plugin:pylair|python_cancel", { task: 2 }).catch(() => "");
     if (acted.has(oc)) everCancelled = true;
-    const granted = await invoke("plugin:pylair|python_grant_credit", { task: 1, n: 8 })
+    const granted = await invoke("plugin:pylair|python_grant_credit", { task: 2, n: 8 })
       .then(() => true)
       .catch(() => false);
     if (granted) anyGrantSucceeded = true;
@@ -720,7 +747,7 @@ async function selfTestIntruder(): Promise<void> {
   // Tauri ignores window scoping for denials — so win-b relays through an
   // ACL-checked command whose Rust side emits for it.
   await invoke("plugin:pylair|python_selftest_b_report", {
-    report: { sawEvents, everCancelled, anyGrantSucceeded, seenSample },
+    report: { sawEvents, everCancelled, anyGrantSucceeded, seenSample, sawStderr },
   }).catch(() => {});
 }
 

@@ -10,6 +10,7 @@ recovery, and packaged installs on machines with no Python.
 
 import asyncio
 import os
+import sys
 from collections.abc import AsyncIterator
 
 from pylair import expose
@@ -82,3 +83,10 @@ async def count(n: int = 5) -> AsyncIterator[int]:
     for i in range(n):
         yield i
         await asyncio.sleep(0.2)
+
+
+@expose
+def log_stderr(msg: str) -> None:
+    # The two-window self-test writes a marker line and asserts it reaches
+    # only the owner window's pylair://stderr subscription.
+    print(msg, file=sys.stderr)
