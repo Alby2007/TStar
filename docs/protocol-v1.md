@@ -256,15 +256,23 @@ Call data and lifecycle events use different mechanisms:
 - **Call data is channel-bound — not an event.** `python_call_stream`
   requires an `onEvent` `tauri::ipc::Channel` argument and sends every
   stream item `{task, seq?, value?, done, result?|error?}` through it.
-  Delivery is bound to the invoking webview: a channel cannot be listened
-  to by another window, replayed elsewhere, or forged from JS — there is
-  no shared bus (the `pylair://stream` event was removed; see
+  The invoke itself answers `{task, protocol: 2}` — `protocol` is the
+  client↔plugin bridge version (unrelated to the wire version above):
+  an older plugin returns a bare task id and ignored `onEvent`, so a
+  bare-number answer means "no channel delivery will arrive" and the
+  client must fail loudly (and cancel the orphaned task) rather than
+  hang. Delivery is bound to the invoking webview: a channel cannot be
+  listened to by another window, replayed elsewhere, or forged from JS —
+  there is no shared bus (the `pylair://stream` event was removed; see
   `docs/design/event-scoping.md` for the leak/forgery record). When the
-  channel's consumer is gone (`send` fails), the forwarder reaps the
-  window's tasks and stops — no stream slot or credit is left tied up.
+  channel's consumer is gone (`send` fails), the forwarder reaps that
+  task and stops — no stream slot or credit is left tied up, and
+  same-owner siblings keep running.
   A webview **reload** kills the channel without reliably failing `send`
-  (the eval lands in a dead JS context), so the client additionally
-  cancels its live tasks on `pagehide`.
+  (the eval lands in a dead JS context), so the plugin reaps the old
+  document's tasks server-side at `on_page_load`/`PageLoadEvent::Started`
+  (bounded by a task-id watermark — the new document's calls survive);
+  the client's `pagehide` hook remains as best effort.
 - **Broadcast lifecycle stays broadcast.** `pylair://state`,
   `pylair://stderr` and `pylair://exposes` are `emit_to`-addressed at
   webviews that have invoked the bridge — routing, not a security

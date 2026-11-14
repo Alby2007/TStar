@@ -43,7 +43,7 @@ function fakeBridge() {
       assert.equal(cmd, "plugin:pylair|python_call_stream");
       const task = nextTask++;
       channels.set(task, onEvent);
-      return task;
+      return { task, protocol: 2 };
     },
     async listen(event, cb) {
       if (!listeners.has(event)) listeners.set(event, []);
@@ -67,6 +67,43 @@ test("call resolves with the terminal result", async () => {
   await tick(); // let invokeChannel resolve, task=100
   b.emitTask(100, streamDone(100, 3));
   assert.equal(await p, 3);
+});
+
+test("old plugin's bare task ack errors loudly and cancels the orphan", async () => {
+  const b = fakeBridge();
+  // An old python_call_stream ignores `onEvent` and returns a bare task
+  // id — the task runs with no channel to report on.
+  b.invokeChannel = async (cmd, args) => {
+    b.calls.push({ cmd, args });
+    return 7;
+  };
+  setBridge(b);
+  await assert.rejects(
+    call("add", { a: 1, b: 2 }),
+    /older than the client.*tauri-plugin-pylair/,
+  );
+  await tick();
+  const cancels = b.calls.filter((c) => c.cmd === "plugin:pylair|python_cancel");
+  assert.deepEqual(
+    cancels.map((c) => c.args),
+    [{ task: 7 }],
+    "the orphaned task must be cancelled",
+  );
+});
+
+test("stream also rejects an old plugin's bare task ack", async () => {
+  const b = fakeBridge();
+  b.invokeChannel = async (cmd, args) => {
+    b.calls.push({ cmd, args });
+    return 9;
+  };
+  setBridge(b);
+  await assert.rejects(
+    (async () => {
+      for await (const _ of stream("counter", { n: 1 })) void _;
+    })(),
+    /older than the client.*tauri-plugin-pylair/,
+  );
 });
 
 test("call rejects with PythonError on runtime error", async () => {
