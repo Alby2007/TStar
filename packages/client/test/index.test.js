@@ -416,3 +416,42 @@ test("stream terminal LIMIT_EXCEEDED throws LimitExceededError with .limit", asy
       e.code === -32040,
   );
 });
+
+// ---- rc.15 PR I4: abort-listener hygiene ----
+
+test("a long-lived AbortSignal keeps zero listeners after 1000 settled calls", async () => {
+  const { getEventListeners } = await import("node:events");
+  const b = fakeBridge();
+  setBridge(b);
+  const ac = new AbortController();
+  let task = 100;
+  for (let i = 0; i < 1000; i++) {
+    const p = call("f", {}, { signal: ac.signal });
+    await tick();
+    b.emitTask(task, streamDone(task, i));
+    await p;
+    task++;
+  }
+  assert.equal(
+    getEventListeners(ac.signal, "abort").length,
+    0,
+    "abort listeners must be removed when each call settles",
+  );
+});
+
+test("a long-lived AbortSignal keeps zero listeners after settled streams", async () => {
+  const { getEventListeners } = await import("node:events");
+  const b = fakeBridge();
+  setBridge(b);
+  const ac = new AbortController();
+  let task = 100;
+  for (let i = 0; i < 200; i++) {
+    const it = stream("g", {}, { signal: ac.signal });
+    const next = it.next();
+    await tick();
+    b.emitTask(task, streamDone(task, null));
+    await next;
+    task++;
+  }
+  assert.equal(getEventListeners(ac.signal, "abort").length, 0);
+});

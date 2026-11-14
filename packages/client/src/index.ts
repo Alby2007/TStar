@@ -312,13 +312,24 @@ function trackLive(task: number): void {
   liveTasks.add(task);
 }
 
-function wireAbort(signal: AbortSignal | undefined, task: number): void {
-  if (!signal) return;
+/**
+ * Wire an AbortSignal to a task's cancel; returns a disarm that removes
+ * the listener. The listener MUST be removed when the call settles —
+ * `{once:true}` only cleans up after firing, so a long-lived signal
+ * reused across calls would otherwise accumulate a listener (and the
+ * closure) per call forever.
+ */
+function wireAbort(signal: AbortSignal | undefined, task: number): () => void {
+  if (!signal) return () => {};
   const cancel = () => {
     void ipc().then((b) => b.invoke(CMD.cancel, { task }));
   };
-  if (signal.aborted) return cancel();
+  if (signal.aborted) {
+    cancel();
+    return () => {};
+  }
   signal.addEventListener("abort", cancel, { once: true });
+  return () => signal.removeEventListener("abort", cancel);
 }
 
 // ---- public API -------------------------------------------------------------
@@ -375,6 +386,7 @@ export async function call<T = unknown>(
   // before invokeChannel runs: the callback can fire during the invoke.
   let settled = false;
   let disarm = () => {};
+  let unwire = () => {};
   let task = -1;
   const ack = await b
     .invokeChannel<unknown>(
@@ -385,6 +397,7 @@ export async function call<T = unknown>(
         settled = true;
         liveTasks.delete(task);
         disarm();
+        unwire();
         if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
         else resolve(fromWire(ev.result) as T);
       },
@@ -393,10 +406,13 @@ export async function call<T = unknown>(
       throw asPythonError(e);
     });
   task = streamAckTask(ack);
-  wireAbort(opts.signal, task);
+  unwire = wireAbort(opts.signal, task);
   if (!settled) {
     trackLive(task);
-    disarm = armDeadline(opts, task, reject);
+    disarm = armDeadline(opts, task, (e) => {
+      unwire();
+      reject(e);
+    });
   }
   return result;
 }
@@ -430,9 +446,10 @@ export async function* stream<T = unknown>(
       throw asPythonError(e);
     });
   const task = streamAckTask(ack);
-  wireAbort(opts.signal, task);
+  const unwire = wireAbort(opts.signal, task);
   trackLive(task);
   const disarm = armDeadline(opts, task, (e) => {
+    unwire();
     expired = e;
     finished = true; // the deadline already sent the cancel
     wake?.();
@@ -464,6 +481,7 @@ export async function* stream<T = unknown>(
     }
   } finally {
     disarm();
+    unwire();
     liveTasks.delete(task);
     // Consumer walked away (break / return() / throw) before the producer
     // finished: stop it instead of leaving it running and granting credit.
