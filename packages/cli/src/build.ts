@@ -86,25 +86,28 @@ export function download(
   const part = `${to}.part`;
   return new Promise((res, rej) => {
     let settled = false;
-    let fd: number | undefined;
-    const closeFd = () => {
-      if (fd !== undefined) {
-        const f = fd;
-        fd = undefined;
-        closeSync(f);
-      }
-    };
+    let out: ReturnType<typeof createWriteStream> | undefined;
     const fail = (e: Error) => {
       if (settled) return;
       settled = true;
-      // The fd is ours (opened synchronously, autoClose: false) — close it
-      // here, once, synchronously. Do NOT destroy() the stream: its
-      // _destroy issues a second fs.close on the same fd asynchronously,
-      // and if that lands after the fd number was reused by another open,
-      // the stale close kills someone else's file.
-      closeFd();
-      rmSync(part, { force: true });
-      rej(e);
+      if (out === undefined) {
+        rmSync(part, { force: true });
+        rej(e);
+        return;
+      }
+      // The stream owns the fd. destroy() waits for in-flight writes
+      // before closing it — closing early (closeSync) or twice lets a
+      // reused fd number absorb the stale op: the write lands in some
+      // other file, or the close kills it. .part is removed only once
+      // 'close' says the fd is really gone, keeping the rejection
+      // ordered after cleanup.
+      const s = out;
+      out = undefined;
+      s.once("close", () => {
+        rmSync(part, { force: true });
+        rej(e);
+      });
+      s.destroy();
     };
     const onErr = (e: unknown) =>
       fail(e instanceof Error ? e : new Error(String(e)));
@@ -144,23 +147,31 @@ export function download(
               if (!ended)
                 fail(new Error(`GET ${u}: connection dropped mid-body`));
             });
-            // Open eagerly — with autoClose off, <part>'s lifetime is
-            // synchronous: no deferred fs.open can land after fail()'s
-            // rmSync and recreate the file. The fd is never destroyed
-            // through the stream (see fail()).
-            fd = openSync(part, "w");
-            const stream = createWriteStream(part, { fd, autoClose: false });
+            // Open eagerly — <part>'s existence is synchronous, so no
+            // deferred fs.open can land after fail()'s rmSync and recreate
+            // the file. autoClose: false keeps fd closing on our explicit
+            // destroy() calls only (see fail()).
+            const stream = createWriteStream(part, {
+              fd: openSync(part, "w"),
+              autoClose: false,
+            });
+            out = stream;
             r.pipe(stream);
             stream.on("finish", () => {
               if (settled) return;
-              closeFd();
-              if (!Number.isNaN(want) && got !== want)
-                return fail(
-                  new Error(`GET ${u}: incomplete body — ${got} of ${want} bytes`),
-                );
-              settled = true;
-              renameSync(part, to);
-              res();
+              out = undefined;
+              stream.once("close", () => {
+                if (!Number.isNaN(want) && got !== want)
+                  return fail(
+                    new Error(
+                      `GET ${u}: incomplete body — ${got} of ${want} bytes`,
+                    ),
+                  );
+                settled = true;
+                renameSync(part, to);
+                res();
+              });
+              stream.destroy();
             });
             stream.on("error", fail);
           } catch (e) {
