@@ -46,13 +46,13 @@ test("scaffolds a complete app skeleton", () => {
     assert.ok(gi.includes(line), `.gitignore missing "${line}"`);
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
-  assert.match(py, /pylair==0\.1\.0rc7/);
+  assert.match(py, /pylair==0\.1\.0rc8/);
   const pkg = readFileSync(join(app, "package.json"), "utf8");
-  assert.match(pkg, /"@pylair\/client": "0\.1\.0-rc\.13"/);
-  assert.match(pkg, /"@pylair\/cli": "0\.1\.0-rc\.13"/);
+  assert.match(pkg, /"@pylair\/client": "0\.1\.0-rc\.14"/);
+  assert.match(pkg, /"@pylair\/cli": "0\.1\.0-rc\.14"/);
   const lock = readFileSync(join(app, "src-tauri/Cargo.lock"), "utf8");
   assert.match(lock, /name = "my-app"/);
-  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.9"/);
+  assert.match(lock, /name = "tauri-plugin-pylair"\nversion = "0\.1\.0-rc\.10"/);
   // Webviews may listen but must not inject events — a forged
   // pylair://stream terminal resolves another window's call.
   const caps = readFileSync(join(app, "src-tauri/capabilities/default.json"), "utf8");
