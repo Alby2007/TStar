@@ -1473,7 +1473,8 @@ impl Supervisor {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
-                                serde_json::json!({"fn": fn_name, "task": task, "input": input}));
+                                serde_json::json!({"fn": fn_name, "task": task,
+                                    "input": input, "stream": false}));
                             match send_frame(&io, &body, self.config.max_frame) {
                                 Ok(()) => {
                                     let _ = task_out.send(task);
@@ -1516,7 +1517,8 @@ impl Supervisor {
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let task = self.next_task.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "call",
-                                serde_json::json!({"fn": fn_name, "task": task, "input": input}));
+                                serde_json::json!({"fn": fn_name, "task": task,
+                                    "input": input, "stream": true}));
                             let credit = proto::notification("stream.credit",
                                 serde_json::json!({"task": task, "n": self.config.initial_stream_credit}));
                             // The initial grant is control traffic and goes

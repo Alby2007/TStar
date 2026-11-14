@@ -88,7 +88,7 @@ All messages carry `"jsonrpc": "2.0"`.
 
 | method | params | response result |
 |---|---|---|
-| `call` | `{fn, input, task}` | fn's return value (JSON); for generator fns, see §3.1 |
+| `call` | `{fn, input, task, stream?}` | fn's return value (JSON); for generator fns, see §3.1 |
 | `cancel` | `{task}` | `{cancelled: true/false, status?, reason?}` — see §3.2 |
 | `shutdown` | `{grace_ms}` | `{}` then process exits 0 |
 | `ping` | `{seq}` | must produce a `pong {seq}` notification — see §5 |
@@ -103,6 +103,13 @@ All messages carry `"jsonrpc": "2.0"`.
   imports; the worker resolves it through the registry, not by
   attribute lookup on the app module.
 - `task`: opaque id assigned by the host; scopes streaming + cancel.
+- `stream` (optional bool): the host's declaration of client intent —
+  `false` from a plain `call()`, `true` from `stream()`. When present,
+  the runtime validates it against the function's kind: `stream: false`
+  on a generator or `stream: true` on a non-generator fails
+  `INVALID_PARAMS` with a message naming the right API, instead of
+  streaming into a `call()` that drops every chunk or a `stream()` that
+  silently ends. Older hosts omit it → no validation.
 - `input`: the single JSON argument object, matching the generated TS
   client call shape `python.<fn>({...})`.
 

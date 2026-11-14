@@ -388,12 +388,31 @@ export async function call<T = unknown>(
   let disarm = () => {};
   let unwire = () => {};
   let task = -1;
+  // A chunk arriving before the ack means the task id isn't known yet —
+  // the reject still runs now; the cancel is deferred to the ack.
+  let cancelOnAck = false;
+  const failStreamMismatch = () => {
+    if (settled) return;
+    settled = true;
+    liveTasks.delete(task);
+    disarm();
+    unwire();
+    cancelOnAck = task < 0;
+    if (!cancelOnAck) void b.invoke(CMD.cancel, { task }).catch(() => {});
+    reject(
+      new TypeError(`${fn} is a stream function — call it with stream(), not call()`),
+    );
+  };
   const ack = await b
     .invokeChannel<unknown>(
       CMD.callStream,
       { fnName: fn, input: toWire(input) as Record<string, unknown> },
       (ev) => {
-        if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
+        // A chunk means fn is a generator — call() cannot deliver its
+        // values; name stream() and reap the task instead of silently
+        // dropping every item.
+        if (!ev.done) return failStreamMismatch();
+        if (settled) return;
         settled = true;
         liveTasks.delete(task);
         disarm();
@@ -406,8 +425,9 @@ export async function call<T = unknown>(
       throw asPythonError(e);
     });
   task = streamAckTask(ack);
-  unwire = wireAbort(opts.signal, task);
+  if (cancelOnAck) void b.invoke(CMD.cancel, { task }).catch(() => {});
   if (!settled) {
+    unwire = wireAbort(opts.signal, task);
     trackLive(task);
     disarm = armDeadline(opts, task, (e) => {
       unwire();

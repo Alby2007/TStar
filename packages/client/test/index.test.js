@@ -417,6 +417,31 @@ test("stream terminal LIMIT_EXCEEDED throws LimitExceededError with .limit", asy
   );
 });
 
+test("call() on a stream function fails 'use stream()' and cancels the task", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("counter", { n: 3 });
+  await tick();
+  // A chunk event means the function is a generator — call() must say so.
+  b.emitTask(100, streamChunk(100, 0, "v0"));
+  const outcome = await Promise.race([
+    p.then(
+      () => "resolved",
+      (e) => e,
+    ),
+    new Promise((r) => setTimeout(() => r("still-pending"), 200)),
+  ]);
+  assert.ok(
+    outcome instanceof Error && /stream\(\)/.test(outcome.message) && /counter/.test(outcome.message),
+    `expected a 'use stream()' rejection, got ${outcome}`,
+  );
+  await tick();
+  assert.ok(
+    b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel" && c.args.task === 100),
+    "the mismatched task must be cancelled, not left running",
+  );
+});
+
 // ---- rc.15 PR I4: abort-listener hygiene ----
 
 test("a long-lived AbortSignal keeps zero listeners after 1000 settled calls", async () => {
