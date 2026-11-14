@@ -130,6 +130,37 @@ def test_weird_shapes_and_invalid_credit_sequences(runtime):
     )
 
 
+def test_malformed_notification_params_do_not_kill_the_loop(runtime):
+    """A non-dict `params` on a notification used to raise inside _handle
+    and kill the event loop (AttributeError on params.get). Notifications
+    get dropped; requests get INVALID_PARAMS; the runtime stays alive and
+    keeps answering."""
+    runtime.recv()
+    for params in ([1], "x", 5, None):
+        for method in ("stream.credit", "mystery.box"):
+            try:
+                runtime.send({"method": method, "params": params})
+            except (BrokenPipeError, OSError):
+                pass  # loop already dead — the liveness check reports it
+
+    # Request-shaped non-dict params get a typed rejection, not silence.
+    for i, params in enumerate(([1], "x", 5)):
+        try:
+            runtime.send({"id": 60 + i, "method": "cancel", "params": params})
+        except (BrokenPipeError, OSError):
+            pass
+        resp = runtime.recv_until(lambda m: m.get("id") == 60 + i, timeout=5)
+        assert resp["error"]["code"] == proto.INVALID_PARAMS, resp
+
+    # Still alive — a normal call still answers after the garbage.
+    assert runtime.proc.poll() is None, (
+        f"runtime died on malformed notification params: "
+        f"{runtime.stderr_lines[-8:]}"
+    )
+    runtime.send(call(99, "add", task=99, input={"a": 1, "b": 1}))
+    assert runtime.recv_until(lambda m: m.get("id") == 99)["result"] == 2
+
+
 def test_disconnect_mid_stream_exits_cleanly(runtime):
     runtime.recv()
     runtime.send(call(1, "infinite_counted", task=7))
