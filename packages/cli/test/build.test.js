@@ -212,6 +212,47 @@ describe("compileBytecode", () => {
       rmSync(dir, { recursive: true, force: true });
     },
   );
+
+  test(
+    "uncompilable files warn, do not fail; valid files still get pycs",
+    { skip: !py },
+    async () => {
+      const { compileBytecode } = await import("../dist/build.js");
+      const dir = mkdtempSync(join(tmpdir(), "pylair-pycbad-"));
+      const pkg = join(dir, "site-packages", "wangle");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(pkg, "__init__.py"), "\n");
+      writeFileSync(join(pkg, "good.py"), "VALUE = 1\n");
+      // A dependency may ship a file nothing imports — py2-only code, a
+      // template, an invalid fixture. compileall exits 1 for it; the
+      // build must warn and continue, not fail.
+      const bad = join(pkg, "bad.py");
+      writeFileSync(bad, "class :\n");
+
+      let failed;
+      assert.doesNotThrow(() => {
+        failed = compileBytecode(dir, py, ["site-packages"]);
+      }, "exit 1 from compileall must be a warning, not a build failure");
+
+      const cache = join(pkg, "__pycache__");
+      const names = existsSync(cache) ? readdirSync(cache) : [];
+      assert.ok(
+        names.some((n) => n.startsWith("good.cpython-")),
+        "valid files still get pycs",
+      );
+      assert.ok(
+        !names.some((n) => n.startsWith("bad.cpython-")),
+        "the invalid file has no pyc",
+      );
+      // The warning names the failed paths — the function reports them.
+      assert.ok(Array.isArray(failed) && failed.length === 1, `expected [bad.py], got ${failed}`);
+      assert.ok(
+        String(failed[0]).replaceAll("\\", "/").endsWith("site-packages/wangle/bad.py"),
+        `failed path must name the bad file, got ${failed[0]}`,
+      );
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 });
 
 describe("download", () => {

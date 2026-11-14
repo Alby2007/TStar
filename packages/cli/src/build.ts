@@ -327,11 +327,23 @@ export const PYC_INVALIDATION_MODE = "checked-hash" as const;
  * relative args + cwd keep co_filename bundle-relative: identical pycs
  * regardless of build path, tracebacks show `site-packages/…`.
  * `-s`/`-d` would also work; relative args are the smallest version of
- * the same thing. */
-export function compileBytecode(resources: string, python: string, dirs: string[]): void {
+ * the same thing.
+ *
+ * Exit 1 from compileall means "some files failed to compile" — a
+ * dependency may ship a py2-only file or invalid fixture that nothing
+ * imports. That warns (paths returned) instead of failing the build;
+ * the files are left uncompiled and will compile — or fail to import —
+ * as normal at runtime. Real failures still throw: the interpreter
+ * not starting, a signal, or any other exit code. Returns the failed
+ * paths (empty on full success). */
+export function compileBytecode(
+  resources: string,
+  python: string,
+  dirs: string[],
+): string[] {
   const existing = dirs.filter((d) => existsSync(join(resources, d)));
-  if (!existing.length) return;
-  run(
+  if (!existing.length) return [];
+  const r = spawnSync(
     python,
     [
       "-m",
@@ -344,8 +356,27 @@ export function compileBytecode(resources: string, python: string, dirs: string[
       PYC_INVALIDATION_MODE,
       ...existing,
     ],
-    resources,
+    { cwd: resources, encoding: "utf-8" },
   );
+  if (r.error) throw new Error(`${python} -m compileall failed to start: ${r.error.message}`);
+  if (r.signal || (r.status !== 0 && r.status !== 1)) {
+    throw new Error(
+      `${python} -m compileall ${r.signal ? `died on ${r.signal}` : `exited ${r.status}`}`,
+    );
+  }
+  if (r.status === 0) return [];
+  // Quiet mode still prints `*** Error compiling '<path>'...` per file.
+  const failed = [
+    ...String(r.stderr).matchAll(/^\*\*\* Error compiling '([^']+)'/gm),
+    ...String(r.stdout).matchAll(/^\*\*\* Error compiling '([^']+)'/gm),
+  ].map((m) => m[1].replace(/\\\\/g, "\\")); // repr-escaped on Windows
+  const shown = failed.slice(0, 10).join("\n  ");
+  console.warn(
+    `warning: ${failed.length} file(s) failed to byte-compile and are left` +
+      ` uncompiled — they will compile (or fail to import) as normal at` +
+      ` runtime:\n  ${shown}${failed.length > 10 ? `\n  …and ${failed.length - 10} more` : ""}`,
+  );
+  return failed;
 }
 
 // ── macOS ad-hoc signing ──────────────────────────────────────────────

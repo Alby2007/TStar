@@ -140,6 +140,12 @@ bundle-relative (`site-packages/numpy/...`). The build path is never
 embedded, identical inputs produce identical pycs on any machine, and
 tracebacks in installed apps show the paths the user actually has.
 
+Files that fail to compile are a **warning, not a build failure** — a
+dependency may ship a py2-only file, template, or invalid fixture that
+nothing imports; those files are left uncompiled and will compile (or
+fail to import) as normal at runtime, while the interpreter failing to
+run at all still fails the build.
+
 ## No cross-compiling
 
 Pylair bundles *native* wheels. A Linux host cannot produce a Windows
