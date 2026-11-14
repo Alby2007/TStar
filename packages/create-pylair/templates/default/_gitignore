@@ -6,3 +6,6 @@ src-tauri/target/
 src-tauri/resources/
 src-tauri/gen/
 src/api.generated.ts
+.env
+.env.*
+!.env.example

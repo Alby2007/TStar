@@ -39,6 +39,11 @@ test("scaffolds a complete app skeleton", () => {
   const conf = JSON.parse(readFileSync(join(app, "src-tauri/tauri.conf.json"), "utf8"));
   assert.equal(conf.productName, "my-app");
   assert.equal(conf.identifier, "com.example.myapp");
+  // The shipped .gitignore must keep real env files out of git while
+  // still tracking an .env.example.
+  const gi = readFileSync(join(app, ".gitignore"), "utf8").split("\n").map((l) => l.trim());
+  for (const line of [".env", ".env.*", "!.env.example"])
+    assert.ok(gi.includes(line), `.gitignore missing "${line}"`);
   const py = readFileSync(join(app, "pyproject.toml"), "utf8");
   assert.match(py, /app-module = "backend\.app"/);
   assert.match(py, /pylair==0\.1\.0rc7/);

@@ -19,6 +19,9 @@ export interface PylairConfig {
   pythonVersion: string;
   /** Extra prune globs on top of the defaults. */
   prune: string[];
+  /** Source paths to stage even though they match the secret-looking
+   * exclusions — globs relative to `source`, same shape as `prune`. */
+  include: string[];
   /** Bundle target override (default: per-OS sensible set). */
   bundles?: string;
 }
@@ -38,6 +41,7 @@ const KEYMAP: Record<string, keyof PylairConfig> = {
   requirements: "requirements",
   "python-version": "pythonVersion",
   prune: "prune",
+  include: "include",
   bundles: "bundles",
 };
 
@@ -64,6 +68,7 @@ export function loadConfig(appDir: string): PylairConfig {
     requirements: String(raw.requirements ?? "requirements.txt"),
     pythonVersion: String(raw["python-version"] ?? "3.12"),
     prune: Array.isArray(raw.prune) ? raw.prune.map(String) : [],
+    include: Array.isArray(raw.include) ? raw.include.map(String) : [],
     bundles: raw.bundles ? String(raw.bundles) : undefined,
   };
   if (!cfg.appModule)
