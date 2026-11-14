@@ -49,7 +49,31 @@ requirements = "requirements.txt" # locked deps (default "requirements.txt")
 python-version = "3.12"           # bundled CPython class: "3.12" | "3.13"
 prune = ["my/extra/dir"]          # additions to the default deny-list
 bundles = "dmg,app"               # optional override for tauri --bundles
+include = [".env.example"]        # stage a path even though it matches
+                                  # the secret-looking exclusions
 ```
+
+## What ships from your source folder
+
+The build copies `source` (default `backend/`) into the installer
+verbatim — minus anything that looks like a secret. Skipped by default:
+
+- any path segment starting with `.` — `.env`, `.env.*`, `.git`,
+  `.venv`, `.DS_Store`, `.hidden/…`;
+- basenames matching `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`,
+  `id_ed25519*`, `credentials*.json`, `service-account*.json`.
+
+Skips are a warning, not an error: the build prints how many paths were
+refused and the first ten names. To ship one deliberately, list it in
+`include = [...]` — globs relative to `source`, same shape as `prune`
+entries; an included path is staged even inside a refused directory.
+
+Do not put secrets in the backend folder. The exclusion list is a
+seatbelt for accidents, not a secret store — a committed `.env` is
+already in your git history even if the installer drops it. Ship
+configuration through the user's data dir at runtime
+(`app.path().app_data_dir()` / `path_provider`), written on first run
+or entered in a settings window.
 
 ## Pruning
 

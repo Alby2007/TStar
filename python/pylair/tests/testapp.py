@@ -136,6 +136,20 @@ def orphan_maker(pidfile: str) -> str:
     return "never"
 
 
+@expose(isolated=True)
+def sigterm_immune(ready_file: str) -> str:
+    """Worker that ignores SIGTERM and sleeps: its terminate path must
+    wait the whole ISOLATED_GRACE_S before SIGKILL lands. Used to prove
+    a slow kill doesn't stall the dispatch lane."""
+    import signal
+
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    with open(ready_file, "w") as f:
+        f.write("ready")
+    time.sleep(600)
+    return "never"
+
+
 @expose
 def move(p: Point, dx: float = 0.0) -> Point:
     """Translate a point; dataclass in, dataclass out."""

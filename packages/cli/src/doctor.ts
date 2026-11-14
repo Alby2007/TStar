@@ -19,6 +19,17 @@ function probe(cmd: string, args: string[]): string | null {
   return r.status === 0 ? (r.stdout || r.stderr).trim() : null;
 }
 
+/** Numeric major.minor comparison — a string compare would pass "3.9"
+ * for a "3.12" floor. Anything unparseable is false. */
+export function meetsMinPython(version: string, min: string): boolean {
+  const v = /^(\d+)\.(\d+)/.exec(version.trim());
+  const m = /^(\d+)\.(\d+)/.exec(min.trim());
+  if (!v || !m) return false;
+  const [maj, mi] = [Number(v[1]), Number(v[2])];
+  const [fmaj, fmi] = [Number(m[1]), Number(m[2])];
+  return maj > fmaj || (maj === fmaj && mi >= fmi);
+}
+
 export async function doctor(appDir: string): Promise<number> {
   const checks: Check[] = [];
   const add = (name: string, ok: boolean, detail: string) =>
@@ -27,7 +38,11 @@ export async function doctor(appDir: string): Promise<number> {
   const pyVer = probe("python3", ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"]);
   const py = pyVer ? "python3" : "python";
   const pyV = pyVer ?? probe("python", ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"]);
-  add("python >= 3.12", !!pyV && pyV >= "3.12", pyV ? `found ${py} ${pyV}` : "not found");
+  add(
+    "python >= 3.12",
+    !!pyV && meetsMinPython(pyV, "3.12"),
+    pyV ? `found ${py} ${pyV}` : "not found",
+  );
 
   add("uv", !!probe("uv", ["--version"]), probe("uv", ["--version"]) ?? "not found");
   add("node", true, process.version);
