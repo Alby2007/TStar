@@ -4,9 +4,12 @@ import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 
 import { matchGlob } from "../dist/glob.js";
-import { stageNotices } from "../dist/build.js";
+import { stageNotices, download, ensureTarball } from "../dist/build.js";
 import { DEFAULT_PRUNE, prune } from "../dist/prune.js";
 import { loadConfig } from "../dist/config.js";
 
@@ -72,6 +75,123 @@ describe("prune", () => {
     const dir = tree(["site-packages/pip/_internal/x.py", "site-packages/pip/y.py"]);
     const r = prune(dir, ["site-packages/pip"]);
     assert.equal(r.removed, 1);
+    rmSync(dir, { recursive: true });
+  });
+});
+
+describe("download", () => {
+  // A fake ClientRequest: what the injected `get` must return.
+  const fakeRequest = () => {
+    const req = new EventEmitter();
+    req.setTimeout = (ms, fn) => {
+      req._t = setTimeout(fn, ms);
+      return req;
+    };
+    req.destroy = (e) => {
+      clearTimeout(req._t);
+      req.emit("error", e ?? new Error("destroyed"));
+    };
+    return req;
+  };
+  const fakeGet = (handler) => (u, cb) => {
+    const req = fakeRequest();
+    queueMicrotask(() => handler(u, cb, req));
+    return req;
+  };
+  const response = (body, { status = 200, headers = {} } = {}) => {
+    const r = Readable.from(body);
+    r.statusCode = status;
+    r.headers = headers;
+    return r;
+  };
+
+  test("a mid-body drop leaves nothing at the final path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    const to = join(dir, "asset.tar.gz");
+    const dropped = Readable.from(
+      (async function* () {
+        yield Buffer.from("first-half");
+        throw new Error("connection reset");
+      })(),
+    );
+    dropped.statusCode = 200;
+    dropped.headers = { "content-length": "32" };
+    await assert.rejects(
+      download("https://x/asset", to, { get: fakeGet((u, cb) => cb(dropped)) }),
+      /reset|dropped|incomplete/i,
+    );
+    assert.ok(!existsSync(to), "partial body must not sit at the final path");
+    assert.ok(!existsSync(`${to}.part`), ".part must be cleaned up");
+
+    // The next run succeeds — a partial must never poison the cache.
+    await download(
+      "https://x/asset",
+      to,
+      { get: fakeGet((u, cb) => cb(response([Buffer.from("full-body")]))) },
+    );
+    assert.equal(readFileSync(to, "utf-8"), "full-body");
+    rmSync(dir, { recursive: true });
+  });
+
+  test("a redirect loop hits the cap", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    const to = join(dir, "asset.tar.gz");
+    let n = 0;
+    const get = fakeGet((u, cb) =>
+      cb(response([], { status: 302, headers: { location: `${u}/${++n}` } })),
+    );
+    await assert.rejects(download("https://x/a", to, { get }), /redirect/i);
+    rmSync(dir, { recursive: true });
+  });
+
+  test("a stalled server hits the idle timeout", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    const to = join(dir, "asset.tar.gz");
+    const stalled = new Readable({ read() {} }); // headers, then nothing
+    stalled.statusCode = 200;
+    stalled.headers = {};
+    await assert.rejects(
+      download("https://x/s", to, { get: fakeGet((u, cb) => cb(stalled)), timeoutMs: 50 }),
+      /timed out|timeout/i,
+    );
+    assert.ok(!existsSync(to));
+    assert.ok(!existsSync(`${to}.part`));
+    rmSync(dir, { recursive: true });
+  });
+});
+
+describe("ensureTarball", () => {
+  const sha = (s) => createHash("sha256").update(s).digest("hex");
+
+  test("a corrupt cached file is deleted and re-fetched once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-cache-"));
+    const to = join(dir, "asset.tar.gz");
+    writeFileSync(to, "corrupt-bytes");
+    const want = sha(Buffer.from("good-bytes"));
+    let calls = 0;
+    const dl = async (u, dest) => {
+      calls++;
+      writeFileSync(dest, "good-bytes");
+    };
+    await ensureTarball("https://x/asset", to, want, dl);
+    assert.equal(calls, 1, "re-download exactly once");
+    assert.equal(readFileSync(to, "utf-8"), "good-bytes");
+    rmSync(dir, { recursive: true });
+  });
+
+  test("a second mismatch refuses and names the cache file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-cache-"));
+    const to = join(dir, "asset.tar.gz");
+    writeFileSync(to, "corrupt-bytes");
+    const want = sha(Buffer.from("good-bytes"));
+    const bad = async (u, dest) => writeFileSync(dest, "also-bad");
+    const err = await ensureTarball("https://x/asset", to, want, bad).then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err, "expected a refusal");
+    assert.match(err.message, /SHA256|mismatch|refusing/i);
+    assert.ok(err.message.includes("asset.tar.gz"), "message must name the cache file");
     rmSync(dir, { recursive: true });
   });
 });
