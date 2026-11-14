@@ -69,6 +69,29 @@ test("call resolves with the terminal result", async () => {
   assert.equal(await p, 3);
 });
 
+test("call() declares stream:false, stream() declares stream:true", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("add", { a: 1 });
+  await tick();
+  assert.equal(
+    b.calls.find((c) => c.cmd === "plugin:pylair|python_call_stream").args.stream,
+    false,
+    "call() must declare stream:false so the host takes no stream slot",
+  );
+  b.emitTask(100, streamDone(100, 2));
+  await p;
+
+  // stream() is an async generator — nothing runs until first next().
+  const s = stream("counter", { n: 1 })[Symbol.asyncIterator]();
+  const first = s.next();
+  await tick();
+  const invoke = b.calls.filter((c) => c.cmd === "plugin:pylair|python_call_stream").at(-1);
+  assert.equal(invoke.args.stream, true, "stream() must declare stream:true");
+  b.emitTask(101, streamDone(101, null));
+  await first;
+});
+
 test("old plugin's bare task ack errors loudly and cancels the orphan", async () => {
   const b = fakeBridge();
   // An old python_call_stream ignores `onEvent` and returns a bare task

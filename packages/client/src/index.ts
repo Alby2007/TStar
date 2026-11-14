@@ -470,7 +470,11 @@ export async function call<T = unknown>(
   const ack = await b
     .invokeChannel<unknown>(
       CMD.callStream,
-      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      // stream:false — the host counts a task slot only (no stream
+      // slot, no credit) and the runtime validates intent. An OLD
+      // plugin ignores the extra arg and treats it as a stream,
+      // matching its pre-flag accounting.
+      { fnName: fn, input: toWire(input) as Record<string, unknown>, stream: false },
       (ev) => {
         // A chunk means fn is a generator — call() cannot deliver its
         // values; name stream() and reap the task instead of silently
@@ -520,7 +524,7 @@ export async function* stream<T = unknown>(
   const ack = await b
     .invokeChannel<unknown>(
       CMD.callStream,
-      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      { fnName: fn, input: toWire(input) as Record<string, unknown>, stream: true },
       (ev) => {
         queue.push(ev);
         wake?.();
