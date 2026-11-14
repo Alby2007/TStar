@@ -1394,10 +1394,22 @@ impl Supervisor {
                                 serde_json::json!({"fn": fn_name, "task": task, "input": input}));
                             let credit = proto::notification("stream.credit",
                                 serde_json::json!({"task": task, "n": self.config.initial_stream_credit}));
+                            // The initial grant is control traffic and goes
+                            // FIRST: the runtime buffers credit for a task it
+                            // has not registered yet (pending credit), so the
+                            // grant cannot be starved or reordered behind
+                            // data-lane traffic — and a failed send fails the
+                            // stream BEFORE the call is committed instead of
+                            // leaving it uncredited forever.
+                            if !send_ctrl(&io, &credit, self.config.max_frame) {
+                                reject_stream(items, task_out, limit_err(
+                                    "ctrl_queue", 16,
+                                    "control queue full — credit not delivered"));
+                                continue;
+                            }
                             match send_frame(&io, &body, self.config.max_frame) {
                                 Ok(()) => {
                                     let _ = task_out.send(Ok(task));
-                                    let _ = send_frame(&io, &credit, self.config.max_frame);
                                     pending.insert(id, PendingKind::Stream(items));
                                     task_of_call.insert(id, task);
                                     tasks.insert(task, TaskMeta {
@@ -1406,6 +1418,13 @@ impl Supervisor {
                                     });
                                 }
                                 Err(e) => {
+                                    // The grant was delivered but the call was
+                                    // not — best-effort cancel drops the
+                                    // stranded pending credit (bounded anyway).
+                                    let cid = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                    let _ = send_ctrl(&io, &proto::request(cid, "cancel",
+                                        serde_json::json!({"task": task})),
+                                        self.config.max_frame);
                                     let max = self.config.max_frame as u64;
                                     reject_stream(items, task_out, match e {
                                         SendFail::Oversize(n) => limit_err("max_frame", max,
