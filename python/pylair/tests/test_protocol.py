@@ -249,6 +249,21 @@ def test_isolated_call(runtime):
     assert runtime.recv()["result"] == 9
 
 
+def test_isolated_worker_inherits_release_env():
+    """rc.15 H: PYTHONDONTWRITEBYTECODE=1 set by the release spawn spec
+    must be visible INSIDE an isolated call — workers are spawned by the
+    runtime with os.environ, so the flag reaches them automatically."""
+    from conftest import Runtime
+
+    with Runtime(env={"PYTHONDONTWRITEBYTECODE": "1"}) as rt:
+        rt.recv()  # hello
+        rt.send(call(1, "isolated_env_flag", task=1))
+        resp = rt.recv()
+        assert "result" in resp, resp
+        assert resp["result"]["PYTHONDONTWRITEBYTECODE"] == "1"
+        assert resp["result"]["dont_write_bytecode"] is True
+
+
 def test_isolated_fn_in_app_submodule_resolves():
     """An isolated function may live in a submodule the app imports —
     the worker resolves it through the registry, not getattr on the app

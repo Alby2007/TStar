@@ -104,6 +104,20 @@ def isolated_add(a: int, b: int) -> int:
 
 
 @expose(isolated=True)
+def isolated_env_flag() -> dict:
+    """Report the env the isolated WORKER actually inherited — the proof
+    that release-spec vars like PYTHONDONTWRITEBYTECODE reach workers
+    spawned by the runtime, not just the runtime itself."""
+    import os
+    import sys
+
+    return {
+        "PYTHONDONTWRITEBYTECODE": os.environ.get("PYTHONDONTWRITEBYTECODE"),
+        "dont_write_bytecode": sys.dont_write_bytecode,
+    }
+
+
+@expose(isolated=True)
 def isolated_print(text: str) -> str:
     # stdout hygiene inside the worker: print() must not corrupt the result.
     print(f"worker print: {text}")

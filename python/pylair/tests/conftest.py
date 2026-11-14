@@ -20,8 +20,8 @@ _LEN = struct.Struct(">I")
 class Runtime:
     """A spawned pylair runtime with frame-level access."""
 
-    def __init__(self, module: str = "testapp"):
-        env = dict(os.environ)
+    def __init__(self, module: str = "testapp", env: dict | None = None):
+        env = dict(os.environ) | (env or {})
         env.pop("PYTHONPATH", None)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "pylair", module],
