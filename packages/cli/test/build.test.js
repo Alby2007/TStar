@@ -2,7 +2,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { matchGlob } from "../dist/glob.js";
@@ -164,4 +164,80 @@ describe("stageNotices", () => {
     assert.ok(existsSync(join(res, "THIRD-PARTY-NOTICES", "python", "NOTICE.txt")));
     rmSync(dir, { recursive: true });
   });
+});
+
+describe("stageSource", () => {
+  function srcTree() {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-stage-"));
+    for (const f of [
+      "app.py",
+      ".env",
+      ".env.local",
+      "key.pem",
+      ".hidden/x.txt",
+      "sub/id_rsa",
+      "sub/ok.py",
+    ]) {
+      const p = join(dir, f);
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, "x");
+    }
+    return dir;
+  }
+
+  test("stages normal files, skips and names secret-looking paths", async () => {
+    const { stageSource } = await import("../dist/build.js");
+    const src = srcTree();
+    const dest = mkdtempSync(join(tmpdir(), "pylair-staged-"));
+    const lines = [];
+    const skipped = stageSource(src, dest, [], (m) => lines.push(m));
+
+    for (const ok of ["app.py", join("sub", "ok.py")])
+      assert.ok(existsSync(join(dest, ok)), `${ok} should be staged`);
+    for (const denied of [".env", ".env.local", "key.pem", join(".hidden", "x.txt"), join("sub", "id_rsa")])
+      assert.ok(!existsSync(join(dest, denied)), `${denied} must not ship`);
+    for (const named of [".env", ".env.local", "key.pem", ".hidden", "sub/id_rsa"])
+      assert.ok(skipped.includes(named), `skipped list missing ${named}`);
+    // The warning counts, names, and tells the author how to opt in.
+    assert.match(lines[0], /skipped 5/);
+    for (const named of [".env", "key.pem", ".hidden", "sub/id_rsa"])
+      assert.ok(lines[0].includes(named), `warning names ${named}`);
+    assert.match(lines.join("\n"), /\[tool\.pylair\] include/);
+    rmSync(src, { recursive: true });
+    rmSync(dest, { recursive: true });
+  });
+
+  test("include reaches inside a denied directory", async () => {
+    const { stageSource } = await import("../dist/build.js");
+    const src = srcTree();
+    const dest = mkdtempSync(join(tmpdir(), "pylair-staged-"));
+    const lines = [];
+    const skipped = stageSource(src, dest, [".hidden/x.txt"], (m) => lines.push(m));
+
+    assert.ok(existsSync(join(dest, ".hidden", "x.txt")), "included file must stage");
+    assert.ok(!existsSync(join(dest, ".env")), ".env still skipped");
+    assert.ok(!skipped.includes(".hidden"), ".hidden not denied — it holds an include");
+    assert.ok(!lines.join("\n").includes("x.txt"), "warning must not name the included file");
+    rmSync(src, { recursive: true });
+    rmSync(dest, { recursive: true });
+  });
+});
+
+describe("meetsMinPython", () => {
+  const cases = [
+    ["3.9", false],
+    ["3.10", false],
+    ["3.11", false],
+    ["3.12", true],
+    ["3.13", true],
+    ["4.0", true],
+    ["garbage", false],
+    ["", false],
+  ];
+  for (const [v, want] of cases) {
+    test(`meetsMinPython(${JSON.stringify(v)}) → ${want}`, async () => {
+      const { meetsMinPython } = await import("../dist/doctor.js");
+      assert.equal(meetsMinPython(v, "3.12"), want);
+    });
+  }
 });
