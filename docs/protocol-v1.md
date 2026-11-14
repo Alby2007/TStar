@@ -227,6 +227,12 @@ logs. Clients must not match on its wording; the state machine is
    1s..=600s and a clamp is logged on `pylair://stderr`. No hello →
    kill → `crashed` → backoff → `restarting`. The failure detail names
    both configuration knobs.
+   - **Slow-start hint.** At half the timeout the host emits one
+     repeated `starting → starting` state event whose `detail` reports
+     elapsed time — a spinner-message hook for UIs. It is not a new
+     state, fires at most once per spawn attempt, never after `hello`,
+     and (like all `detail`) is informational: clients must not depend
+     on it arriving.
 4. `protocol` mismatch → `failed` immediately (no restart — retrying
    can't fix a version skew). Error message names both versions.
 

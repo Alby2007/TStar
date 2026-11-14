@@ -1206,7 +1206,37 @@ impl Supervisor {
     /// One runtime lifecycle: handshake, then serve until exit/kill.
     async fn run_child(&mut self, mut io: ChildIo) -> ExitCause {
         // ---- handshake: hello within deadline ----
-        let hello = timeout(self.config.hello_timeout, io.msg_in.recv()).await;
+        // At half the deadline, emit a repeated `starting → starting`
+        // state event so UIs can show "still starting" — informational
+        // only, never a state write (set_state dedupes same-state), and
+        // at most once per spawn attempt. The timer dies with this
+        // select: it cannot fire after hello, EOF, or a shutdown-driven
+        // early return.
+        let hello = {
+            let mut deadline = Box::pin(tokio::time::sleep(self.config.hello_timeout));
+            let half_mark = Box::pin(tokio::time::sleep(self.config.hello_timeout / 2));
+            tokio::pin!(half_mark);
+            let mut slow_noted = false;
+            loop {
+                tokio::select! {
+                    m = io.msg_in.recv() => break Ok(m),
+                    _ = &mut half_mark, if !slow_noted => {
+                        slow_noted = true;
+                        let _ = self.events.try_send(RuntimeEvent::StateChanged {
+                            from: State::Starting,
+                            to: State::Starting,
+                            detail: format!(
+                                "still starting ({:?} elapsed; timeout at {:?}, \
+                                 see PYLAIR_HELLO_TIMEOUT_MS)",
+                                self.config.hello_timeout / 2,
+                                self.config.hello_timeout
+                            ),
+                        });
+                    }
+                    _ = &mut deadline => break Err(()),
+                }
+            }
+        };
         let hello = match hello {
             Ok(Some(Ok(InMsg::Notification { method, params }))) if method == "hello" => {
                 params.unwrap_or(Value::Null)

@@ -81,6 +81,82 @@ async fn wait_state(h: &Handle, want: State) {
     .unwrap_or_else(|_| panic!("never reached {want:?} (state {:?})", *rx.borrow()));
 }
 
+/// Echo-capable runtime that sleeps `delay_s` seconds before hello.
+fn delayed_hello(delay_s: f64) -> String {
+    format!(
+        r#"
+import sys, struct, json, time
+def w(o):
+    b = json.dumps(o).encode()
+    sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
+time.sleep({delay_s})
+w({{"jsonrpc":"2.0","method":"hello","params":{{"protocol":1,"exposes":[{{"name":"echo","kind":"sync"}}]}}}})
+while True:
+    h = sys.stdin.buffer.read(4)
+    if len(h) < 4: break
+    n, = struct.unpack(">I", h)
+    m = json.loads(sys.stdin.buffer.read(n))
+    if m.get("method") == "ping":
+        w({{"jsonrpc":"2.0","method":"pong","params":{{"seq": m["params"]["seq"]}}}})
+    elif m.get("method") == "shutdown":
+        w({{"jsonrpc":"2.0","id": m["id"],"result": None}}); break
+    elif "id" in m:
+        w({{"jsonrpc":"2.0","id": m["id"],"result": m["params"].get("input")}})
+"#
+    )
+}
+
+/// Every StateChanged event where from == to == "starting" (the
+/// still-starting signal) currently in the events channel.
+fn slow_start_events(rx: &mut mpsc::Receiver<RuntimeEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let RuntimeEvent::StateChanged { from, to, detail } = ev {
+            if matches!(from, State::Starting) && matches!(to, State::Starting) {
+                out.push(detail);
+            }
+        }
+    }
+    out
+}
+
+/// Hello delayed past half the timeout: one slow-start event, then Ready.
+#[tokio::test]
+async fn delayed_hello_emits_one_slow_start_event_then_ready() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
+    // hello at ~3s, half-mark at 2s — the signal must fire exactly once.
+    let h = spawn_h(spec(&delayed_hello(3.0)), cfg(Duration::from_secs(4)), ev);
+    wait_state(&h, State::Ready).await;
+    // The signal precedes hello, so by Ready it is already queued.
+    let events = slow_start_events(&mut rx);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly one slow-start event, got {events:?}"
+    );
+    assert!(
+        events[0].contains("still starting") && events[0].contains("PYLAIR_HELLO_TIMEOUT_MS"),
+        "slow-start detail should name the delay and the knob, got {:?}",
+        events[0]
+    );
+    h.shutdown().await;
+}
+
+/// A hello that beats the half-mark: no same-state event at all.
+#[tokio::test]
+async fn fast_hello_emits_no_slow_start_event() {
+    let (ev, mut rx) = mpsc::channel::<RuntimeEvent>(256);
+    let h = spawn_h(spec(&delayed_hello(0.05)), cfg(Duration::from_secs(4)), ev);
+    wait_state(&h, State::Ready).await;
+    // Give a stray timer a chance to fire (it must not exist).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        slow_start_events(&mut rx).is_empty(),
+        "fast hello must not emit a slow-start event"
+    );
+    h.shutdown().await;
+}
+
 /// No hello at all: the timeout message must name both escape hatches.
 #[tokio::test]
 async fn hello_timeout_message_names_env_and_builder_knobs() {
