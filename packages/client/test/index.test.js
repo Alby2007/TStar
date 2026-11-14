@@ -11,22 +11,39 @@ import {
   _resetForTests,
 } from "../dist/index.js";
 
-/** Fake IPC bridge: records invokes, lets tests push events. */
+/**
+ * Fake IPC bridge: records invokes, lets tests push events. Per-call
+ * delivery — `invokeChannel` captures the callback bound at invoke time
+ * and `emitTask` delivers to that call only (what `Channel::send` does).
+ */
 function fakeBridge() {
   const calls = [];
   const listeners = new Map();
+  const channels = new Map(); // task -> onEvent
   let nextTask = 100;
   return {
     calls,
+    channels,
     emit(event, payload) {
       for (const cb of listeners.get(event) ?? []) cb(payload);
     },
+    emitTask(task, ev) {
+      const cb = channels.get(task);
+      assert.ok(cb, `no channel registered for task ${task}`);
+      cb(ev);
+    },
     async invoke(cmd, args) {
       calls.push({ cmd, args });
-      if (cmd === "plugin:pylair|python_call_stream") return nextTask++;
       if (cmd === "plugin:pylair|python_cancel") return "cancelled";
       if (cmd === "plugin:pylair|python_state") return "ready";
       return null;
+    },
+    async invokeChannel(cmd, args, onEvent) {
+      calls.push({ cmd, args });
+      assert.equal(cmd, "plugin:pylair|python_call_stream");
+      const task = nextTask++;
+      channels.set(task, onEvent);
+      return task;
     },
     async listen(event, cb) {
       if (!listeners.has(event)) listeners.set(event, []);
@@ -39,6 +56,7 @@ function fakeBridge() {
 const streamDone = (task, result) => ({ task, done: true, result });
 const streamErr = (task, code, message) => ({ task, done: true, error: { code, message } });
 const streamChunk = (task, seq, value) => ({ task, seq, value, done: false });
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => _resetForTests());
 
@@ -46,8 +64,8 @@ test("call resolves with the terminal result", async () => {
   const b = fakeBridge();
   setBridge(b);
   const p = call("add", { a: 1, b: 2 });
-  await new Promise((r) => setTimeout(r, 0)); // let invoke resolve, task=100
-  b.emit("pylair://stream", streamDone(100, 3));
+  await tick(); // let invokeChannel resolve, task=100
+  b.emitTask(100, streamDone(100, 3));
   assert.equal(await p, 3);
 });
 
@@ -55,8 +73,8 @@ test("call rejects with PythonError on runtime error", async () => {
   const b = fakeBridge();
   setBridge(b);
   const p = call("boom");
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamErr(100, -32000, "kaboom"));
+  await tick();
+  b.emitTask(100, streamErr(100, -32000, "kaboom"));
   await assert.rejects(p, (e) => e instanceof PythonError && e.code === -32000);
 });
 
@@ -65,12 +83,12 @@ test("abort signal sends python_cancel for the task", async () => {
   setBridge(b);
   const ac = new AbortController();
   const p = call("slow", {}, { signal: ac.signal });
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   ac.abort();
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   assert.ok(b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel" && c.args.task === 100));
   // runtime then reports TASK_CANCELLED as the terminal
-  b.emit("pylair://stream", streamErr(100, -32010, "task cancelled"));
+  b.emitTask(100, streamErr(100, -32010, "task cancelled"));
   await assert.rejects(p, (e) => e instanceof PythonError && e.code === -32010);
 });
 
@@ -82,11 +100,11 @@ test("stream yields chunks then ends on terminal", async () => {
   const consume = (async () => {
     for await (const v of it) collected.push(v);
   })();
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamChunk(100, 0, "a"));
-  b.emit("pylair://stream", streamChunk(100, 1, "b"));
-  b.emit("pylair://stream", streamChunk(100, 2, "c"));
-  b.emit("pylair://stream", streamDone(100, { done: true }));
+  await tick();
+  b.emitTask(100, streamChunk(100, 0, "a"));
+  b.emitTask(100, streamChunk(100, 1, "b"));
+  b.emitTask(100, streamChunk(100, 2, "c"));
+  b.emitTask(100, streamDone(100, { done: true }));
   await consume;
   assert.deepEqual(collected, ["a", "b", "c"]);
 });
@@ -98,8 +116,8 @@ test("stream throws PythonError on terminal error", async () => {
   const consume = (async () => {
     for await (const _ of it) { /* consume */ }
   })();
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamErr(100, -32031, "runtime crashed"));
+  await tick();
+  b.emitTask(100, streamErr(100, -32031, "runtime crashed"));
   await assert.rejects(consume, (e) => e instanceof PythonError && e.code === -32031);
 });
 
@@ -111,11 +129,25 @@ test("stream tops up pull credit as consumer drains", async () => {
     let i = 0;
     for await (const _ of it) if (++i >= 40) break;
   })();
-  await new Promise((r) => setTimeout(r, 0));
-  for (let s = 0; s < 40; s++) b.emit("pylair://stream", streamChunk(100, s, s));
+  await tick();
+  for (let s = 0; s < 40; s++) b.emitTask(100, streamChunk(100, s, s));
   await consume;
   const grants = b.calls.filter((c) => c.cmd === "plugin:pylair|python_grant_credit");
   assert.ok(grants.length >= 1 && grants.every((g) => g.args.task === 100));
+});
+
+test("each call only ever sees its own channel events", async () => {
+  // The channel is bound at invoke time: an event for task 100 can
+  // never reach task 101 — there is no shared bus to leak across.
+  const b = fakeBridge();
+  setBridge(b);
+  const a = call("add");
+  const c = call("add");
+  await tick();
+  b.emitTask(100, streamDone(100, "A"));
+  b.emitTask(101, streamDone(101, "B"));
+  assert.equal(await a, "A");
+  assert.equal(await c, "B");
 });
 
 test("cancel() forwards task id and returns the outcome", async () => {
@@ -144,11 +176,11 @@ test("wire JSON: Uint8Array <-> $b64 inside call/stream", async () => {
     data: new Uint8Array([0, 1, 2]),
     nested: { blob: new Uint8Array([255]) },
   });
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   assert.deepEqual(b.calls[0].args.input.data, { $b64: "AAEC" });
   assert.deepEqual(b.calls[0].args.input.nested.blob, { $b64: "/w==" });
   // $b64 tags decode on the way back
-  b.emit("pylair://stream", streamDone(100, { $b64: "AgEA" }));
+  b.emitTask(100, streamDone(100, { $b64: "AgEA" }));
   const result = await p;
   assert.ok(result instanceof Uint8Array);
   assert.deepEqual([...result], [2, 1, 0]);
@@ -162,9 +194,9 @@ test("wire JSON: stream chunks decode per item", async () => {
   const consume = (async () => {
     for await (const v of it) collected.push(v);
   })();
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamChunk(100, 0, { $b64: "aGk=" }));
-  b.emit("pylair://stream", streamDone(100, { done: true }));
+  await tick();
+  b.emitTask(100, streamChunk(100, 0, { $b64: "aGk=" }));
+  b.emitTask(100, streamDone(100, { done: true }));
   await consume;
   assert.ok(collected[0] instanceof Uint8Array);
   assert.deepEqual([...collected[0]], [104, 105]); // "hi"
@@ -186,16 +218,19 @@ test("python namespace exposes the API surface", () => {
   }
 });
 
-/** Bridge whose invoke emits stream events BEFORE it resolves — what the
- *  Rust side can do: the forwarder task emits as soon as Python replies,
- *  racing the invoke response that carries the task id. */
+/**
+ * Bridge whose channel fires events BEFORE the invoke resolves — what
+ * the Rust side can do: the forwarder starts sending as soon as Python
+ * replies, racing the invoke response that carries the task id. The
+ * callback is bound at invoke time, so nothing is lost.
+ */
 function earlyBridge(eventsFor) {
   const b = fakeBridge();
-  const inner = b.invoke.bind(b);
-  b.invoke = async (cmd, args) => {
-    const task = await inner(cmd, args);
+  const inner = b.invokeChannel.bind(b);
+  b.invokeChannel = async (cmd, args, onEvent) => {
+    const task = await inner(cmd, args, onEvent);
     if (cmd === "plugin:pylair|python_call_stream") {
-      for (const ev of eventsFor(task)) b.emit("pylair://stream", ev);
+      for (const ev of eventsFor(task)) onEvent(ev);
     }
     return task;
   };
@@ -238,36 +273,13 @@ test("stream keeps early chunks and the early terminal, in order", async () => {
   assert.deepEqual(got, ["a", "b"]);
 });
 
-test("listener is installed before the first invoke returns", async () => {
-  // A bridge whose listen() resolves late: events emitted by an invoke that
-  // starts after listen() was *requested* must still be delivered.
-  const b = fakeBridge();
-  const realListen = b.listen.bind(b);
-  b.listen = async (ev, cb) => {
-    await new Promise((r) => setTimeout(r, 20));
-    return realListen(ev, cb);
-  };
-  const inner = b.invoke.bind(b);
-  b.invoke = async (cmd, args) => {
-    const task = await inner(cmd, args);
-    if (cmd === "plugin:pylair|python_call_stream") b.emit("pylair://stream", streamDone(task, "ok"));
-    return task;
-  };
-  setBridge(b);
-  const r = await Promise.race([
-    call("fast"),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("call stayed pending")), 500)),
-  ]);
-  assert.equal(r, "ok");
-});
-
 test("breaking out of a stream cancels the producer", async () => {
   const b = fakeBridge();
   setBridge(b);
   const it = stream("counter", { n: 1000 });
   const first = it.next();
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamChunk(100, 0, "a"));
+  await tick();
+  b.emitTask(100, streamChunk(100, 0, "a"));
   assert.equal((await first).value, "a");
   await it.return(undefined); // what `break` does
   assert.ok(
@@ -281,11 +293,11 @@ test("a stream that finished normally does not send a redundant cancel", async (
   setBridge(b);
   const it = stream("counter", { n: 1 });
   const first = it.next();
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamChunk(100, 0, "a"));
+  await tick();
+  b.emitTask(100, streamChunk(100, 0, "a"));
   await first;
   const second = it.next();
-  b.emit("pylair://stream", streamDone(100, null));
+  b.emitTask(100, streamDone(100, null));
   assert.equal((await second).done, true);
   assert.ok(!b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
 });
@@ -305,8 +317,8 @@ test("a call that finishes before its deadline is unaffected", async () => {
   const b = fakeBridge();
   setBridge(b);
   const p = call("fast", {}, { timeoutMs: 500 });
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", streamDone(100, "ok"));
+  await tick();
+  b.emitTask(100, streamDone(100, "ok"));
   assert.equal(await p, "ok");
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(!b.calls.some((c) => c.cmd === "plugin:pylair|python_cancel"));
@@ -323,15 +335,15 @@ test("stream with timeoutMs throws the deadline error and cancels", async () => 
 test("invoke rejection with LIMIT_EXCEEDED surfaces LimitExceededError", async () => {
   const b = fakeBridge();
   // Saturated host: python_call_stream rejects with the serialized ErrorObj.
-  const realInvoke = b.invoke.bind(b);
-  b.invoke = async (cmd, args) => {
+  const realChannel = b.invokeChannel.bind(b);
+  b.invokeChannel = async (cmd, args, onEvent) => {
     if (cmd === "plugin:pylair|python_call_stream")
       throw {
         code: -32040,
         message: "too many in-flight tasks",
         data: { limit: "max_concurrent_tasks", max: 64 },
       };
-    return realInvoke(cmd, args);
+    return realChannel(cmd, args, onEvent);
   };
   setBridge(b);
   await assert.rejects(
@@ -348,9 +360,9 @@ test("stream terminal LIMIT_EXCEEDED throws LimitExceededError with .limit", asy
   const b = fakeBridge();
   setBridge(b);
   const it = stream("flood");
-  const first = it.next(); // generators start on next(): installs listener, registers task=100
-  await new Promise((r) => setTimeout(r, 0));
-  b.emit("pylair://stream", {
+  const first = it.next(); // generators start on next(): binds the channel, task=100
+  await tick();
+  b.emitTask(100, {
     task: 100,
     done: true,
     error: {

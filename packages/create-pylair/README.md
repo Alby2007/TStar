@@ -27,12 +27,28 @@ Windows). Later builds reuse the caches.
 
 The scaffolded `src-tauri/capabilities/default.json` grants
 `core:default` plus `pylair:default`, and additionally **denies**
-`core:event:deny-emit` / `core:event:deny-emit-to`: a webview that
-could emit could forge `pylair://stream` events into another window.
-`@pylair/client` only listens, so a stock app loses nothing — but if
-your app needs JS-side `emit`, add `"core:event:allow-emit"` back in
-your own capability block (deny rules win, so remove the deny entries
-too). See `docs/security.md` for the full event-scoping model.
+`core:event:deny-emit` / `core:event:deny-emit-to`. Stream/result
+delivery no longer uses events at all — each call binds a per-call IPC
+channel to its invoking webview — but `pylair://state`,
+`pylair://stderr` and `pylair://exposes` remain broadcast events a
+webview could otherwise forge into other windows. `@pylair/client` only
+listens, so a stock app loses nothing — but if your app needs JS-side
+`emit`, add `"core:event:allow-emit"` back in your own capability block
+(deny rules win, so remove the deny entries too). The template ships no
+test capability: the `selftest-winb.json` used by
+`PYLAIR_SELF_TEST_WEBVIEW` lives in `examples/reference-app` and is
+injected into scaffolded apps by CI. It grants `emit`/`emitTo` (for the
+forgery attempts; the deny entries above still bar them on a scaffolded
+app) plus `pylair:allow-python-selftest-b-report`, the command the
+test's deliberately-hostile second window uses to relay its verdict
+back. `win-b` is never created in a normal run. See `docs/security.md`
+for the full event-scoping model.
+
+Reloads lose their JS context but could strand task slots if left to
+channel error detection alone: the plugin's `on_page_load` hook cancels
+the old document's tasks server-side when a navigation commits
+(same-document navigations do not trigger it), and the client's
+`pagehide` hook stays as a best-effort fallback.
 
 ## Windows: no console window
 

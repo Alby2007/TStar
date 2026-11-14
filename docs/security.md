@@ -36,7 +36,7 @@ scope except where noted (wrap mode's loopback server, §9).
 
 ## 2. What the webview can reach — and nothing else
 
-The plugin's entire IPC surface is eight commands:
+The plugin's entire IPC surface is nine commands:
 
 | command | what it does | default permission |
 |---|---|---|
@@ -48,6 +48,7 @@ The plugin's entire IPC surface is eight commands:
 | `python_retry` | respawn a `failed` runtime | opt-in only |
 | `python_shutdown` | stop the runtime | opt-in only |
 | `python_selftest_report` | end the installed-webview self-test | template grants; inert w/o env flag |
+| `python_selftest_b_report` | relay the two-window self-test verdict | opt-in only; no shipped capability |
 
 There are **no** fs, env, shell, exec, or network commands in the plugin.
 The only way from the webview into Python is `call`/`call_stream`, and the
@@ -59,7 +60,10 @@ permission by accident opens nothing.
 `pylair:default` deliberately excludes `python_retry` and
 `python_shutdown` — supervisor control is a power an app opts into with
 `pylair:allow-python-retry` / `pylair:allow-python-shutdown`, not part of
-the everyday set.
+the everyday set. `python_selftest_b_report` is likewise opt-in only: the
+capability that grants it (`selftest-winb.json`) is carried by the
+reference app and injected into scaffolded apps by CI — it is not part of
+the shipped template.
 
 ## 3. The `@expose` allowlist — no arbitrary execution
 
@@ -130,31 +134,58 @@ is the Tauri-reported window label — never a JS-supplied value:
   control a new task);
 - destroying a window cancels all of its tasks.
 
-Event delivery is **best-effort scoping, not a security boundary**.
-Stream chunks are emitted with `emit_to` addressed at the owning
-webview's label, and state/stderr/exposes go to webviews that have used
-the bridge (P1-8, covered by `tests/event_scoping.rs` — which tests
-Rust-side targeted listeners only). But the client's `listen()` uses
-Tauri's default `target: Any`, which receives events regardless of their
-emit target, and `core:event` grants emit: any webview that can listen
-can read another window's stream events, and any webview with emit
-permission can forge them (per Tauri 2.12.5's `match_any_or_filter`,
-an `Any`-target listener bypasses the `emit_to` filter). Treat
-per-window event scoping as UX routing, not isolation;
-stricter delivery is under investigation.
+**Stream/result delivery is bound to the invoking webview** — it is not
+an event at all. `python_call_stream` requires an `onEvent`
+`tauri::ipc::Channel` argument; the plugin sends every chunk and the
+terminal through it, and `pylair://stream` no longer exists. A second
+webview cannot listen to a channel it was never handed, and there is no
+bus left to inject forged events into — so the leak and the forgeries
+documented in `docs/design/event-scoping.md` are both closed by
+construction, not by a permission stopgap. This is enforced by the
+installed two-window self-test (`PYLAIR_SELF_TEST_WEBVIEW`): a `win-b`
+holding `emit`/`emitTo` sees none of `main`'s call data, never gets a
+forged item accepted, and never wins a cancel/grant on `main`'s tasks.
 
-**Forging is denied in the template; the leak is not.** The scaffolded
-capability adds `core:event:deny-emit` and `core:event:deny-emit-to` —
-deny rules win over `core:default`'s allow entries, so a scaffolded
-app's webviews cannot inject events into other windows (the forge half
-of the `docs/design/event-scoping.md` findings). Nothing in
-`@pylair/client` or the template emits, so this costs a stock app
-nothing; an app that needs JS-side `emit` re-grants it per window
-(`"core:event:allow-emit"` in its own capability block) — and accepts
-that any webview holding it can forge events again. Passive receipt is
-untouched: an `Any`-target listener still sees `emit_to`-addressed
-events, so cross-window stream reads remain possible until delivery
-moves to a per-call channel.
+What remains broadcast: `pylair://state`, `pylair://stderr` and
+`pylair://exposes` go to webviews that have invoked the bridge
+(`emit_to` per label) — but any `Any`-target listener still receives
+them regardless of the emit target (Tauri 2.12.5's
+`match_any_or_filter`), so treat these events as readable by every
+webview in the app. They carry lifecycle and log data, not call
+results — though `stderr` can contain application log lines, which is
+why per-window stderr opt-in is a documented follow-up. The template
+still **denies** `core:event:deny-emit` and `core:event:deny-emit-to`.
+Deny rules are evaluated per *origin*, ignoring `windows:` scoping, and
+always win over allows — so the entries bar **every** local webview from
+`emit`/`emitTo`, not just `main`. A scaffolded webview cannot forge the
+remaining broadcast events; an app needing JS-side `emit` cannot get it
+back through capabilities while the deny stays — the only paths left
+are Rust-side `emit_to` calls. That is also why the self-test's `win-b`
+reports through `python_selftest_b_report` (an ACL-checked command that
+emits for it) instead of `emitTo` — and why `selftest-winb.json` is not
+part of the shipped template: it grants `emit`/`emitTo` to a `win-b`
+label and references a permission a freshly scaffolded app may not
+resolve. The reference app carries it; CI injects it into scaffolded
+apps before building them.
+
+Scope boundaries, stated plainly: ownership checks are the boundary for
+`cancel`/`grant_credit`/task reap-on-destroy; capability grants are the
+boundary for *starting* work — any webview whose capability covers the
+commands can still invoke them and start calls or streams. Channel
+delivery does not limit who may invoke; it guarantees only that a
+call's data reaches the webview that invoked it.
+
+Reloads are a webview-lifecycle edge the channel cannot see: a fresh
+document replaces the JS context but `Channel::send` can keep returning
+`Ok` through the engine's eval path — payloads land in a dead context
+and nothing calls back. The plugin's `on_page_load` hook closes that
+gap server-side: at `PageLoadEvent::Started` — a document-commit event
+on every engine (WebView2 `ContentLoading`, WKWebView
+`didCommitNavigation`, WebKitGTK `LoadCommitted`), which same-document
+navigations like anchors and `history.pushState` never fire — every
+task the old document owned is cancelled, bounded by a task-id
+watermark so a call the new document raced in before the reap lands is
+spared. The client's `pagehide` hook remains as a best-effort belt.
 
 ## 5. Malformed input, in both directions
 

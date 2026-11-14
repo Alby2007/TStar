@@ -1,5 +1,25 @@
 # Design note: `pylair://stream` event scoping across webviews
 
+**Status: IMPLEMENTED (channel migration, rc.13).** The repro below is
+kept as the record of the vulnerability it fixed. `pylair://stream` no
+longer exists — call/stream delivery rides a required per-call
+`tauri::ipc::Channel` (`onEvent`) bound to the invoking webview, so
+neither the leak nor any of the forgeries below can occur. The
+two-window repro is now a permanent installed-app self-test:
+`PYLAIR_SELF_TEST_WEBVIEW` opens a second webview `win-b` with
+`core:event:allow-emit`/`allow-emit-to` **deliberately granted** (via
+`selftest-winb.json` — carried by the reference app and CI-injected into
+scaffolded apps, never shipped in the template), which
+passively listens, attempts every forgery recorded here, and probes
+cancel/grant on the owner's task — the run goes green only when none of
+it lands. Broadcast `pylair://state|stderr|exposes` remain events.
+(win-b's own verdict does not ride `emitTo`: template deny entries
+apply per-origin, so on a scaffolded app they bar win-b's emission too —
+it reports through `python_selftest_b_report`, an ACL-checked command
+whose Rust side emits.)
+
+---
+
 **Findings of the event-scoping investigation (PR #21), kept as a design
 record.** The claim under review: `emit_to(label, "pylair://stream", …)` does
 not isolate windows, because the client's `listen()` defaults to target
@@ -79,8 +99,10 @@ Evidence lands in `spikes/event-scoping/out.log` (webview → `emit("repro-log")
   `core:event:deny-emit-to`): deny is origin-checked and wins over allows
   (`ipc/authority.rs::denied_on` runs first). Kills forging outright — no
   window can inject events. Nothing in `@pylair/client` emits, so the template
-  could add these today; cost: apps lose app-level `emit`/`emitTo` (they can
-  re-grant per-window). Does **not** fix the leak — passive listeners still
+  could add these today; cost: apps lose app-level `emit`/`emitTo` — and
+  because denies are origin-wide they cannot be re-granted per window;
+  only removing the entry (or a Rust-side `emit_to`) emits again. Does
+  **not** fix the leak — passive listeners still
   receive `emit_to`-targeted events.
 - Neither stopgap is sufficient alone; combined (deny emit + self-targeted
   listen) they close both holes for *cooperative* windows, but `allow-listen`

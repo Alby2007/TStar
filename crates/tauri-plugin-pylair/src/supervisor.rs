@@ -486,8 +486,11 @@ enum Command {
         caller: Option<String>,
     },
     /// Cancel every task owned by this webview label — sent when the
-    /// window is destroyed (supervisor-initiated, not a JS caller).
-    CancelOwned { owner: String },
+    /// window is destroyed or its document reloads (supervisor-initiated,
+    /// not a JS caller). `before` bounds the reap to tasks allocated
+    /// before a watermark: on a page-load the new document's calls may
+    /// register before this command lands, and they must survive.
+    CancelOwned { owner: String, before: Option<u64> },
     /// Operator-initiated restart out of the Failed state.
     Retry,
     /// Stop the runtime. `ack` fires only after the process tree is reaped,
@@ -599,6 +602,10 @@ pub struct Handle {
     /// Shared with the actor: total stream bytes buffered for ALL
     /// consumers, metered by each chunk's `StreamLease` (RC.8A).
     stream_bytes_total: Arc<AtomicU64>,
+    /// Shared with the actor: the next task id it will allocate. A page
+    /// load reads this as a watermark — tasks with id < watermark existed
+    /// before the navigation committed and belong to the dead document.
+    next_task: Arc<AtomicU64>,
     limits: Arc<Limits>,
 }
 
@@ -740,7 +747,54 @@ impl Handle {
     /// command queue cannot silently lose it (the window's tasks would
     /// run on orphaned) — and nobody is left to report a loss to anyway.
     pub async fn cancel_owner(&self, owner: String) {
-        let _ = self.cmd.send(Command::CancelOwned { owner }).await;
+        let _ = self
+            .cmd
+            .send(Command::CancelOwned {
+                owner,
+                before: None,
+            })
+            .await;
+    }
+
+    /// The next task id the actor will allocate — a watermark for
+    /// `cancel_owner_before`. Read cheap: a shared atomic.
+    pub fn task_watermark(&self) -> u64 {
+        self.next_task.load(Ordering::Relaxed)
+    }
+
+    /// Cancel every task `owner` allocated BEFORE `before` — used when a
+    /// webview starts loading a new document. The label survives reloads,
+    /// so unlike `cancel_owner` this must not sweep tasks the NEW
+    /// document managed to register before this command lands: their ids
+    /// are >= the watermark and they stay. Same awaited-send,
+    /// never-dropped guarantee as `cancel_owner`.
+    pub async fn cancel_owner_before(&self, owner: String, before: u64) {
+        let _ = self
+            .cmd
+            .send(Command::CancelOwned {
+                owner,
+                before: Some(before),
+            })
+            .await;
+    }
+
+    /// Cancel exactly `task` as its owner — used by the stream forwarder
+    /// when the call's channel dies. Unlike `cancel` this awaits the
+    /// command send, so a momentarily-full queue cannot silently drop the
+    /// reap the way a `try_send` could; the outcome is discarded — the
+    /// dead consumer could never observe it. Cancelling one task leaves
+    /// same-owner siblings alone (a window closed and reopened under the
+    /// same label may hold newer live calls).
+    pub async fn cancel_task(&self, task: u64, owner: String) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .cmd
+            .send(Command::Cancel {
+                task,
+                respond: tx,
+                caller: Some(owner),
+            })
+            .await;
     }
 
     /// Grant more stream pull-credit to `task` as `caller`.
@@ -838,6 +892,7 @@ pub fn spawn(
     let stream_buffer = config.stream_buffer;
     let cancel_timeout = config.cancel_timeout;
     let stream_bytes_total = Arc::new(AtomicU64::new(0));
+    let next_task = Arc::new(AtomicU64::new(1));
     let actor = Supervisor {
         spec,
         config,
@@ -846,7 +901,7 @@ pub fn spawn(
         state_tx,
         generation: 0,
         next_id: AtomicU64::new(1),
-        next_task: AtomicU64::new(1),
+        next_task: next_task.clone(),
         ready_since: None,
         shutdown_acks: Vec::new(),
         shutdown_outcome: None,
@@ -859,6 +914,7 @@ pub fn spawn(
             stream_buffer,
             cancel_timeout,
             stream_bytes_total,
+            next_task,
             limits,
         },
         actor,
@@ -873,7 +929,9 @@ struct Supervisor {
     state_tx: watch::Sender<State>,
     generation: u64,
     next_id: AtomicU64,
-    next_task: AtomicU64,
+    /// Shared with `Handle` so a page-load can watermark "tasks that
+    /// existed before this navigation" — see `cancel_owner_before`.
+    next_task: Arc<AtomicU64>,
     /// When the current generation reached Ready — a crash after a sustained
     /// ready period is a fresh incident, not a boot loop.
     ready_since: Option<Instant>,
@@ -1434,13 +1492,17 @@ impl Supervisor {
                                 }
                             }
                         }
-                        Command::CancelOwned { owner } => {
-                            // A window was destroyed: cancel every task it
-                            // owned. Supervisor-initiated, so the owner check
-                            // does not apply; delivery failures only lose a
-                            // cancel the dead window could never observe.
+                        Command::CancelOwned { owner, before } => {
+                            // Window destroyed (before: None) or new
+                            // document loading (Some watermark): cancel
+                            // every task it owned / owned before the mark.
+                            // Supervisor-initiated, so the owner check does
+                            // not apply; delivery failures only lose a
+                            // cancel the dead context could never observe.
                             for (&task, meta) in tasks.iter() {
-                                if meta.owner.as_deref() == Some(owner.as_str()) {
+                                if meta.owner.as_deref() == Some(owner.as_str())
+                                    && before.is_none_or(|b| task < b)
+                                {
                                     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                                     let body = proto::request(id, "cancel",
                                         serde_json::json!({"task": task}));

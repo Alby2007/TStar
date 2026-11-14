@@ -1,15 +1,35 @@
 /**
  * @pylair/client — typed calls into the managed Python runtime.
  *
- * Transport: `plugin:pylair|python_*` commands + `pylair://*` events
- * (see crates/tauri-plugin-pylair/src/lib.rs `events` and
- * docs/protocol-v1.md). The bridge is injectable for testing/headless use.
+ * Transport: `plugin:pylair|python_*` commands. Call/stream delivery
+ * rides a per-call `tauri::ipc::Channel` bound to the invoking webview —
+ * not an event bus. `pylair://*` events remain for broadcast lifecycle
+ * (state/stderr/exposes). See docs/protocol-v1.md. The bridge is
+ * injectable for testing/headless use.
  */
 
-/** Minimal bridge over Tauri invoke/listen — injectable for tests. */
+/**
+ * Minimal bridge over Tauri invoke/listen — injectable for tests.
+ *
+ * `invokeChannel` carries the per-call event channel: the plugin command
+ * requires an `onEvent` `tauri::ipc::Channel`, so each call/stream gets
+ * its own delivery — there is no shared stream event bus to listen to
+ * (that bus was the event-scoping leak). Breaking vs the pre-channel
+ * interface: a custom bridge must now implement `invokeChannel`.
+ */
 export interface IpcBridge {
   invoke<T = unknown>(cmd: string, args?: Record<string, unknown>): Promise<T>;
   listen<T = unknown>(event: string, cb: (payload: T) => void): Promise<() => void>;
+  /**
+   * Invoke a streaming command with a per-call event sink. `onEvent`
+   * receives StreamEvents for THIS invocation only; the implementation
+   * binds it to a `Channel` passed as the `onEvent` argument.
+   */
+  invokeChannel<T = number>(
+    cmd: string,
+    args: Record<string, unknown>,
+    onEvent: (ev: StreamEvent) => void,
+  ): Promise<T>;
 }
 
 /** Python-side error object (docs/protocol-v1.md §8). */
@@ -93,11 +113,12 @@ export interface StreamEvent {
   error?: { code: number; message: string; data?: unknown };
 }
 
+// Broadcast lifecycle events — stream/result delivery is NOT an event;
+// it rides the per-call channel bound to the invoking webview.
 const EVT = {
   state: "pylair://state",
   stderr: "pylair://stderr",
   exposes: "pylair://exposes",
-  stream: "pylair://stream",
 } as const;
 
 const CMD = {
@@ -125,6 +146,13 @@ function defaultBridge(): Promise<IpcBridge> {
       invoke: (cmd, args) => core.invoke(cmd, args),
       listen: <T,>(ev: string, cb: (p: T) => void) =>
         event.listen<T>(ev, (e) => cb(e.payload)),
+      invokeChannel: (cmd, args, onEvent) => {
+        // onmessage is wired BEFORE invoke — the first chunk can race
+        // the invoke response and must not be lost.
+        const channel = new core.Channel<StreamEvent>();
+        channel.onmessage = onEvent;
+        return core.invoke(cmd, { ...args, onEvent: channel });
+      },
     };
   });
   return _defaultBridge;
@@ -192,62 +220,40 @@ function fromWire(v: unknown): unknown {
 }
 
 // ---- internal stream machinery ---------------------------------------------
+//
+// Every call — plain or streaming — goes through `python_call_stream` so it
+// always has a task id (needed for cancellation). Delivery arrives on the
+// per-call `Channel` passed at invoke time: each invocation only ever sees
+// its own events, so no task-map routing or early-event buffering exists.
 
 /**
- * Every call — plain or streaming — goes through `python_call_stream` so it
- * always has a task id (needed for cancellation). Plain calls simply see a
- * single terminal stream event.
+ * Live task ids in THIS window — not for routing (channels do that), only
+ * so a page unload can cancel them. A reload kills every channel but
+ * `Channel::send` does NOT reliably error on a reload (the webview object
+ * survives; the eval lands in a dead JS context and the callback is a
+ * no-op). The plugin's on_page_load hook already reaps the document's
+ * tasks server-side when a navigation commits; this hook stays as a best
+ * effort belt for engines that never surface a load event.
  */
-interface ActiveTask {
-  onItem: (ev: StreamEvent) => void;
-}
+const liveTasks = new Set<number>();
+let unloadHooked = false;
 
-const tasks = new Map<number, ActiveTask>();
-let streamListener: Promise<() => void> | null = null;
-
-/**
- * Events for a task id nobody has registered yet. The Rust forwarder starts
- * emitting as soon as Python replies, which can beat the `invoke` response
- * that carries the task id back to JS. Every task here was started by this
- * client, so an unknown id is an in-flight invoke: hold its events and
- * replay them on registration. Entries expire so a cancelled/abandoned
- * invoke cannot leak.
- */
-const EARLY_TTL_MS = 30_000;
-const early = new Map<number, { events: StreamEvent[]; timer: ReturnType<typeof setTimeout> }>();
-
-function holdEarly(ev: StreamEvent): void {
-  let e = early.get(ev.task);
-  if (!e) {
-    const timer = setTimeout(() => early.delete(ev.task), EARLY_TTL_MS);
-    (timer as { unref?: () => void }).unref?.();
-    e = { events: [], timer };
-    early.set(ev.task, e);
+function trackLive(task: number): void {
+  // No DOM lib in this package — globalThis is the window in a webview.
+  const g = globalThis as {
+    addEventListener?: (event: string, cb: () => void) => void;
+  };
+  if (typeof g.addEventListener === "function" && !unloadHooked) {
+    unloadHooked = true;
+    g.addEventListener("pagehide", () => {
+      // Best effort: teardown may cut the invoke off, but when it lands
+      // the tasks die instead of running orphaned under a dead channel.
+      void ipc().then((b) => {
+        for (const task of liveTasks) b.invoke(CMD.cancel, { task }).catch(() => {});
+      });
+    });
   }
-  e.events.push(ev);
-}
-
-/** Register a task and replay anything that arrived before it existed. */
-function register(task: number, t: ActiveTask): void {
-  tasks.set(task, t);
-  const e = early.get(task);
-  if (!e) return;
-  early.delete(task);
-  clearTimeout(e.timer);
-  for (const ev of e.events) {
-    t.onItem(ev);
-    if (ev.done) break;
-  }
-}
-
-async function ensureStreamListener(): Promise<void> {
-  streamListener ??= (async () =>
-    (await ipc()).listen<StreamEvent>(EVT.stream, (ev) => {
-      const t = tasks.get(ev.task);
-      if (t) t.onItem(ev);
-      else holdEarly(ev);
-    }))();
-  await streamListener;
+  liveTasks.add(task);
 }
 
 function wireAbort(signal: AbortSignal | undefined, task: number): void {
@@ -302,31 +308,40 @@ export async function call<T = unknown>(
   opts: CallOptions = {},
 ): Promise<T> {
   const b = await ipc();
-  await ensureStreamListener();
-  const task = await b
-    .invoke<number>(CMD.callStream, {
-      fnName: fn,
-      input: toWire(input) as Record<string, unknown>,
-    })
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const result = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  // The terminal can arrive before the invoke resolves — the callback is
+  // bound at invoke time, so nothing is lost. `task` must be a let bound
+  // before invokeChannel runs: the callback can fire during the invoke.
+  let settled = false;
+  let disarm = () => {};
+  let task = -1;
+  task = await b
+    .invokeChannel<number>(
+      CMD.callStream,
+      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      (ev) => {
+        if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
+        settled = true;
+        liveTasks.delete(task);
+        disarm();
+        if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
+        else resolve(fromWire(ev.result) as T);
+      },
+    )
     .catch((e) => {
       throw asPythonError(e);
     });
   wireAbort(opts.signal, task);
-  return new Promise<T>((resolve, reject) => {
-    const disarm = armDeadline(opts, task, (e) => {
-      tasks.delete(task);
-      reject(e);
-    });
-    register(task, {
-      onItem: (ev) => {
-        if (!ev.done) return; // plain calls shouldn't chunk; ignore defensively
-        disarm();
-        tasks.delete(task);
-        if (ev.error) reject(mkError(ev.error.code, ev.error.message, ev.error.data));
-        else resolve(fromWire(ev.result) as T);
-      },
-    });
-  });
+  if (!settled) {
+    trackLive(task);
+    disarm = armDeadline(opts, task, reject);
+  }
+  return result;
 }
 
 const CREDIT_BATCH = 32;
@@ -338,34 +353,33 @@ export async function* stream<T = unknown>(
   opts: CallOptions = {},
 ): AsyncGenerator<T, void, void> {
   const b = await ipc();
-  await ensureStreamListener();
-  const task = await b
-    .invoke<number>(CMD.callStream, {
-      fnName: fn,
-      input: toWire(input) as Record<string, unknown>,
-    })
-    .catch((e) => {
-      throw asPythonError(e);
-    });
-  wireAbort(opts.signal, task);
-
   const queue: StreamEvent[] = [];
   let wake: (() => void) | null = null;
   let pendingCredit = 0;
   let finished = false; // terminal event seen: producer already done
   let expired: PythonError | null = null;
+  // Bound at invoke time — events queue locally even if they beat the
+  // invoke response back.
+  const task = await b
+    .invokeChannel<number>(
+      CMD.callStream,
+      { fnName: fn, input: toWire(input) as Record<string, unknown> },
+      (ev) => {
+        queue.push(ev);
+        wake?.();
+      },
+    )
+    .catch((e) => {
+      throw asPythonError(e);
+    });
+  wireAbort(opts.signal, task);
+  trackLive(task);
   const disarm = armDeadline(opts, task, (e) => {
     expired = e;
     finished = true; // the deadline already sent the cancel
     wake?.();
   });
 
-  register(task, {
-    onItem: (ev) => {
-      queue.push(ev);
-      wake?.();
-    },
-  });
   try {
     for (;;) {
       while (queue.length === 0) {
@@ -392,7 +406,7 @@ export async function* stream<T = unknown>(
     }
   } finally {
     disarm();
-    tasks.delete(task);
+    liveTasks.delete(task);
     // Consumer walked away (break / return() / throw) before the producer
     // finished: stop it instead of leaving it running and granting credit.
     if (!finished) void b.invoke(CMD.cancel, { task }).catch(() => {});
@@ -488,6 +502,29 @@ export async function maybeSelfTest(
   spec: SelfTestSpec = { add: "add", count: "count" },
 ): Promise<void> {
   if (!(globalThis as { __PYLAIR_SELF_TEST__?: boolean }).__PYLAIR_SELF_TEST__) return;
+  // Under the flag the plugin also opens a second webview, "win-b". It
+  // runs the intruder role; every other label runs the owner role.
+  if ((await selfTestLabel()) === "win-b") return selfTestIntruder();
+  return selfTestOwner(spec);
+}
+
+async function selfTestLabel(): Promise<string> {
+  try {
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    return getCurrentWebview().label;
+  } catch {
+    return "main"; // headless/test hosts have no webview API
+  }
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Owner role ("main"): run a real stream and a plain call to completion,
+ * then gate on the intruder's report. Any leaked chunk, forged item or
+ * successful cross-window cancel/grant fails the verdict.
+ */
+async function selfTestOwner(spec: SelfTestSpec): Promise<void> {
   const checks: Record<string, string> = {};
   let ok = true;
   const run = async (name: string, f: () => Promise<void>) => {
@@ -505,20 +542,34 @@ export async function maybeSelfTest(
       new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`${what} timed out`)), ms)),
     ]);
 
-  await run("call", async () => {
-    const v = await within(call<number>(spec.add, { a: 2, b: 3 }), 30_000, "call");
-    if (v !== 5) throw new Error(`add(2,3) returned ${String(v)}`);
+  // The intruder's verdict must be captured before it can possibly send —
+  // the listener installs before any task runs.
+  const bReport = new Promise<{
+    sawEvents?: number;
+    everCancelled?: boolean;
+    anyGrantSucceeded?: boolean;
+    seenSample?: unknown[];
+  }>((res) => {
+    void ipc().then((b) => b.listen("pylair://selftest-b", res));
   });
+
+  // Task ids are sequential from 1 on a fresh app: stream = task 1,
+  // call = task 2, cancel-check = task 3. The intruder targets 1 and 2.
   await run("stream-order", async () => {
     const got: number[] = [];
     await within(
       (async () => {
-        for await (const n of stream<number>(spec.count, { n: 5 })) got.push(n);
+        for await (const n of stream<number>(spec.count, { n: 25 })) got.push(n);
       })(),
       30_000,
       "stream",
     );
-    if (got.join(",") !== "0,1,2,3,4") throw new Error(`stream gave [${got.join(",")}]`);
+    if (got.join(",") !== "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24")
+      throw new Error(`stream gave [${got.join(",")}]`);
+  });
+  await run("call", async () => {
+    const v = await within(call<number>(spec.add, { a: 2, b: 3 }), 30_000, "call");
+    if (v !== 5) throw new Error(`add(2,3) returned ${String(v)}`);
   });
   await run("cancel", async () => {
     const ac = new AbortController();
@@ -541,7 +592,95 @@ export async function maybeSelfTest(
     if (code !== -32010) throw new Error(`expected TASK_CANCELLED, got ${String(code)} after ${seen} chunks`);
     if (seen >= 100) throw new Error(`producer kept running (${seen} chunks)`);
   });
+  await run("event-scoping", async () => {
+    const b = await within(bReport, 30_000, "win-b report");
+    if ((b.sawEvents ?? 0) !== 0)
+      throw new Error(
+        `win-b read ${String(b.sawEvents)} of win-a's stream events: ${JSON.stringify(b.seenSample ?? [])}`,
+      );
+    if (b.everCancelled) throw new Error("win-b cancelled win-a's task");
+    if (b.anyGrantSucceeded) throw new Error("win-b granted credit on win-a's task");
+  });
   await (await ipc()).invoke(CMD.selftestReport, { result: { ok, checks } });
+}
+
+/**
+ * Intruder role ("win-b"): a hostile second window. Its capability grants
+ * emit/emitTo on purpose, so a pass proves delivery — not the deny-emit
+ * stopgap — protects the owner's stream. Reports findings back on
+ * `pylair://selftest-b`; it cannot exit the app itself.
+ */
+async function selfTestIntruder(): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  const { emit, emitTo, listen } = await import("@tauri-apps/api/event");
+
+  // Passive receipt: a default-target listener — what a stock webview's
+  // client does — must see nothing of the owner's call data. Tauri's
+  // Any-target listener ALSO echoes this window's own forgeries back —
+  // count only events lacking the FORGED markers emitted below.
+  const forged = new Set([
+    "FORGED-BY-B",
+    "FORGED-EMITTO-BY-B",
+    "FORGED-EARLY-BY-B",
+    "FORGED-RESULT-BY-B",
+  ]);
+  let sawEvents = 0;
+  const seenSample: unknown[] = [];
+  await listen<{ value?: unknown; result?: unknown }>("pylair://stream", (e) => {
+    if (seenSample.length < 6) seenSample.push(e.payload);
+    if (forged.has(String(e.payload.value)) || forged.has(String(e.payload.result))) return;
+    sawEvents += 1;
+  });
+
+  // Early-buffer attack: pre-fire a terminal for the owner's NEXT task id
+  // (task 2 — the plain call) before it exists.
+  void emit("pylair://stream", { task: 2, done: true, result: "FORGED-EARLY-BY-B" }).catch(() => {});
+
+  // Wait until the runtime is up so task 1 (the owner's stream) is live.
+  for (let i = 0; i < 120; i++) {
+    const s = await invoke<string>("plugin:pylair|python_state").catch(() => "");
+    if (s === "ready") break;
+    await sleep(500);
+  }
+
+  // Mid-stream forgeries at task 1: plain emit, emitTo("main"), terminal.
+  void emit("pylair://stream", { task: 1, seq: 999, value: "FORGED-BY-B", done: false }).catch(
+    () => {},
+  );
+  void emitTo("main", "pylair://stream", {
+    task: 1,
+    seq: 998,
+    value: "FORGED-EMITTO-BY-B",
+    done: false,
+  }).catch(() => {});
+  setTimeout(() => {
+    void emit("pylair://stream", { task: 1, done: true, result: "FORGED-RESULT-BY-B" }).catch(
+      () => {},
+    );
+  }, 400);
+
+  // Task control: cancel/grant on the owner's task must never succeed —
+  // probe repeatedly across the stream's live window.
+  let everCancelled = false;
+  let anyGrantSucceeded = false;
+  const acted = new Set(["cancelled", "terminated", "requested_may_continue", "termination_uncertain"]);
+  for (let i = 0; i < 8; i++) {
+    const oc = await invoke<string>("plugin:pylair|python_cancel", { task: 1 }).catch(() => "");
+    if (acted.has(oc)) everCancelled = true;
+    const granted = await invoke("plugin:pylair|python_grant_credit", { task: 1, n: 8 })
+      .then(() => true)
+      .catch(() => false);
+    if (granted) anyGrantSucceeded = true;
+    await sleep(400);
+  }
+
+  // The report cannot ride emit/emitTo: a `core:event:deny-emit(-to)` entry
+  // (as the default template ships) denies those commands origin-wide —
+  // Tauri ignores window scoping for denials — so win-b relays through an
+  // ACL-checked command whose Rust side emits for it.
+  await invoke("plugin:pylair|python_selftest_b_report", {
+    report: { sawEvents, everCancelled, anyGrantSucceeded, seenSample },
+  }).catch(() => {});
 }
 
 /**
@@ -560,12 +699,9 @@ export const python = {
   onExposes,
 };
 
-/** For tests: reset all listeners/tasks between cases. */
+/** For tests: reset the injected bridge between cases. */
 export function _resetForTests(): void {
-  tasks.clear();
-  for (const e of early.values()) clearTimeout(e.timer);
-  early.clear();
-  streamListener = null;
+  liveTasks.clear();
   _bridge = null;
   _defaultBridge = null;
 }

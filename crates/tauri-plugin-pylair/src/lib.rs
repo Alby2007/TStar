@@ -335,8 +335,6 @@ pub mod events {
     pub const STDERR: &str = "pylair://stderr";
     /// The exposes manifest after handshake.
     pub const EXPOSES: &str = "pylair://exposes";
-    /// Stream items: `{task, seq?, value?, done, result?|error?}`.
-    pub const STREAM: &str = "pylair://stream";
 }
 
 /// Managed state holding the supervisor handle.
@@ -466,9 +464,34 @@ impl<R: Runtime> Builder<R> {
                 Ok(())
             })
             .on_event(|app, event| {
+                // Two-window event-scoping self-test: a second webview
+                // exists only under the flag. Its capability grants
+                // emit/emitTo on purpose — the test proves the delivery
+                // fix itself, not the deny-emit stopgap. Window creation
+                // must wait for RunEvent::Ready (plugin setup runs before
+                // the event loop starts) AND must run off the main thread:
+                // create_window dispatches to the loop and blocks on the
+                // ack, which deadlocks inside an event callback.
+                if let tauri::RunEvent::Ready = event {
+                    if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_some() {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = tauri::WebviewWindowBuilder::new(
+                                &app,
+                                "win-b",
+                                tauri::WebviewUrl::App("index.html".into()),
+                            )
+                            .build()
+                            {
+                                eprintln!("self-test win-b creation failed: {e}");
+                            }
+                        });
+                    }
+                }
                 // A destroyed window leaves the subscriber set; a reload does
-                // NOT remove it (label survives reloads — an in-flight stream
-                // to a reloaded page just has no listener, which is fine).
+                // NOT remove it (the label survives — the new document keeps
+                // receiving broadcast lifecycle/stderr events, which is what
+                // subscribers want). Its tasks are reaped by on_page_load.
                 if let tauri::RunEvent::WindowEvent {
                     label,
                     event: tauri::WindowEvent::Destroyed,
@@ -501,6 +524,30 @@ impl<R: Runtime> Builder<R> {
                     }
                 }
             })
+            .on_page_load(|webview, payload| {
+                // A new document replaces the page's JS context: every call
+                // the old document owned is orphaned — its Channel::send can
+                // still return Ok through eval, so send-failure reaping
+                // cannot catch this. PageLoadEvent::Started fires at the
+                // document commit (WebView2 ContentLoading, WKWebView
+                // didCommitNavigation, WebKitGTK LoadCommitted): reloads and
+                // dev-server full reloads land here; same-document
+                // navigations (anchors, history.pushState, SPA routes) do
+                // not. The watermark keeps the race airtight — only tasks
+                // allocated BEFORE this navigation are reaped; a call the
+                // new document races in registers an id >= the mark and
+                // survives. The client-side pagehide hook stays as belt.
+                if payload.event() == tauri::webview::PageLoadEvent::Started {
+                    if let Some(rt) = webview.try_state::<PyRuntime>() {
+                        let h = rt.0.clone();
+                        let before = h.task_watermark();
+                        let owner = webview.label().to_string();
+                        tauri::async_runtime::spawn(async move {
+                            h.cancel_owner_before(owner, before).await;
+                        });
+                    }
+                }
+            })
             .on_drop(|app| {
                 if let Some(rt) = app.try_state::<PyRuntime>() {
                     let handle = rt.0.clone();
@@ -516,6 +563,7 @@ impl<R: Runtime> Builder<R> {
                 python_state,
                 python_shutdown,
                 python_selftest_report,
+                python_selftest_b_report,
             ])
             .build()
     }
@@ -557,22 +605,42 @@ async fn python_call<R: Runtime>(
 }
 
 /// Start a streaming call. Returns the task id; chunks and the terminal
-/// arrive on the `pylair://stream` event, addressed to the owning webview.
+/// arrive on the per-call `on_event` channel — delivery is bound to the
+/// invoking webview, no shared event bus (event-scoping fix).
 #[tauri::command]
 async fn python_call_stream<R: Runtime>(
-    app: tauri::AppHandle<R>,
     window: tauri::WebviewWindow<R>,
     reg: tauri::State<'_, Registry>,
     rt: tauri::State<'_, PyRuntime>,
+    on_event: tauri::ipc::Channel<Value>,
     fn_name: String,
     input: Value,
 ) -> Result<u64, ErrorObj> {
     subscribed(&window, &reg);
     let label = window.label().to_string();
-    let (task, mut items) =
+    let (task, items) =
         rt.0.call_stream(&fn_name, input, Some(label.clone()))
             .await?;
-    let reg_state: Registry = app.state::<Registry>().inner().clone();
+    forward_stream(on_event, items, rt.0.clone(), task, label);
+    Ok(task)
+}
+
+/// Forward one call's stream items to its per-call channel. A dead
+/// consumer — `Channel::send` fails when the webview is gone — reaps
+/// that task and stops forwarding, so no stream slot or credit is left
+/// tied up. The reap is per-task, not per-label: a webview closed and
+/// reopened under the same label can hold newer live calls that a stale
+/// forwarder must not kill. Uses `cancel_task`: the awaited send cannot
+/// be dropped by a full command queue the way a `try_send` cancel can.
+/// Returns the forwarder's join handle (tests await it).
+#[doc(hidden)]
+pub fn forward_stream(
+    on_event: tauri::ipc::Channel<Value>,
+    mut items: supervisor::StreamRx,
+    rt: Handle,
+    task: u64,
+    owner: String,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         while let Some(item) = items.recv().await {
             let payload = match item {
@@ -586,13 +654,12 @@ async fn python_call_stream<R: Runtime>(
                     json!({"task": task, "done": true, "error": e})
                 }
             };
-            // Scoped to the webview that started the stream (P1-8).
-            if app.emit_to(&label, events::STREAM, payload).is_err() {
-                reg_state.lock().unwrap().drop_label(&label);
+            if on_event.send(payload).is_err() {
+                rt.cancel_task(task, owner.clone()).await;
+                break;
             }
         }
-    });
-    Ok(task)
+    })
 }
 
 #[tauri::command]
@@ -627,6 +694,34 @@ fn python_selftest_report<R: Runtime>(
     println!("webview-self-test: {result}");
     app.exit(if ok { 0 } else { 5 });
     Ok(())
+}
+
+/// Intruder's verdict for the two-window self-test. win-b cannot send it
+/// via JS emit/emit_to: a `core:event:deny-emit(-to)` entry (as the default
+/// template ships for the main webview) denies those commands origin-wide —
+/// Tauri's authority ignores `windows:` scoping for denials — so the report
+/// relays through this ACL-checked command and the Rust side emits. Rust
+/// emit paths are not subject to webview permissions. Unlike
+/// python_selftest_report this does not exit the app, so win-b can hold it
+/// without gaining shutdown power. Inert unless PYLAIR_SELF_TEST_WEBVIEW.
+#[tauri::command]
+fn python_selftest_b_report<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    report: Value,
+) -> Result<(), ErrorObj> {
+    if std::env::var_os("PYLAIR_SELF_TEST_WEBVIEW").is_none() {
+        return Err(ErrorObj {
+            code: protocol::INVALID_REQUEST,
+            message: "webview self-test not enabled".into(),
+            data: None,
+        });
+    }
+    app.emit_to("main", "pylair://selftest-b", report)
+        .map_err(|e| ErrorObj {
+            code: protocol::INTERNAL,
+            message: e.to_string(),
+            data: None,
+        })
 }
 
 #[tauri::command]

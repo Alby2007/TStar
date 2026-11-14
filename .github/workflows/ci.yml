@@ -314,6 +314,17 @@ jobs:
           # The app lives inside this repo's checkout; without its own
           # workspace root pnpm installs the monorepo instead of the app.
           echo "packages: []" > app-under-test/pnpm-workspace.yaml
+      - name: Two-window self-test capability (scaffold legs)
+        if: matrix.app == 'scaffold'
+        shell: bash
+        run: |
+          # Deliberately NOT shipped in the template — it grants
+          # emit/emitTo to a win-b label and references a permission that
+          # exists only in the crate this branch builds (--local resolves
+          # it). The reference app carries the canonical copy; CI injects
+          # it here so the installed two-window self-test can run.
+          cp examples/reference-app/src-tauri/capabilities/selftest-winb.json \
+             app-under-test/src-tauri/capabilities/
       # After scaffolding: restoring the cache earlier creates
       # src-tauri/target, and the scaffolder rightly refuses a
       # non-empty target directory.
