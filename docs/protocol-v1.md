@@ -150,17 +150,22 @@ on a generator while it holds credit for that task.
   in *chunks*; each `stream.chunk` sent decrements outstanding credit
   by one.
 - On stream open the host grants an initial credit of
-  `INITIAL_STREAM_CREDIT` (default 64). The TS client replenishes as
-  items are consumed — a throttled or backgrounded webview simply stops
-  granting, and the generator pauses at the next `__anext__`. The
-  stream stalls, it does not die.
-- Safety cap for misbehaving producers: sending a `stream.chunk` with
-  no outstanding credit, or buffering more than `MAX_STREAM_BUFFER`
-  (default 8 MiB) of un-granted data, aborts the task with
-  `PROTOCOL_VIOLATION` and counts as a protocol violation. This is the
-  only remaining abort path — a well-behaved producer can never hit a
-  limit by streaming "too fast"; it can only run out of credit, which
-  pauses it.
+  `INITIAL_STREAM_CREDIT` (default 64). Like every `stream.credit` it
+  travels the control lane — before the call frame — so a saturated
+  data lane cannot starve or reorder it, and the runtime applies it
+  through pending credit if it arrives before registration. The TS
+  client replenishes as items are consumed — a throttled or
+  backgrounded webview simply stops granting, and the generator pauses
+  at the next `__anext__`. The stream stalls, it does not die.
+- Safety cap for misbehaving producers: a `stream.chunk` that arrives
+  with no outstanding credit is a protocol violation — the host fails
+  every in-flight call with `PROTOCOL_VIOLATION` and kills the runtime,
+  the same treatment a malformed frame gets (a runtime that cannot
+  count credit cannot be trusted to honour a per-task abort either).
+  Chunks naming a task the generation no longer knows are ignored — a
+  plausible race, not a violation. This is the only remaining abort
+  path — a well-behaved producer can never hit a limit by streaming
+  "too fast"; it can only run out of credit, which pauses it.
 - `cancel` is independent of credit: a task is cancellable whether it
   is producing, waiting on credit, or fully drained.
 
@@ -418,8 +423,9 @@ effective set is logged at startup.
 - `stream.chunk` ordering is guaranteed **per task only** (seq-ordered);
   chunks from different tasks may interleave.
 - Flow control is credit-based (§3.1), not buffer-cap-based — producers
-  are paused, never aborted for streaming "too much". The byte-wise
-  `MAX_STREAM_BUFFER` remains only as a misbehavior tripwire.
+  are paused, never aborted for streaming "too much". The runtime's
+  outbound queue (`OUT_MAX_BYTES`, default 64 MiB) remains only as a
+  host-not-draining tripwire.
 
 ## 10. Versioning
 

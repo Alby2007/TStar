@@ -304,3 +304,59 @@ async fn initial_credit_undeliverable_rejects_stream() {
     );
     h.shutdown().await;
 }
+
+/// A chunk with no outstanding credit is a protocol violation, not a
+/// shrug: the host fails in-flight work with PROTOCOL_VIOLATION and
+/// kills the runtime — same treatment as a malformed frame.
+#[tokio::test]
+async fn uncredited_chunk_is_protocol_violation() {
+    /// Well-formed runtime that ignores credit: answers count_stream with
+    /// two chunks whatever the grant was (initial credit is 1).
+    const FAKE_UNCREDITED: &str = r#"
+import sys, struct, json
+def w(o):
+    b = json.dumps(o).encode()
+    sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
+w({"jsonrpc":"2.0","method":"hello","params":{"protocol":1,"exposes":[{"name":"count_stream","kind":"stream"}]}})
+while True:
+    h = sys.stdin.buffer.read(4)
+    if len(h) < 4: break
+    n, = struct.unpack(">I", h)
+    m = json.loads(sys.stdin.buffer.read(n))
+    method = m.get("method")
+    params = m.get("params") or {}
+    if method == "ping":
+        w({"jsonrpc":"2.0","method":"pong","params":{"seq": params.get("seq")}})
+    elif method == "shutdown":
+        w({"jsonrpc":"2.0","id": m["id"],"result": None}); break
+    elif "id" in m:
+        t = params.get("task")
+        for seq in (1, 2):
+            w({"jsonrpc":"2.0","method":"stream.chunk","params":{"task": t, "seq": seq, "value": seq}})
+        w({"jsonrpc":"2.0","id": m["id"],"result": None})
+"#;
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
+    let h = spawn_h(spec(FAKE_UNCREDITED), fast_config(), ev);
+    wait_state(&h, State::Ready).await;
+
+    let (_task, mut items) = h
+        .call_stream("count_stream", json!({}), None)
+        .await
+        .expect("stream call rejected");
+    let mut terminal = None;
+    while let Ok(Some(item)) = timeout(T, items.recv()).await {
+        if let StreamItem::End(r) = item {
+            terminal = Some(r);
+            break;
+        }
+    }
+    let err = terminal
+        .expect("stream never ended")
+        .expect_err("uncredited chunks accepted and the stream ended Ok");
+    assert_eq!(
+        err.code,
+        proto::PROTOCOL_VIOLATION,
+        "uncredited chunk must trip PROTOCOL_VIOLATION, got {err:?}"
+    );
+    h.shutdown().await;
+}

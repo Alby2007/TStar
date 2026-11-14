@@ -1249,11 +1249,28 @@ impl Supervisor {
                                     let task = p["task"].as_u64().unwrap_or(0);
                                     let seq = p["seq"].as_u64().unwrap_or(0);
                                     let value = p["value"].clone();
+                                    // A chunk with no outstanding credit is
+                                    // a protocol violation (protocol-v1 §3.1):
+                                    // a runtime that cannot count credit
+                                    // cannot be trusted to honour a per-task
+                                    // abort either — same treatment as a
+                                    // malformed frame. Chunks for a task the
+                                    // generation no longer knows are still
+                                    // ignored: they are a plausible race with
+                                    // the producer draining after a finish.
+                                    if tasks.get(&task).is_some_and(|m| m.credit == 0) {
+                                        fail_all(&mut pending,
+                                            proto::PROTOCOL_VIOLATION,
+                                            "runtime sent stream.chunk with no outstanding credit").await;
+                                        kill_and_reap(&mut io).await;
+                                        return ExitCause::Crashed(
+                                            format!("protocol violation: task {task} sent an uncredited stream.chunk"));
+                                    }
                                     let mut abandoned = None;
                                     if let Some(meta) = tasks.get_mut(&task) {
                                         // Each delivered chunk consumed one
                                         // credit (RC.8A accounting).
-                                        meta.credit = meta.credit.saturating_sub(1);
+                                        meta.credit -= 1;
                                         if let Some(PendingKind::Stream(sink)) = pending.get(&meta.call_id) {
                                             if let Err(why) = sink.chunk(seq, value) {
                                                 abandoned = Some((meta.call_id, why));
