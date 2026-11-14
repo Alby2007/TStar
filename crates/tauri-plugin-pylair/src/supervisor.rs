@@ -905,6 +905,8 @@ pub fn spawn(
         ready_since: None,
         shutdown_acks: Vec::new(),
         shutdown_outcome: None,
+        #[cfg(target_os = "linux")]
+        pdeath_anchor: None,
     }
     .run();
     (
@@ -939,6 +941,13 @@ struct Supervisor {
     shutdown_acks: Vec<oneshot::Sender<ShutdownOutcome>>,
     /// What the most recent shutdown actually achieved (RC.6C).
     shutdown_outcome: Option<ShutdownOutcome>,
+    /// Linux only: the one long-lived pdeathsig anchor thread every spawn
+    /// in this supervisor's lifetime goes through (created lazily).
+    /// Dropping it at actor exit closes the job channel; the thread then
+    /// exits — its parked children were already reaped, and any that were
+    /// not get their SIGKILL from the anchor's death either way.
+    #[cfg(target_os = "linux")]
+    pdeath_anchor: Option<PdeathAnchor>,
 }
 
 /// Per-child IO plumbing, owned by the per-spawn scope.
@@ -1036,7 +1045,17 @@ impl Supervisor {
                 State::Starting,
                 format!("spawning (gen {})", self.generation),
             );
-            let cause = match spawn_child(&self.spec, &self.config, &self.events).await {
+            #[cfg(target_os = "linux")]
+            let spawned = spawn_child(
+                &self.spec,
+                &self.config,
+                &self.events,
+                &mut self.pdeath_anchor,
+            )
+            .await;
+            #[cfg(not(target_os = "linux"))]
+            let spawned = spawn_child(&self.spec, &self.config, &self.events).await;
+            let cause = match spawned {
                 Ok(io) => self.run_child(io).await,
                 Err(e) => ExitCause::Crashed(format!("spawn failed: {e}")),
             };
@@ -1817,18 +1836,71 @@ fn jitter(d: Duration) -> Duration {
 
 // ---- process spawning & kill plumbing ----
 
-/// Linux: spawn the child FROM a dedicated thread that then parks for the
-/// process's lifetime. PR_SET_PDEATHSIG is bound to the *thread* that
-/// forked the child — not the process — so spawning on a transient
-/// executor thread (e.g. a spawn_blocking worker at its ~10s keepalive)
-/// would SIGKILL a perfectly healthy runtime. The anchor can only die
-/// with the whole process, so the signal means exactly "the host is gone".
+/// Linux: spawn the child FROM a dedicated long-lived thread that parks
+/// for the host process's lifetime. PR_SET_PDEATHSIG is bound to the
+/// *thread* that forked the child — not the process — so spawning on a
+/// transient executor thread (e.g. a spawn_blocking worker at its ~10s
+/// keepalive) would SIGKILL a perfectly healthy runtime. The anchor can
+/// only die with the whole process, so the signal means exactly "the
+/// host is gone".
 ///
-/// The fork itself must happen on the anchor thread, so the runtime
-/// handle is carried in and entered there — `Command::spawn` is a plain
-/// synchronous call that only needs the context to register the child.
+/// One anchor serves every spawn a supervisor ever makes: the pre-rc.15
+/// shape parked a fresh thread per spawn, so crash/retry respawns stacked
+/// anchor threads (~8 MiB of reserved stack each) that never unwound.
+/// The fork itself still happens on the anchor thread — the runtime
+/// handle and the fully-configured `Command` are carried over a job
+/// channel and executed there.
 #[cfg(target_os = "linux")]
-fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
+type AnchorJob = (
+    tokio::runtime::Handle,
+    tokio::process::Command,
+    std::sync::mpsc::Sender<io::Result<Child>>,
+);
+
+#[cfg(target_os = "linux")]
+struct PdeathAnchor(std::sync::mpsc::Sender<AnchorJob>);
+
+/// Live anchor threads — test-only visibility that respawns reuse one
+/// anchor instead of stacking them.
+#[cfg(target_os = "linux")]
+static ANCHOR_THREADS: AtomicU64 = AtomicU64::new(0);
+
+/// Live `pylair-pdeath-anchor` threads in this process (test hook).
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn pdeath_anchor_threads() -> usize {
+    ANCHOR_THREADS.load(Ordering::SeqCst) as usize
+}
+
+#[cfg(target_os = "linux")]
+impl PdeathAnchor {
+    fn new() -> io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<AnchorJob>();
+        std::thread::Builder::new()
+            .name("pylair-pdeath-anchor".into())
+            .spawn(move || {
+                ANCHOR_THREADS.fetch_add(1, Ordering::SeqCst);
+                // Jobs until every sender is gone — a sender lives in the
+                // supervisor actor, so the anchor outlives every spawn it
+                // served and exits when the supervisor does.
+                while let Ok((rt, mut cmd, reply)) = rx.recv() {
+                    let res = {
+                        let _guard = rt.enter();
+                        cmd.spawn()
+                    };
+                    let _ = reply.send(res);
+                }
+                ANCHOR_THREADS.fetch_sub(1, Ordering::SeqCst);
+            })
+            .map(|_| Self(tx))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_via_pdeathsig_anchor(
+    spec: &SpawnSpec,
+    anchor: &mut Option<PdeathAnchor>,
+) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|e| io::Error::other(format!("no runtime for spawn: {e}")))?;
@@ -1863,19 +1935,15 @@ fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
             Ok(())
         });
     }
+    let anchor = match anchor {
+        Some(a) => a,
+        None => anchor.insert(PdeathAnchor::new()?),
+    };
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Child>>();
-    std::thread::Builder::new()
-        .name("pylair-pdeath-anchor".into())
-        .spawn(move || {
-            // Enter the runtime so the child's registration resolves, then
-            // fork HERE — the JoinHandle detaches on return and this thread
-            // lives until the process does.
-            let _guard = rt.enter();
-            let _ = tx.send(cmd.spawn());
-            loop {
-                std::thread::park();
-            }
-        })?;
+    anchor
+        .0
+        .send((rt, cmd, tx))
+        .map_err(|_| io::Error::other("pdeathsig anchor is gone"))?;
     rx.recv()
         .map_err(|_| io::Error::other("pdeathsig anchor died before spawn"))?
 }
@@ -1884,6 +1952,7 @@ async fn spawn_child(
     spec: &SpawnSpec,
     config: &SupervisorConfig,
     events: &mpsc::Sender<RuntimeEvent>,
+    #[cfg(target_os = "linux")] pdeath_anchor: &mut Option<PdeathAnchor>,
 ) -> io::Result<ChildIo> {
     // Simplify a canonicalized (Windows \\?\-prefixed) program path so the
     // child sees a plain sys.executable — dev-mode callers may pass one too.
@@ -1923,7 +1992,7 @@ async fn spawn_child(
         cmd.spawn()?
     };
     #[cfg(target_os = "linux")]
-    let mut child = spawn_via_pdeathsig_anchor(spec)?;
+    let mut child = spawn_via_pdeathsig_anchor(spec, pdeath_anchor)?;
     #[cfg(windows)]
     let pid = child.id();
     let stdin = child.stdin.take().expect("piped");

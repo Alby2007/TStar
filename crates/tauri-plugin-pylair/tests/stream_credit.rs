@@ -22,7 +22,11 @@ use tokio::time::timeout;
 
 const T: Duration = Duration::from_secs(30);
 
-fn spawn_h(spec: SpawnSpec, config: SupervisorConfig, events: mpsc::Sender<RuntimeEvent>) -> Handle {
+fn spawn_h(
+    spec: SpawnSpec,
+    config: SupervisorConfig,
+    events: mpsc::Sender<RuntimeEvent>,
+) -> Handle {
     let (h, actor) = spawn(spec, config, events);
     tokio::spawn(actor);
     h
@@ -296,7 +300,11 @@ async fn initial_credit_undeliverable_rejects_stream() {
         Ok(_) => panic!("stream opened despite an undeliverable initial grant"),
         Err(e) => e,
     };
-    assert_eq!(err.code, proto::LIMIT_EXCEEDED, "expected a typed limit error, got {err:?}");
+    assert_eq!(
+        err.code,
+        proto::LIMIT_EXCEEDED,
+        "expected a typed limit error, got {err:?}"
+    );
     assert_eq!(
         err.data.as_ref().and_then(|d| d["limit"].as_str()),
         Some("ctrl_queue"),

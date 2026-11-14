@@ -191,3 +191,65 @@ async fn two_hundred_window_generations_no_leaks_no_stale_events() {
     }
     h.shutdown().await;
 }
+
+/// F3 (rc.15): respawns reuse ONE pdeathsig anchor thread. Pre-fix each
+/// spawn parked a fresh `pylair-pdeath-anchor` thread forever, so crash
+/// and retry respawns stacked threads (~8 MiB of reserved stack each)
+/// that never unwound. Deltas, not absolute counts — other tests in this
+/// process may hold anchors of their own.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn respawns_reuse_one_pdeath_anchor_thread() {
+    use tauri_plugin_pylair::supervisor::pdeath_anchor_threads;
+
+    /// Hello, then die — every generation crashes fast and respawns.
+    const FAKE_DIE_AFTER_HELLO: &str = r#"
+import sys, struct, json
+b = json.dumps({"jsonrpc":"2.0","method":"hello","params":{"protocol":1,"exposes":[]}}).encode()
+sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
+sys.exit(3)
+"#;
+    let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
+    let mut c = cfg();
+    c.breaker_crashes = 50; // let generations cycle; never park in Failed
+    let before = pdeath_anchor_threads();
+    let h = spawn_h(
+        SpawnSpec {
+            program: python(),
+            args: vec!["-c".into(), FAKE_DIE_AFTER_HELLO.into()],
+            env: vec![],
+            cwd: None,
+            ..Default::default()
+        },
+        c,
+        ev,
+    );
+
+    // First spawn brings the anchor up.
+    timeout(T, async {
+        while pdeath_anchor_threads() < before + 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first spawn never created the anchor thread");
+
+    // Generations cycle in ~spawn-time plus a 20-80ms backoff — three
+    // seconds is many respawns even on a slow runner.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        pdeath_anchor_threads(),
+        before + 1,
+        "respawns stacked anchor threads instead of reusing one"
+    );
+
+    // Actor exit drops the job channel; the anchor thread exits too.
+    h.shutdown().await;
+    timeout(T, async {
+        while pdeath_anchor_threads() > before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("anchor thread outlived its supervisor");
+}
