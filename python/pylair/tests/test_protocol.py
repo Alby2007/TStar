@@ -249,6 +249,20 @@ def test_isolated_call(runtime):
     assert runtime.recv()["result"] == 9
 
 
+def test_isolated_fn_in_app_submodule_resolves():
+    """An isolated function may live in a submodule the app imports —
+    the worker resolves it through the registry, not getattr on the app
+    module (testapp_subapp does not re-export sub_ping by name)."""
+    from conftest import Runtime
+
+    with Runtime("testapp_subapp") as rt:
+        rt.recv()  # hello
+        rt.send(call(1, "sub_ping", task=1, input={"text": "hi"}))
+        resp = rt.recv()
+        assert "result" in resp, resp
+        assert resp["result"] == {"echoed": "hi", "via": "testapp_pkg.sub"}
+
+
 def test_isolated_print_does_not_corrupt_result(runtime):
     runtime.recv()
     runtime.send(call(1, "isolated_print", task=1, input={"text": "hi"}))
