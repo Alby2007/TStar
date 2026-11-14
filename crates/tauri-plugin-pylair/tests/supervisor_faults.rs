@@ -169,8 +169,12 @@ fn fast_config() -> SupervisorConfig {
 }
 
 async fn wait_state(h: &Handle, want: State) {
+    wait_state_within(h, want, T).await;
+}
+
+async fn wait_state_within(h: &Handle, want: State, limit: Duration) {
     let mut rx = h.subscribe_state();
-    timeout(T, async {
+    timeout(limit, async {
         while *rx.borrow() != want {
             rx.changed().await.expect("state channel closed");
         }
@@ -573,6 +577,13 @@ async fn vanished_consumer_cancels_the_producer() {
 /// A fake runtime that spawns a heartbeat grandchild, then behaves like
 /// FAKE_READY (or, with `crash`, exits right after hello). The heartbeat
 /// file only keeps growing while the grandchild is alive.
+///
+/// The parent gates its `hello` on the grandchild's first byte: under
+/// load the grandchild's interpreter boot can take many seconds, and a
+/// test asserting on Ready/Failed plus a fixed delay was really just
+/// measuring CPython startup. With the gate, reaching a state *proves*
+/// the first byte landed; the only bound is the supervisor's own
+/// hello_timeout (bumped for these tests via grandchild_config).
 fn runtime_with_grandchild(beat: &std::path::Path, crash: bool) -> String {
     let path = beat.to_string_lossy().replace('\\', "/");
     format!(
@@ -583,6 +594,8 @@ def w(o):
     sys.stdout.buffer.write(struct.pack(">I", len(b)) + b); sys.stdout.buffer.flush()
 subprocess.Popen([sys.executable, "-c",
     "import time\nf = open('{path}', 'a')\nwhile True:\n    f.write('x'); f.flush(); time.sleep(0.1)"])
+while not (os.path.exists('{path}') and os.path.getsize('{path}') > 0):
+    time.sleep(0.05)
 w({{"jsonrpc":"2.0","method":"hello","params":{{"protocol":1,"exposes":[]}}}})
 if {crash}:
     # Keep answering pings (so the supervisor does NOT take its wedged-kill
@@ -607,12 +620,38 @@ fn beat_len(p: &std::path::Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
 }
 
+/// The fixtures gate hello on the first beat byte, so reaching a state
+/// already implies it landed — this poll is a cheap re-check that keeps
+/// the vacuous-pass guard explicit (an empty file here would mean the
+/// gate regressed, not merely a slow boot).
+async fn wait_beat_started(beat: &std::path::Path, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while beat_len(beat) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "beat file still empty 10s after {what} — spawn or first heartbeat never landed"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn assert_heartbeat_stopped(beat: &std::path::Path, what: &str) {
     sleep(Duration::from_millis(500)).await;
     let a = beat_len(beat);
     sleep(Duration::from_millis(700)).await;
     let b = beat_len(beat);
     assert_eq!(a, b, "grandchild kept running after {what}");
+}
+
+/// The grandchild fixtures gate hello on the descendant's first byte,
+/// so spawn→hello includes a full second interpreter boot — well past
+/// fast_config's 2s hello timeout under load. The crash variant runs two
+/// such spawn cycles before Failed, so the state wait needs the same
+/// headroom.
+fn grandchild_config() -> SupervisorConfig {
+    let mut c = fast_config();
+    c.hello_timeout = Duration::from_secs(60);
+    c
 }
 
 fn beat_file(tag: &str) -> std::path::PathBuf {
@@ -627,12 +666,11 @@ async fn shutdown_resolves_only_after_the_whole_tree_is_gone() {
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(64);
     let h = spawn_h(
         spec(&runtime_with_grandchild(&beat, false)),
-        fast_config(),
+        grandchild_config(),
         ev,
     );
-    wait_state(&h, State::Ready).await;
-    sleep(Duration::from_millis(500)).await;
-    assert!(beat_len(&beat) > 0, "grandchild never started");
+    wait_state_within(&h, State::Ready, Duration::from_secs(60)).await;
+    wait_beat_started(&beat, "Ready").await;
 
     timeout(T, h.shutdown())
         .await
@@ -652,14 +690,11 @@ async fn shutdown_resolves_only_after_the_whole_tree_is_gone() {
 async fn runtime_exiting_on_its_own_does_not_leave_descendants() {
     let beat = beat_file("crash");
     let (ev, _rx) = mpsc::channel::<RuntimeEvent>(256);
-    let mut cfg = fast_config();
+    let mut cfg = grandchild_config();
     cfg.breaker_crashes = 2;
     let h = spawn_h(spec(&runtime_with_grandchild(&beat, true)), cfg, ev);
-    wait_state(&h, State::Failed).await;
-    assert!(
-        beat_len(&beat) > 0,
-        "grandchild never started — the test would pass vacuously"
-    );
+    wait_state_within(&h, State::Failed, Duration::from_secs(60)).await;
+    wait_beat_started(&beat, "Failed").await;
     assert_heartbeat_stopped(&beat, "the runtime crashed").await;
     let _ = std::fs::remove_file(&beat);
 }
