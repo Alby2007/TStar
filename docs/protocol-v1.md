@@ -173,16 +173,21 @@ on a generator while it holds credit for that task.
     terminal `TASK_CANCELLED` response. Because the host only forwards
     cancels for tasks of the current generation, a not-yet-registered id
     is always a call still in flight, so `pending` is an acceptance, not
-    a miss.
+    a miss. The runtime tracks the highest task id whose call frame it
+    has handled (host ids only increase and frames arrive in order):
+    only unknown ids **above** that mark are stored as pending — an
+    unknown id at or below it has already finished or been rejected and
+    is answered `task_not_found`, so the pending set stays proportional
+    to the in-flight window rather than every id ever seen.
   - `"terminated"` — an isolated worker was killed and reaped.
   - `"may_continue"` — inline sync work that cannot be interrupted; it
     may run to completion.
   - `"termination_in_progress"` — termination was requested but is not
     confirmed.
 - `cancelled: false, reason: "task_not_found"` — the task already
-  finished (its terminal was emitted and the entry reaped), or the
-  bounded pending set refused a new id. The host maps this to
-  `completed`.
+  finished (its terminal was emitted and the entry reaped), the id sits
+  at or below the high-water mark of handled calls, or the bounded
+  pending set refused a new id. The host maps this to `completed`.
 
 A `pending` ack therefore means "will be cancelled", never "already
 finished" — the host reports `cancelled`, not `completed`.

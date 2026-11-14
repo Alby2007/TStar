@@ -191,6 +191,58 @@ def test_cancel_before_registration_still_terminates(runtime):
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
 
 
+def test_early_cancel_survives_pending_set_eviction(runtime):
+    """More than 4096 cancels for already-seen ids must not evict a
+    genuinely-early cancel: ids below the high-water mark are answered
+    task_not_found, never stored, so the pending set only holds ids
+    greater than every call handled so far."""
+    runtime.recv()
+    # Establish the high-water mark with one real call.
+    runtime.send(call(1, "add", task=100_000, input={"a": 1, "b": 1}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == 2
+    # Flood cancels for ids below the mark — each must answer
+    # task_not_found and none may occupy the pending set.
+    for i in range(4100):
+        runtime.send(proto.request(50_000 + i, "cancel", {"task": 10_000 + i}))
+    # The genuinely-early cancel: the task's call hasn't arrived yet.
+    runtime.send(proto.request(9, "cancel", {"task": 200_000}))
+    ack = runtime.recv_until(lambda m: m.get("id") == 9, timeout=30)
+    assert ack["result"]["cancelled"] is True
+    assert ack["result"]["status"] == "pending"
+    # The call arrives after its cancel — it must end TASK_CANCELLED,
+    # not run to completion because the pending cancel was evicted.
+    runtime.send(call(2, "sleep_forever", task=200_000))
+    terminal = runtime.recv_until(lambda m: m.get("id") == 2, timeout=15)
+    assert terminal["error"]["code"] == proto.TASK_CANCELLED
+
+
+def test_early_credit_survives_pending_set_eviction(runtime):
+    """Same shape for stream credit: grants for ids below the mark are
+    dropped, so a grant that arrives before its call still lands."""
+    runtime.recv()
+    runtime.send(call(1, "add", task=100_000, input={"a": 1, "b": 1}))
+    assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == 2
+    for i in range(4100):
+        runtime.send(grant(10_000 + i, 1))
+    # Grant past n so the pump can reach StopAsyncIteration for the
+    # terminal, not stall on zero credit after the third chunk.
+    runtime.send(grant(200_001, 8))
+    runtime.send(call(2, "counter", task=200_001, input={"n": 3}))
+    chunks = [
+        runtime.recv_until(
+            lambda m: (
+                m.get("method") == "stream.chunk"
+                and m.get("params", {}).get("task") == 200_001
+            ),
+            timeout=15,
+        )
+        for _ in range(3)
+    ]
+    assert [c["params"]["value"] for c in chunks] == [0, 1, 2]
+    terminal = runtime.recv_until(lambda m: m.get("id") == 2, timeout=10)
+    assert terminal["result"] == {"done": True}
+
+
 def test_isolated_call(runtime):
     runtime.recv()
     runtime.send(call(1, "isolated_add", task=1, input={"a": 4, "b": 5}))
@@ -256,6 +308,82 @@ def test_cancel_isolated_kills_sigterm_immune_grandchild(runtime, tmp_path):
         time.sleep(0.1)
     else:
         pytest.fail(f"grandchild {gpid} survived the group kill")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="SIGTERM-grace semantics are posix-specific"
+)
+def test_isolated_cancel_report_does_not_block_dispatch(runtime, tmp_path):
+    """A worker ignoring SIGTERM takes the full grace window to die. The
+    cancel's waiting half must not sit on the dispatch lane: a fast call
+    sent right after the cancel answers inside 1s while the kill is
+    still being awaited."""
+    runtime.recv()
+    ready = tmp_path / "armed"
+    runtime.send(call(1, "sigterm_immune", task=1, input={"ready_file": str(ready)}))
+    deadline = time.time() + 15
+    while not ready.exists():
+        assert time.time() < deadline, "worker never armed"
+        time.sleep(0.05)
+
+    t0 = time.time()
+    runtime.send(proto.request(2, "cancel", {"task": 1}))
+    runtime.send(call(3, "add", task=3, input={"a": 1, "b": 1}))
+    # The terminal and the cancel ack land together once the kill
+    # completes — collect all three frames without discarding any.
+    resp = ack = terminal = None
+    t_resp = None
+    deadline = t0 + 15
+    while resp is None or ack is None or terminal is None:
+        m = runtime.recv(timeout=max(0.1, deadline - time.time()))
+        if m.get("id") == 3:
+            resp, t_resp = m, time.time()
+        elif m.get("id") == 2:
+            ack = m
+        elif m.get("id") == 1:
+            terminal = m
+    assert t_resp - t0 < 1.0, (
+        f"dispatch stalled {t_resp - t0:.2f}s behind an in-flight isolated cancel"
+    )
+    assert resp["result"] == 2
+
+    # The cancel still reports the real outcome once the kill lands.
+    assert ack["result"]["cancelled"] is True
+    assert ack["result"]["status"] == "terminated"
+    assert terminal["error"]["code"] == proto.TASK_CANCELLED
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="SIGTERM-grace semantics are posix-specific"
+)
+def test_two_isolated_cancels_report_concurrently(runtime, tmp_path):
+    """Two slow isolated cancels must overlap: neither ack may be delayed
+    by the other's terminate/reap wait."""
+    runtime.recv()
+    r1, r2 = tmp_path / "r1", tmp_path / "r2"
+    runtime.send(call(1, "sigterm_immune", task=1, input={"ready_file": str(r1)}))
+    runtime.send(call(2, "sigterm_immune", task=2, input={"ready_file": str(r2)}))
+    deadline = time.time() + 15
+    while not (r1.exists() and r2.exists()):
+        assert time.time() < deadline, "workers never armed"
+        time.sleep(0.05)
+
+    t0 = time.time()
+    runtime.send(proto.request(3, "cancel", {"task": 1}))
+    runtime.send(proto.request(4, "cancel", {"task": 2}))
+    t3 = t4 = None
+    deadline = t0 + 15
+    while t3 is None or t4 is None:
+        m = runtime.recv(timeout=max(0.1, deadline - time.time()))
+        if m.get("id") == 3:
+            t3 = time.time()
+        elif m.get("id") == 4:
+            t4 = time.time()
+    assert t3 - t0 < 5.0 and t4 - t0 < 5.0, (
+        f"acks landed {t3 - t0:.2f}s / {t4 - t0:.2f}s after cancel — "
+        "one waited behind the other"
+    )
+    assert abs(t3 - t4) < 1.5, f"acks {abs(t3 - t4):.2f}s apart — serialized"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="posix process groups")
