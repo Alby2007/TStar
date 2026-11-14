@@ -133,6 +133,41 @@ describe("download", () => {
     rmSync(dir, { recursive: true });
   });
 
+  test("a relative redirect resolves against the request URL", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    const to = join(dir, "asset.tar.gz");
+    const seen = [];
+    const get = fakeGet((u, cb) => {
+      seen.push(u);
+      if (u === "https://x/a")
+        return cb(response([], { status: 302, headers: { location: "/cdn/b" } }));
+      return cb(response([Buffer.from("ok-body")]));
+    });
+    await download("https://x/a", to, { get });
+    assert.deepEqual(seen, ["https://x/a", "https://x/cdn/b"]);
+    assert.equal(readFileSync(to, "utf-8"), "ok-body");
+    rmSync(dir, { recursive: true });
+  });
+
+  test("an http:// redirect is refused, not followed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    const to = join(dir, "asset.tar.gz");
+    // https.get throws synchronously on a non-https URL — stand in for
+    // it so the pre-fix crash path is exercised, not hidden.
+    const get = (u, cb) => {
+      if (!u.startsWith("https://")) throw new Error("ERR_INVALID_PROTOCOL");
+      const req = fakeRequest();
+      queueMicrotask(() =>
+        cb(response([], { status: 302, headers: { location: "http://insecure.example/x" } })),
+      );
+      return req;
+    };
+    await assert.rejects(download("https://x/a", to, { get }), /non-https|refus/i);
+    assert.ok(!existsSync(to));
+    assert.ok(!existsSync(`${to}.part`));
+    rmSync(dir, { recursive: true });
+  });
+
   test("a redirect loop hits the cap", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
     const to = join(dir, "asset.tar.gz");

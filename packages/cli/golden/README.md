@@ -11,7 +11,7 @@ Regenerate both after changing testapp, the schema, or the emitter:
 cd python/pylair/tests
 PYTHONPATH=../src python3 -m pylair.codegen testapp \
   | python3 -m json.tool > ../../../packages/cli/golden/testapp.manifest.json
-PYTHONPATH=../src node ../../../packages/cli/dist/cli.js codegen \
+PYTHONPATH=../src node ../../../packages/cli/dist/bin.js codegen \
   --module testapp --python python3 \
   --out ../../../packages/cli/golden/testapp.api.generated.ts
 ```

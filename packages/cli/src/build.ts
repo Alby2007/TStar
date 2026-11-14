@@ -94,52 +94,75 @@ export function download(
       rmSync(part, { force: true });
       rej(e);
     };
-    const follow = (u: string, redirects: number) => {
-      if (redirects > maxRedirects)
-        return fail(
-          new Error(`GET ${url}: too many redirects (cap ${maxRedirects})`),
+    const onErr = (e: unknown) =>
+      fail(e instanceof Error ? e : new Error(String(e)));
+    const follow = (u: string, redirects: number): void => {
+      try {
+        if (redirects > maxRedirects)
+          return fail(
+            new Error(`GET ${url}: too many redirects (cap ${maxRedirects})`),
+          );
+        const req = getImpl(u, (r) => {
+          try {
+            if (r.statusCode! >= 300 && r.statusCode! < 400 && r.headers.location) {
+              // Location may be relative, and only https targets are
+              // fetchable — resolve first, refuse anything else.
+              const target = new URL(r.headers.location, u);
+              if (target.protocol !== "https:")
+                return fail(
+                  new Error(
+                    `GET ${u}: refusing non-https redirect to ${target.origin}`,
+                  ),
+                );
+              return follow(target.href, redirects + 1);
+            }
+            if (r.statusCode !== 200)
+              return fail(new Error(`GET ${u} -> ${r.statusCode}`));
+            const want = Number(r.headers["content-length"]);
+            let got = 0;
+            let ended = false;
+            r.on("data", (c: Buffer) => {
+              got += c.length;
+            });
+            r.on("end", () => {
+              ended = true;
+            });
+            r.on("error", fail);
+            r.on("close", () => {
+              if (!ended)
+                fail(new Error(`GET ${u}: connection dropped mid-body`));
+            });
+            const stream = createWriteStream(part);
+            out = stream;
+            r.pipe(stream);
+            stream.on("finish", () =>
+              stream.close(() => {
+                if (settled) return;
+                if (!Number.isNaN(want) && got !== want)
+                  return fail(
+                    new Error(
+                      `GET ${u}: incomplete body — ${got} of ${want} bytes`,
+                    ),
+                  );
+                settled = true;
+                renameSync(part, to);
+                res();
+              }),
+            );
+            stream.on("error", fail);
+          } catch (e) {
+            onErr(e);
+          }
+        });
+        req.setTimeout(timeoutMs, () =>
+          req.destroy(
+            new Error(`GET ${u}: timed out — no data for ${timeoutMs / 1000}s`),
+          ),
         );
-      const req = getImpl(u, (r) => {
-        if (r.statusCode! >= 300 && r.statusCode! < 400 && r.headers.location)
-          return follow(r.headers.location, redirects + 1);
-        if (r.statusCode !== 200)
-          return fail(new Error(`GET ${u} -> ${r.statusCode}`));
-        const want = Number(r.headers["content-length"]);
-        let got = 0;
-        let ended = false;
-        r.on("data", (c: Buffer) => {
-          got += c.length;
-        });
-        r.on("end", () => {
-          ended = true;
-        });
-        r.on("error", fail);
-        r.on("close", () => {
-          if (!ended) fail(new Error(`GET ${u}: connection dropped mid-body`));
-        });
-        const stream = createWriteStream(part);
-        out = stream;
-        r.pipe(stream);
-        stream.on("finish", () =>
-          stream.close(() => {
-            if (settled) return;
-            if (!Number.isNaN(want) && got !== want)
-              return fail(
-                new Error(`GET ${u}: incomplete body — ${got} of ${want} bytes`),
-              );
-            settled = true;
-            renameSync(part, to);
-            res();
-          }),
-        );
-        stream.on("error", fail);
-      });
-      req.setTimeout(timeoutMs, () =>
-        req.destroy(
-          new Error(`GET ${u}: timed out — no data for ${timeoutMs / 1000}s`),
-        ),
-      );
-      req.on("error", fail);
+        req.on("error", fail);
+      } catch (e) {
+        onErr(e);
+      }
     };
     follow(url, 0);
   });
