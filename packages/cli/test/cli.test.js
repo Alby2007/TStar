@@ -1,13 +1,25 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseBuildArgs } from "../dist/cli.js";
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../dist/bin.js", import.meta.url));
 
 test("--version prints version", () => {
   const out = execFileSync(process.execPath, [cli, "--version"], { encoding: "utf8" });
+  assert.equal(out.trim(), "0.0.0");
+});
+
+// A node_modules/.bin/pylair symlink is how pack-mode apps invoke the
+// CLI — argv[1] is the symlink, not bin.js. Guards the bin entry.
+test("bin runs through a .bin-style symlink", { skip: process.platform === "win32" }, () => {
+  const shim = join(mkdtempSync(join(tmpdir(), "pylair-bin-")), "pylair");
+  symlinkSync(cli, shim);
+  const out = execFileSync(process.execPath, [shim, "--version"], { encoding: "utf8" });
   assert.equal(out.trim(), "0.0.0");
 });
 

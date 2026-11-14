@@ -7,7 +7,6 @@
 import { spawnSync } from "node:child_process";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { build } from "./build.js";
 import { emit } from "./codegen.js";
 import { dev } from "./dev.js";
@@ -148,7 +147,7 @@ function codegen(argv: string[]): number {
   return 0;
 }
 
-function main(argv: string[]): number | Promise<number> {
+export function main(argv: string[]): number | Promise<number> {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "-h") {
     usage();
@@ -198,7 +197,5 @@ function main(argv: string[]): number | Promise<number> {
   return 1;
 }
 
-// Entry guard: importing this module in tests must not run the CLI.
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  Promise.resolve(main(process.argv.slice(2))).then(process.exit);
-}
+// The executable entry is bin.ts — importing this module must not run
+// the CLI (tests import parseBuildArgs/main directly).
