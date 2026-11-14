@@ -250,14 +250,24 @@ class Server:
             return
 
         if proto.is_notification(msg):
-            method, params = msg["method"], msg.get("params") or {}
-            if method == "stream.credit":
-                task_id = params.get("task")
-                n = params.get("n", 0)
-                if isinstance(task_id, (int, str)) and isinstance(n, int) and n > 0:
-                    self._tasks.grant_credit(task_id, n)
-            else:
-                _log(f"unknown notification: {method}")
+            # A notification has no caller to report to — malformed
+            # params drop the frame, never the loop.
+            try:
+                method, params = msg["method"], msg.get("params")
+                if params is None:
+                    params = {}
+                if not isinstance(params, dict):
+                    _log(f"dropping notification {method}: params is not an object")
+                    return
+                if method == "stream.credit":
+                    task_id = params.get("task")
+                    n = params.get("n", 0)
+                    if isinstance(task_id, (int, str)) and isinstance(n, int) and n > 0:
+                        self._tasks.grant_credit(task_id, n)
+                else:
+                    _log(f"unknown notification: {method}")
+            except Exception as e:  # noqa: BLE001 - loop must survive
+                _log(f"notification handler error: {e!r}")
             return
 
         if proto.is_response(msg):
@@ -273,7 +283,17 @@ class Server:
             )
             return
 
-        rid, method, params = msg["id"], msg["method"], msg.get("params") or {}
+        rid, method = msg["id"], msg["method"]
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            self._send(
+                proto.error_response(
+                    rid, proto.INVALID_PARAMS, "params must be an object"
+                )
+            )
+            return
         try:
             if method == "ping":
                 # Unreachable — the reader thread answers pings (§5). Kept
@@ -282,8 +302,11 @@ class Server:
             elif method == "call":
                 await self._call(rid, params)
             elif method == "cancel":
-                result = await self._tasks.cancel(params.get("task"))
-                self._send(proto.response(rid, result))
+                # Synchronous half only — the response is sent by
+                # cancel() itself, or by a spawned waiter for slow
+                # isolated kills, so a terminate/reap never occupies the
+                # dispatch lane.
+                self._tasks.cancel(params.get("task"), rid)
             elif method == "shutdown":
                 self._send(proto.response(rid, {}))
                 self._stopping = True
@@ -312,6 +335,9 @@ class Server:
     async def _call(self, rid: Any, params: dict) -> None:
         fn_name = params.get("fn")
         task_id = params.get("task")
+        # Advance the id high-water mark even on paths that reject below —
+        # the call frame was handled, so a later cancel must not pend.
+        self._tasks.note_call_id(task_id)
         input = params.get("input") or {}
         if not isinstance(input, dict):
             self._send(

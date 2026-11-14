@@ -28,6 +28,10 @@ def _log(msg: str) -> None:
     print(f"[pylair] {msg}", file=sys.stderr, flush=True)
 
 
+def _is_int_id(task_id: Any) -> bool:
+    return isinstance(task_id, int) and not isinstance(task_id, bool)
+
+
 @dataclass
 class Task:
     id: int | str
@@ -50,7 +54,31 @@ class TaskRegistry:
         # hold cancels/credit for not-yet-known ids and apply them at start.
         self._pending_cancels: set[int | str] = set()
         self._pending_credit: dict[int | str, int] = {}
+        # High-water mark of integer task ids whose call frame was
+        # handled. Host ids only increase and frames arrive in order, so
+        # an unknown id <= the mark is finished-or-rejected, never early.
+        self._highest_task_id = 0
         self._isolated = 0
+
+    def note_call_id(self, task_id: int | str) -> None:
+        """Advance the id high-water mark and drop dead early-entries.
+
+        A handled call for T proves every earlier-issued call already
+        arrived, so pendings below T can never be claimed — pruning them
+        keeps the sets proportional to the in-flight window instead of
+        everything the host ever cancelled.
+        """
+        if not _is_int_id(task_id) or task_id <= self._highest_task_id:
+            return
+        self._highest_task_id = task_id
+        self._pending_cancels = {
+            t for t in self._pending_cancels if not (_is_int_id(t) and t < task_id)
+        }
+        self._pending_credit = {
+            t: n
+            for t, n in self._pending_credit.items()
+            if not (_is_int_id(t) and t < task_id)
+        }
 
     def get(self, task_id: int | str) -> Task | None:
         return self._tasks.get(task_id)
@@ -331,11 +359,18 @@ class TaskRegistry:
     def grant_credit(self, task_id: int | str, n: int) -> bool:
         task = self._tasks.get(task_id)
         if task is None or task.done:
+            if _is_int_id(task_id) and task_id <= self._highest_task_id:
+                return False  # finished or rejected — never registers
             # Credit that outran its call: hold it for registration instead
             # of losing it (control lane is independent of the data lane).
             if len(self._pending_credit) < 4096:
                 self._pending_credit[task_id] = min(
                     self._pending_credit.get(task_id, 0) + n, MAX_STREAM_CREDIT
+                )
+            else:
+                _log(
+                    "pending-credit map hit its 4096 backstop — "
+                    f"dropping early credit for task {task_id!r}"
                 )
             return False
         # Defensive clamp (RC.8A): the host enforces the outstanding-credit
@@ -344,46 +379,76 @@ class TaskRegistry:
         task.credit_event.set()
         return True
 
-    async def cancel(self, task_id: int | str) -> dict:
+    def cancel(self, task_id: int | str, call_id: int | str | None = None) -> None:
+        """Cancel a task — synchronous half, in dispatch order.
+
+        Sends the cancel response for `call_id` (None = internal shutdown
+        use, no response is owed). For isolated tasks the terminate/reap
+        outcome is reported by a spawned waiter so a slow kill never
+        occupies the dispatch lane.
+        """
         task = self._tasks.get(task_id)
         if task is None:
-            # A cancel can outrun the call that creates the task (the
-            # host's control lane beats the data lane) — record it so it
-            # lands at registration, never run untracked. The supervisor
-            # only forwards cancels for in-generation tasks, so an
-            # unknown id means the call frame is still in flight: the
-            # cancel is accepted pending arrival, not refused.
-            if len(self._pending_cancels) < 4096:
+            if _is_int_id(task_id) and task_id <= self._highest_task_id:
+                # Below the high-water mark the call already arrived and
+                # finished or was rejected — a late cancel, not early.
+                result = {"cancelled": False, "reason": "task_not_found"}
+            elif len(self._pending_cancels) < 4096:
+                # A cancel can outrun the call that creates the task (the
+                # host's control lane beats the data lane) — record it so
+                # it lands at registration, never run untracked. An
+                # unknown id above the mark means the call frame is still
+                # in flight: the cancel is accepted pending arrival.
                 self._pending_cancels.add(task_id)
-                return {"cancelled": True, "status": "pending"}
-            return {"cancelled": False, "reason": "task_not_found"}
-        if task.done:
-            return {"cancelled": False, "reason": "task_not_found"}
-        if task.asyncio_task is not None and not task.asyncio_task.done():
+                result = {"cancelled": True, "status": "pending"}
+            else:
+                _log(
+                    "pending-cancel set hit its 4096 backstop — "
+                    f"dropping early cancel for task {task_id!r}"
+                )
+                result = {"cancelled": False, "reason": "task_not_found"}
+        elif task.done:
+            result = {"cancelled": False, "reason": "task_not_found"}
+        elif task.asyncio_task is not None and not task.asyncio_task.done():
             task.asyncio_task.cancel()
             asyncio.create_task(self._ensure_terminal(task))
             if task.kind == "isolated":
-                # Report what ACTUALLY happened (RC.6B): wait for the
-                # terminate/force-kill/reap path within a bound, then say so.
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(task.asyncio_task),
-                        timeout=ISOLATED_GRACE_S + 2.0,
-                    )
-                    return {"cancelled": True, "status": "terminated"}
-                except asyncio.CancelledError:
-                    return {"cancelled": True, "status": "terminated"}
-                # An outcome we can't classify means "may still be running".
-                except BaseException:  # noqa: BLE001 - deliberate catch-all
-                    return {"cancelled": True, "status": "termination_in_progress"}
+                if call_id is not None:
+                    asyncio.create_task(self._report_isolated_cancel(task, call_id))
+                return
             if task.kind == "sync":
                 # Inline sync runs on an executor thread — it cannot be
                 # interrupted. The caller sees TASK_CANCELLED; the Python
                 # may run to completion. Say so — never claim it stopped.
-                return {"cancelled": True, "status": "may_continue"}
-        # Ack immediately; the terminal response follows via the task's own
-        # handler or the finisher below — exactly once, _finish dedupes.
-        return {"cancelled": True}
+                result = {"cancelled": True, "status": "may_continue"}
+            else:
+                # Ack immediately; the terminal response follows via the
+                # task's own handler or the finisher — exactly once,
+                # _finish dedupes.
+                result = {"cancelled": True}
+        else:
+            result = {"cancelled": True}
+        if call_id is not None:
+            self._send(proto.response(call_id, result))
+
+    async def _report_isolated_cancel(self, task: Task, call_id: int | str) -> None:
+        """Awaiting half of an isolated cancel: report what ACTUALLY
+        happened (RC.6B) — the terminate/force-kill/reap outcome within
+        a bound strictly inside the host's cancel_timeout (5 s). The old
+        bound (GRACE+2 s) equalled the host's — the response could lose
+        the race and surface as RUNTIME_WEDGED."""
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task.asyncio_task),
+                timeout=ISOLATED_GRACE_S + 1.0,
+            )
+            result = {"cancelled": True, "status": "terminated"}
+        except asyncio.CancelledError:
+            result = {"cancelled": True, "status": "terminated"}
+        # An outcome we can't classify means "may still be running".
+        except BaseException:  # noqa: BLE001 - deliberate catch-all
+            result = {"cancelled": True, "status": "termination_in_progress"}
+        self._send(proto.response(call_id, result))
 
     async def _ensure_terminal(self, task: Task) -> None:
         """Guarantee a terminal response even if the handler never ran.
@@ -408,7 +473,7 @@ class TaskRegistry:
     async def cancel_all(self) -> None:
         for task in self._tasks.values():
             if not task.done:
-                await self.cancel(task.id)
+                self.cancel(task.id)  # sync — all kills start together
         # cancel() only SCHEDULES the terminal-emitting finisher. On
         # shutdown the loop closes right after this returns, so wait for
         # the cancelled tasks to end — the finishers emit TASK_CANCELLED

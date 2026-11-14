@@ -224,12 +224,16 @@ def test_early_credit_survives_pending_set_eviction(runtime):
     assert runtime.recv_until(lambda m: m.get("id") == 1)["result"] == 2
     for i in range(4100):
         runtime.send(grant(10_000 + i, 1))
-    runtime.send(grant(200_001, 3))
+    # Grant past n so the pump can reach StopAsyncIteration for the
+    # terminal, not stall on zero credit after the third chunk.
+    runtime.send(grant(200_001, 8))
     runtime.send(call(2, "counter", task=200_001, input={"n": 3}))
     chunks = [
         runtime.recv_until(
-            lambda m: m.get("method") == "stream.chunk"
-            and m.get("params", {}).get("task") == 200_001,
+            lambda m: (
+                m.get("method") == "stream.chunk"
+                and m.get("params", {}).get("task") == 200_001
+            ),
             timeout=15,
         )
         for _ in range(3)
@@ -325,18 +329,27 @@ def test_isolated_cancel_report_does_not_block_dispatch(runtime, tmp_path):
     t0 = time.time()
     runtime.send(proto.request(2, "cancel", {"task": 1}))
     runtime.send(call(3, "add", task=3, input={"a": 1, "b": 1}))
-    resp = runtime.recv_until(lambda m: m.get("id") == 3, timeout=10)
-    elapsed = time.time() - t0
-    assert elapsed < 1.0, (
-        f"dispatch stalled {elapsed:.2f}s behind an in-flight isolated cancel"
+    # The terminal and the cancel ack land together once the kill
+    # completes — collect all three frames without discarding any.
+    resp = ack = terminal = None
+    t_resp = None
+    deadline = t0 + 15
+    while resp is None or ack is None or terminal is None:
+        m = runtime.recv(timeout=max(0.1, deadline - time.time()))
+        if m.get("id") == 3:
+            resp, t_resp = m, time.time()
+        elif m.get("id") == 2:
+            ack = m
+        elif m.get("id") == 1:
+            terminal = m
+    assert t_resp - t0 < 1.0, (
+        f"dispatch stalled {t_resp - t0:.2f}s behind an in-flight isolated cancel"
     )
     assert resp["result"] == 2
 
     # The cancel still reports the real outcome once the kill lands.
-    ack = runtime.recv_until(lambda m: m.get("id") == 2, timeout=10)
     assert ack["result"]["cancelled"] is True
     assert ack["result"]["status"] == "terminated"
-    terminal = runtime.recv_until(lambda m: m.get("id") == 1, timeout=10)
     assert terminal["error"]["code"] == proto.TASK_CANCELLED
 
 
