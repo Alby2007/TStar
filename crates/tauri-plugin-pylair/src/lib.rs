@@ -52,6 +52,14 @@ pub fn release_spawn_spec(resources: &Path, app_module: &str, source_dir: &str) 
     // bundled runtime is 3.12) removes the implicit entry; PYTHONPATH
     // above still resolves the app module and bundled site-packages.
     spec.env.push(("PYTHONSAFEPATH".into(), "1".into()));
+    // The bundle is precompiled at build time and the install dir is
+    // often read-only (per-machine installs, .app bundles): never write
+    // bytecode at launch. Isolated workers inherit os.environ, so they
+    // are covered too — same for subprocesses the app itself spawns,
+    // unless that call passes its own env. Dev mode is untouched:
+    // __pycache__ in the source tree is normal and useful there.
+    spec.env
+        .push(("PYTHONDONTWRITEBYTECODE".into(), "1".into()));
     // Pin cwd to the bundle rather than whatever dir launched the app —
     // deterministic for any code that opens relative paths, and empty
     // of user-writable shadow candidates.
@@ -1068,6 +1076,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, json!({"task": 7, "protocol": 2}));
+    }
+
+    #[test]
+    fn release_spec_forbids_bytecode_writes() {
+        // rc.15 H: the bundle ships precompiled pycs and the install dir
+        // is often read-only — the runtime must never write bytecode.
+        // Isolated workers and app subprocesses inherit os.environ, so
+        // this one var covers the whole tree.
+        let spec = release_spawn_spec(Path::new("/res"), "backend.app", "backend");
+        assert!(
+            spec.env
+                .contains(&("PYTHONDONTWRITEBYTECODE".into(), "1".into())),
+            "release spawn spec must set PYTHONDONTWRITEBYTECODE=1"
+        );
+        assert!(
+            !spec
+                .env_remove
+                .iter()
+                .any(|k| k == "PYTHONDONTWRITEBYTECODE"),
+            "the var must survive into the child env"
+        );
     }
 
     #[test]

@@ -310,6 +310,11 @@ Environment hygiene narrows the edge further: packaged spawns scrub the
 `PYTHONUSERBASE`, `PYTHONINSPECT`, `PYTHONPLATLIBDIR`, `PYTHONWARNINGS`,
 `PYTHONBREAKPOINT`) and set `PYTHONNOUSERSITE`/`PYTHONUTF8`, so the
 bundled interpreter can't be redirected by whatever launched the app.
+`PYTHONDONTWRITEBYTECODE=1` stops the runtime writing `__pycache__`
+next to its code — the bundle ships precompiled pycs (see
+`docs/build.md`), and the install dir is not necessarily writable —
+and app code inherits it: a packaged app that wants a writable cache
+must put it somewhere appropriate itself.
 `PYTHONSAFEPATH=1` keeps the child's cwd off `sys.path` — a `json.py` or
 `pylair/` in the launch directory would otherwise shadow the stdlib or
 the runtime itself for `python -m` — and the packaged cwd is pinned to
