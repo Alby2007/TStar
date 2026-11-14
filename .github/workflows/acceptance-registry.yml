@@ -146,6 +146,32 @@ jobs:
                capabilities/selftest-winb.json
             echo "PYLAIR_WINB_CAP=1" >> "$GITHUB_ENV"
             echo "two-window self-test capability written (resolved crate carries the permission)"
+            # The stderr probe additionally needs the resolved crate's
+            # stderr_targets filter: a published crate predating it
+            # broadcasts stderr by design and would fail on the missing
+            # feature. Grep the lockfile-pinned crate source; the client
+            # self-test skips the probe when the fixture is absent.
+            CRATE_VER=$(grep -A1 'name = "tauri-plugin-pylair"' Cargo.lock \
+              | grep -o 'version = "[^"]*"' | head -1 | cut -d'"' -f2)
+            LIBRS=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+              -path "*tauri-plugin-pylair-$CRATE_VER/src/lib.rs" -print -quit 2>/dev/null)
+            if [ -n "$LIBRS" ] && grep -q "stderr_targets" "$LIBRS"; then
+              # The stderr-scoping check needs an exposed function writing
+              # to stderr; the template deliberately ships without one (a
+              # test-only fixture must not ship).
+              cat >> ../backend/app.py <<'PYEOF'
+
+          import sys
+
+
+          @expose
+          def log_stderr(msg: str) -> None:
+              print(msg, file=sys.stderr)
+          PYEOF
+              echo "log_stderr appended (resolved crate carries stderr scoping)"
+            else
+              echo "resolved crate predates stderr scoping — stderr probe skipped"
+            fi
           else
             echo "resolved crate predates python_selftest_b_report — two-window self-test skipped"
           fi

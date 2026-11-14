@@ -325,6 +325,19 @@ jobs:
           # it here so the installed two-window self-test can run.
           cp examples/reference-app/src-tauri/capabilities/selftest-winb.json \
              app-under-test/src-tauri/capabilities/
+          # The stderr-scoping check needs an exposed function that writes
+          # to stderr; the template deliberately ships without one (a
+          # test-only fixture must not ship), so CI appends the same
+          # function the reference backend carries.
+          cat >> app-under-test/backend/app.py <<'PYEOF'
+
+          import sys
+
+
+          @expose
+          def log_stderr(msg: str) -> None:
+              print(msg, file=sys.stderr)
+          PYEOF
       # After scaffolding: restoring the cache earlier creates
       # src-tauri/target, and the scaffolder rightly refuses a
       # non-empty target directory.
