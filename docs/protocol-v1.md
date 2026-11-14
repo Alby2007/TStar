@@ -209,6 +209,10 @@ Host-side states (emitted to the UI as events):
 (liveness warning, §5) and `stopped` (clean terminal after `shutdown` —
 host-side only, never emitted by the runtime).
 
+`StateChanged.detail` is informational only — free text for humans and
+logs. Clients must not match on its wording; the state machine is
+`from`/`to`, nothing else.
+
 1. Host spawns the process, state `starting`.
 2. Runtime's **first stdout frame must be `hello`**:
    `{protocol: 1, runtime_version, python_version, exposes: [{name, kind, signature, doc}]}`
@@ -217,8 +221,12 @@ host-side only, never emitted by the runtime).
      where `schema` is the annotation map defined in docs/codegen.md (the
      same schema `pylair codegen` consumes). `doc` is the function's
      docstring or null — used for generated JSDoc.
-3. `HELLO_TIMEOUT = 15s`. No hello → kill → `crashed` → backoff →
-   `restarting`.
+3. `HELLO_TIMEOUT = 30s` default. Settable via the
+   `PYLAIR_HELLO_TIMEOUT_MS` env var (milliseconds) or
+   `Builder::hello_timeout(Duration)`; every source is clamped to
+   1s..=600s and a clamp is logged on `pylair://stderr`. No hello →
+   kill → `crashed` → backoff → `restarting`. The failure detail names
+   both configuration knobs.
 4. `protocol` mismatch → `failed` immediately (no restart — retrying
    can't fix a version skew). Error message names both versions.
 
