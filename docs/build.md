@@ -21,9 +21,11 @@ pyproject.toml [tool.pylair] + src-tauri/tauri.conf.json
    the no-lockfile fallback, with a drift warning)
 3. copy the app source dir into src-tauri/resources/
 4. prune the staged tree (default deny-list + app additions)
-5. import-check the app module with the staged tree
-6. npx tauri build
-7. warn loudly if no signing credentials are configured
+5. precompile bytecode for site-packages and the app source with the
+   bundled interpreter (checked-hash pycs — see below)
+6. import-check the app module with the staged tree
+7. npx tauri build
+8. warn loudly if no signing credentials are configured
 ```
 
 ## Network access on first build
@@ -88,7 +90,7 @@ Default deny-list (globs relative to `src-tauri/resources/`):
 | `pydoc_data`, `ensurepip`, `venv`, `share` | docs topics, pip bootstrap, man pages |
 | `site-packages/pip*`, `_distutils_hack` | pip is dead weight post-install |
 | `site-packages/*/tests`, `*/test` | per-package test suites (numpy's is ~25 MB) |
-| `**/*.pyc`, `**/__pycache__` | regenerated caches |
+| `**/*.pyc`, `**/__pycache__` | staging leftovers — the bundle ships its own pycs (next section) |
 
 Deliberately **not** pruned:
 - `*/testing` — `numpy.testing`, `pandas.testing`, `torch.testing` are
@@ -104,6 +106,39 @@ build time, not on the user's machine.
 Apps extend it via `prune = [...]`. If an app genuinely ships a package
 named `tests` or needs pip at runtime (e.g. a plugin installer), that entry
 belongs in a future `prune-exclude` — for now, deny-list is deny-list.
+
+## Precompiled bytecode
+
+After pruning — so denied dirs never get compiled — the build runs
+`python -m compileall` on `site-packages/` and the staged app source
+using the **bundled** interpreter, guaranteeing the pyc magic number
+matches the runtime that will load them. This matters because the
+install dir is not necessarily writable (per-machine Program Files
+installs, signed `.app` bundles, mounted AppImages): without shipped
+pycs the app would compile its whole Python tree in memory on *every*
+launch, paying the cold-start cost each time. Packaged spawns also set
+`PYTHONDONTWRITEBYTECODE=1` (see `docs/security.md` §8), so nothing ever
+writes `__pycache__` into the install dir.
+
+Invalidation mode is `checked-hash`, chosen deliberately:
+
+- **timestamp (compileall default) — rejected.** Installers rewrite
+  mtimes (NSIS/WiX normalize them); a timestamp pyc whose recorded
+  mtime no longer matches the source file is silently ignored, which
+  recreates the every-launch recompile this step exists to remove.
+- **unchecked-hash** is the fastest — the loader trusts the pyc and
+  never stats or hashes the source. Correct for immutable bundles, but
+  a post-install source edit would silently run stale bytecode.
+- **checked-hash** reads and hashes the source once per import — the
+  measured cost on a numpy-sized tree is within noise of unchecked
+  (~0–10ms), and an edited source recompiles correctly instead of
+  running stale code. The safety costs nothing measurable.
+
+Compilation is deterministic: `compileall` runs with cwd =
+`src-tauri/resources/` and relative dir arguments, so `co_filename` is
+bundle-relative (`site-packages/numpy/...`). The build path is never
+embedded, identical inputs produce identical pycs on any machine, and
+tracebacks in installed apps show the paths the user actually has.
 
 ## No cross-compiling
 

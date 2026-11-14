@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -9,7 +9,7 @@ import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 
 import { matchGlob } from "../dist/glob.js";
-import { stageNotices, download, ensureTarball } from "../dist/build.js";
+import { stageNotices, download, ensureTarball, PYC_INVALIDATION_MODE } from "../dist/build.js";
 import { DEFAULT_PRUNE, prune } from "../dist/prune.js";
 import { loadConfig } from "../dist/config.js";
 
@@ -77,6 +77,141 @@ describe("prune", () => {
     assert.equal(r.removed, 1);
     rmSync(dir, { recursive: true });
   });
+});
+
+describe("compileBytecode", () => {
+  const py = (() => {
+    for (const c of ["python3", "python"]) {
+      const r = spawnSync(c, ["-c", "import sys;sys.exit(0 if sys.version_info>=(3,12) else 1)"]);
+      if (r.status === 0) return c;
+    }
+    return null;
+  })();
+  const PYC_FLAGS = { timestamp: 0, "unchecked-hash": 1, "checked-hash": 3 };
+  const expectedFlags = () => PYC_FLAGS[PYC_INVALIDATION_MODE];
+
+  /** Flags word = bytes 4..8 of the pyc header (u32 LE); bytes 8+ are
+   *  mtime+size for timestamp pycs or the siphash for hash-based. */
+  const pycFlags = (p) => readFileSync(p).readUInt32LE(4);
+
+  function pyTree() {
+    const dir = mkdtempSync(join(tmpdir(), "pylair-pyc-"));
+    for (const [f, src] of [
+      ["site-packages/numpy/__init__.py", "x = 1"],
+      ["site-packages/numpy/tests/t.py", "y = 2"],
+      ["site-packages/pip/__init__.py", "z = 3"],
+      ["backend/app.py", "a = 4"],
+    ]) {
+      const p = join(dir, f);
+      mkdirSync(join(p, ".."), { recursive: true });
+      writeFileSync(p, src);
+    }
+    return dir;
+  }
+
+  test(
+    "shipped dirs get checked-hash pycs; pruned dirs get none",
+    { skip: !py },
+    async () => {
+      const { compileBytecode } = await import("../dist/build.js");
+      const dir = pyTree();
+      // The build order: prune FIRST, then compile what survives.
+      prune(dir, DEFAULT_PRUNE);
+      compileBytecode(dir, py, ["site-packages", "backend"]);
+
+      // pyc naming carries the interpreter tag — find it by glob-in-dir.
+      const cache = join(dir, "site-packages", "numpy", "__pycache__");
+      const names = existsSync(cache) ? readdirSync(cache) : [];
+      assert.ok(
+        names.some((n) => n.startsWith("__init__.cpython-") && n.endsWith(".pyc")),
+        `site-packages module must be precompiled, found ${names}`,
+      );
+      const pyc = join(cache, names[0]);
+      assert.equal(
+        pycFlags(pyc),
+        expectedFlags(),
+        `pyc flags must be ${PYC_INVALIDATION_MODE} (${expectedFlags()})`,
+      );
+
+      const backendCache = join(dir, "backend", "__pycache__");
+      assert.ok(
+        existsSync(backendCache) && readdirSync(backendCache).length === 1,
+        "backend source must be precompiled too",
+      );
+      assert.equal(pycFlags(join(backendCache, readdirSync(backendCache)[0])), expectedFlags());
+
+      // Pruned dirs must contain no pycs at all.
+      for (const gone of ["site-packages/numpy/tests", "site-packages/pip"])
+        assert.ok(!existsSync(join(dir, gone)), `${gone} was pruned, cannot hold pycs`);
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
+
+  test(
+    "precompiled pycs actually load — `python -v` reports 'code object from'",
+    { skip: !py },
+    async () => {
+      const { compileBytecode } = await import("../dist/build.js");
+      const dir = mkdtempSync(join(tmpdir(), "pylair-pycload-"));
+      const pkg = join(dir, "site-packages", "wibble");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(pkg, "__init__.py"), "\n");
+      writeFileSync(join(pkg, "mod.py"), "VALUE = 7\n");
+      compileBytecode(dir, py, ["site-packages"]);
+      // -v prints `# code object from '<pyc>'` when the importer decodes
+      // a cached pyc — the proof the bundle's pycs are used, not ignored.
+      const r = spawnSync(py, ["-v", "-c", "import wibble.mod"], {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          PYTHONPATH: join(dir, "site-packages"),
+          PYTHONNOUSERSITE: "1",
+          PYTHONDONTWRITEBYTECODE: "1",
+        },
+      });
+      assert.equal(r.status, 0, String(r.stderr).slice(-500));
+      assert.match(
+        r.stderr,
+        /code object from '.*wibble.*mod\.cpython-\d+\.pyc'/,
+        "importer did not decode the bundled pyc",
+      );
+      assert.doesNotMatch(
+        r.stderr,
+        /wrote bytecode '.*wibble/,
+        "importer recompiled instead of using the pyc",
+      );
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
+
+  test(
+    "checked-hash revalidates: editing the source after build recompiles",
+    { skip: !py || PYC_INVALIDATION_MODE !== "checked-hash" },
+    async () => {
+      const { compileBytecode } = await import("../dist/build.js");
+      const dir = mkdtempSync(join(tmpdir(), "pylair-pycedit-"));
+      const pkg = join(dir, "site-packages", "wobble");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(pkg, "__init__.py"), "\n");
+      writeFileSync(join(pkg, "mod.py"), "VALUE = 1\n");
+      compileBytecode(dir, py, ["site-packages"]);
+      writeFileSync(join(pkg, "mod.py"), "VALUE = 2\n");
+      const r = spawnSync(
+        py,
+        ["-c", "import wobble.mod, sys; sys.exit(0 if wobble.mod.VALUE == 2 else 9)"],
+        {
+          env: {
+            ...process.env,
+            PYTHONPATH: join(dir, "site-packages"),
+            PYTHONNOUSERSITE: "1",
+            PYTHONDONTWRITEBYTECODE: "1",
+          },
+        },
+      );
+      assert.equal(r.status, 0, "edited source must win over the stale pyc");
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 });
 
 describe("download", () => {

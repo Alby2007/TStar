@@ -310,6 +310,44 @@ function run(cmd: string, args: string[], cwd: string) {
   if (r.status !== 0) throw new Error(`${cmd} ${args.join(" ")} exited ${r.status}`);
 }
 
+/** pyc invalidation mode shipped in installers — see docs/build.md.
+ * checked-hash: installers rewrite mtimes, so timestamp pycs silently
+ * invalidate; hash-based headers survive repackaging. checked (not
+ * unchecked) re-validates the source hash per import — ~10ms slower on
+ * a numpy-sized tree but a post-install source edit recompiles instead
+ * of running stale bytecode. Measured (Windows, numpy tree):
+ * ~665ms no-pyc / ~267ms checked / ~256ms unchecked per cold import.
+ */
+export const PYC_INVALIDATION_MODE = "checked-hash" as const;
+
+/** Precompile the staged .py tree with the BUNDLED interpreter — same
+ * CPython and magic number as the runtime that will load the pycs.
+ * An installed app (possibly read-only) must not compile its Python on
+ * every launch. Runs post-prune so denied dirs stay uncompiled, and
+ * relative args + cwd keep co_filename bundle-relative: identical pycs
+ * regardless of build path, tracebacks show `site-packages/…`.
+ * `-s`/`-d` would also work; relative args are the smallest version of
+ * the same thing. */
+export function compileBytecode(resources: string, python: string, dirs: string[]): void {
+  const existing = dirs.filter((d) => existsSync(join(resources, d)));
+  if (!existing.length) return;
+  run(
+    python,
+    [
+      "-m",
+      "compileall",
+      "-q",
+      "-f",
+      "-j",
+      "0",
+      "--invalidation-mode",
+      PYC_INVALIDATION_MODE,
+      ...existing,
+    ],
+    resources,
+  );
+}
+
 // ── macOS ad-hoc signing ──────────────────────────────────────────────
 // Mach-O magic numbers, read as the first BE u32 — includes the
 // byte-swapped forms and both fat headers.
@@ -634,12 +672,18 @@ export async function build(opts: BuildOptions): Promise<void> {
   const mib = (res.bytesFreed / 2 ** 20).toFixed(1);
   console.log(`pruned ${res.removed} paths (${mib} MiB) from staged resources`);
 
+  // Precompile what survives the prune — read-only installs cannot
+  // write pycs at launch, so the bundle ships them ready-made.
+  compileBytecode(resources, bundled, ["site-packages", cfg.source]);
+
   // Over-pruning must fail at build time, not on the user's machine:
   // import the app module with the staged tree exactly as the bundle sees it.
   const sep = isWin ? ";" : ":";
   // The import root is the PARENT of the staged source dir ("backend.app"
   // resolves from resources/, not resources/backend/). Run from an unrelated
   // cwd so the project checkout can't satisfy the import by accident.
+  // PYTHONDONTWRITEBYTECODE: the check exercises the compiled pycs rather
+  // than writing a second, non-deterministic set into the staged tree.
   const check = spawnSync(
     bundled,
     ["-c", `import ${cfg.appModule}; print("staged import ok")`],
@@ -650,6 +694,7 @@ export async function build(opts: BuildOptions): Promise<void> {
         ...process.env,
         PYTHONPATH: `${importRoot(resources, cfg.source)}${sep}${join(resources, "site-packages")}`,
         PYTHONNOUSERSITE: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
       },
     },
   );
