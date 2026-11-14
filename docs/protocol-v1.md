@@ -111,7 +111,17 @@ All messages carry `"jsonrpc": "2.0"`.
   streaming into a `call()` that drops every chunk or a `stream()` that
   silently ends. Older hosts omit it → no validation.
 - `input`: the single JSON argument object, matching the generated TS
-  client call shape `python.<fn>({...})`.
+  client call shape `python.<fn>({...})`. **What the client accepts**
+  (`toWire`): `null`, `undefined`, booleans, numbers, strings, arrays,
+  plain objects (null-prototype included), `Uint8Array` (→ `$b64`), and
+  class instances carrying plain data — own enumerable props are the
+  intent, same as `{...x}` spread. Anything whose data doesn't live in
+  own enumerable props is a TypeError naming the path: `Date`, `Map`,
+  `Set`, `RegExp`, `Promise`, `Error`, `ArrayBuffer`, typed arrays other
+  than `Uint8Array`, functions, symbols, `bigint`, non-plain objects
+  with zero own enumerable props (would serialize as `{}`), and
+  circular references. `undefined`/`NaN`/`Infinity` keep JSON
+  semantics — omitted in objects, `null` in arrays.
 
 ### Responses (runtime → host)
 

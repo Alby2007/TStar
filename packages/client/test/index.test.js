@@ -417,6 +417,119 @@ test("stream terminal LIMIT_EXCEEDED throws LimitExceededError with .limit", asy
   );
 });
 
+// ---- rc.15 PR I: input typing, call/stream mismatch, abort hygiene ----
+
+/** A rejected-in-microtask promise vs a still-pending marker — lets the
+ *  red phase fail cleanly where unfixed code would leave the call
+ *  hanging instead of rejecting synchronously. */
+const settledNow = (p) =>
+  Promise.race([p.catch((e) => e), tick().then(() => "still-pending")]);
+
+test("toWire rejects a Date naming the path, before any invoke", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("f", { when: new Date(0) });
+  const out = await settledNow(p);
+  assert.ok(
+    out instanceof TypeError && /input\.when is a Date/.test(out.message),
+    `expected TypeError naming input.when, got ${out}`,
+  );
+  assert.equal(b.calls.length, 0, "rejected input must not reach the bridge");
+});
+
+test("toWire rejects Map, Set, RegExp, Promise, non-Uint8Array views", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const cases = [
+    [{ m: new Map() }, /input\.m is a Map/],
+    [{ s: new Set([1]) }, /input\.s is a Set/],
+    [{ r: /x/ }, /input\.r is a RegExp/],
+    [{ p: Promise.resolve(1) }, /input\.p is a Promise/],
+    [{ f: new Float64Array(2) }, /input\.f is a Float64Array/],
+    [{ ab: new ArrayBuffer(4) }, /input\.ab is an ArrayBuffer/],
+  ];
+  for (const [input, re] of cases) {
+    const p = call("f", input);
+    const out = await settledNow(p);
+    assert.ok(out instanceof TypeError && re.test(out.message), `${re} got ${out}`);
+  }
+  assert.equal(b.calls.length, 0);
+});
+
+test("toWire rejects function, symbol, bigint values by name", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const cases = [
+    [{ fn: () => 1 }, /input\.fn is a function/],
+    [{ sym: Symbol("s") }, /input\.sym is a symbol/],
+    [{ big: 10n }, /input\.big is a bigint/],
+  ];
+  for (const [input, re] of cases) {
+    const p = call("f", input);
+    const out = await settledNow(p);
+    assert.ok(out instanceof TypeError && re.test(out.message), `${re} got ${out}`);
+  }
+  assert.equal(b.calls.length, 0);
+});
+
+test("toWire names the nested path", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const p = call("f", { outer: { list: [1, { when: new Date(0) }] } });
+  const out = await settledNow(p);
+  assert.ok(/input\.outer\.list\[1\]\.when is a Date/.test(out?.message ?? ""), `got ${out}`);
+});
+
+test("toWire rejects circular input naming the path", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const cyc = { a: {} };
+  cyc.a.back = cyc;
+  const p = call("f", cyc);
+  const out = await settledNow(p);
+  assert.ok(out instanceof TypeError && /circular/.test(out.message), `got ${out}`);
+});
+
+test("class instances serialize own enumerable props; empty ones throw", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  class Point {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+    }
+    dist() {
+      return Math.hypot(this.x, this.y);
+    }
+  }
+  const p = call("f", { pt: new Point(3, 4) });
+  await tick();
+  assert.deepEqual(b.calls.at(-1).args.input, { pt: { x: 3, y: 4 } });
+  b.emitTask(100, streamDone(100, "ok"));
+  await p;
+
+  class Empty {}
+  const q = call("f", { e: new Empty() });
+  const out = await settledNow(q);
+  assert.ok(out instanceof TypeError && /input\.e.*Empty/.test(out.message), `got ${out}`);
+});
+
+test("plain objects, null-proto objects, arrays, Uint8Array still pass", async () => {
+  const b = fakeBridge();
+  setBridge(b);
+  const nullo = Object.create(null);
+  nullo.k = "v";
+  const p = call("f", { o: { a: 1 }, arr: [1, "x"], nullo, bytes: new Uint8Array([1, 2]) });
+  await tick();
+  const input = b.calls.at(-1).args.input;
+  assert.deepEqual(input.o, { a: 1 });
+  assert.deepEqual(input.arr, [1, "x"]);
+  assert.deepEqual(input.nullo, { k: "v" });
+  assert.ok(input.bytes && typeof input.bytes === "object" && "$b64" in input.bytes);
+  b.emitTask(100, streamDone(100, null));
+  await p;
+});
+
 test("call() on a stream function fails 'use stream()' and cancels the task", async () => {
   const b = fakeBridge();
   setBridge(b);
@@ -441,8 +554,6 @@ test("call() on a stream function fails 'use stream()' and cancels the task", as
     "the mismatched task must be cancelled, not left running",
   );
 });
-
-// ---- rc.15 PR I4: abort-listener hygiene ----
 
 test("a long-lived AbortSignal keeps zero listeners after 1000 settled calls", async () => {
   const { getEventListeners } = await import("node:events");

@@ -207,17 +207,81 @@ function b64decode(b64: string): Uint8Array {
   return u8;
 }
 
-function toWire(v: unknown): unknown {
+/**
+ * Types whose own enumerable properties do NOT capture their data —
+ * serializing them produces `{}` (or garbage) and silently loses the
+ * value. Named so the TypeError can tell the user exactly what they
+ * passed, and where.
+ */
+const NOT_WIRE_DATA: ReadonlyArray<[abstract new (...a: never[]) => unknown, string]> = [
+  [Date, "a Date"],
+  [RegExp, "a RegExp"],
+  [Map, "a Map"],
+  [Set, "a Set"],
+  [WeakMap, "a WeakMap"],
+  [WeakSet, "a WeakSet"],
+  [Promise, "a Promise"],
+  [Error, "an Error"],
+  [ArrayBuffer, "an ArrayBuffer"],
+  [DataView, "a DataView"],
+  [Int8Array, "an Int8Array"],
+  [Uint8ClampedArray, "a Uint8ClampedArray"],
+  [Int16Array, "an Int16Array"],
+  [Uint16Array, "a Uint16Array"],
+  [Int32Array, "an Int32Array"],
+  [Uint32Array, "a Uint32Array"],
+  [Float32Array, "a Float32Array"],
+  [Float64Array, "a Float64Array"],
+  [BigInt64Array, "a BigInt64Array"],
+  [BigUint64Array, "a BigUint64Array"],
+];
+
+/**
+ * Value → wire JSON. Anything that would silently lose data is a
+ * TypeError naming the path (e.g. `input.when is a Date`), thrown
+ * synchronously so nothing reaches the bridge. Supported: null,
+ * undefined, booleans, numbers, strings, arrays, plain objects
+ * (including null-prototype), `Uint8Array` (→ `$b64`), and class
+ * instances carrying plain data — own enumerable props ARE the intent,
+ * same as `{...x}` spread. Rejected: Date/Map/Set/RegExp/Promise/Error/
+ * ArrayBuffer and views other than Uint8Array (own props don't hold the
+ * data), functions/symbols/bigint (JSON can't represent them — JSON
+ * would drop or throw later, we throw now with a path), non-plain
+ * objects with zero own enumerable props (would serialize as {}), and
+ * circular structures. `undefined`/`NaN`/`Infinity` keep JSON
+ * semantics (omitted / null).
+ */
+function toWire(v: unknown, path = "input", seen = new Set<object>()): unknown {
+  if (v === null || v === undefined) return v;
+  const t = typeof v;
+  if (t === "function" || t === "symbol" || t === "bigint")
+    throw new TypeError(`${path} is a ${t} — cannot cross the bridge`);
   if (v instanceof Uint8Array) return { [B64_TAG]: b64encode(v) };
-  if (Array.isArray(v)) return v.map(toWire);
-  if (v !== null && typeof v === "object")
+  if (t !== "object") return v;
+  for (const [ctor, what] of NOT_WIRE_DATA)
+    if (v instanceof ctor)
+      throw new TypeError(`${path} is ${what} — pass a plain value or spread it yourself`);
+  const obj = v as Record<string, unknown>;
+  if (seen.has(obj))
+    throw new TypeError(`circular reference at ${path}`);
+  seen.add(obj);
+  try {
+    if (Array.isArray(obj))
+      return obj.map((x, i) => toWire(x, `${path}[${i}]`, seen));
+    const entries = Object.entries(obj);
+    const proto = Object.getPrototypeOf(obj);
+    if (proto !== Object.prototype && proto !== null && entries.length === 0) {
+      const name = obj.constructor?.name ?? "anonymous-class";
+      throw new TypeError(
+        `${path} is a ${name} instance with no own enumerable properties — it would serialize as {}`,
+      );
+    }
     return Object.fromEntries(
-      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
-        k,
-        toWire(x),
-      ]),
+      entries.map(([k, x]) => [k, toWire(x, `${path}.${k}`, seen)]),
     );
-  return v;
+  } finally {
+    seen.delete(obj);
+  }
 }
 
 function fromWire(v: unknown): unknown {
