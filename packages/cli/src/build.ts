@@ -86,11 +86,24 @@ export function download(
   const part = `${to}.part`;
   return new Promise((res, rej) => {
     let settled = false;
+    let fd: number | undefined;
     let out: ReturnType<typeof createWriteStream> | undefined;
+    const closeFd = () => {
+      if (fd !== undefined) {
+        const f = fd;
+        fd = undefined;
+        try {
+          closeSync(f);
+        } catch {
+          // EBADF — the stream's own destroy path already closed it.
+        }
+      }
+    };
     const fail = (e: Error) => {
       if (settled) return;
       settled = true;
       out?.destroy();
+      closeFd();
       rmSync(part, { force: true });
       rej(e);
     };
@@ -132,23 +145,24 @@ export function download(
               if (!ended)
                 fail(new Error(`GET ${u}: connection dropped mid-body`));
             });
-            const stream = createWriteStream(part);
+            // Open eagerly — with autoClose off, <part>'s lifetime is
+            // synchronous: no deferred fs.open can land after fail()'s
+            // rmSync and recreate the file.
+            fd = openSync(part, "w");
+            const stream = createWriteStream(part, { fd, autoClose: false });
             out = stream;
             r.pipe(stream);
-            stream.on("finish", () =>
-              stream.close(() => {
-                if (settled) return;
-                if (!Number.isNaN(want) && got !== want)
-                  return fail(
-                    new Error(
-                      `GET ${u}: incomplete body — ${got} of ${want} bytes`,
-                    ),
-                  );
-                settled = true;
-                renameSync(part, to);
-                res();
-              }),
-            );
+            stream.on("finish", () => {
+              if (settled) return;
+              closeFd();
+              if (!Number.isNaN(want) && got !== want)
+                return fail(
+                  new Error(`GET ${u}: incomplete body — ${got} of ${want} bytes`),
+                );
+              settled = true;
+              renameSync(part, to);
+              res();
+            });
             stream.on("error", fail);
           } catch (e) {
             onErr(e);
