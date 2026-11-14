@@ -96,7 +96,12 @@ All messages carry `"jsonrpc": "2.0"`.
 - `fn`: name registered via `@expose`. Anything else →
   `FUNCTION_NOT_FOUND`. There is no way to reach unexposed callables —
   the allowlist lives in Python (`_registry`), enforced again by the
-  host's permission layer.
+  host's permission layer. Names must be unique across modules —
+  registering the same name for a different definition raises at import
+  (re-importing the same definition replaces silently, so hot reload
+  keeps working). An isolated function may live in any module the app
+  imports; the worker resolves it through the registry, not by
+  attribute lookup on the app module.
 - `task`: opaque id assigned by the host; scopes streaming + cancel.
 - `input`: the single JSON argument object, matching the generated TS
   client call shape `python.<fn>({...})`.

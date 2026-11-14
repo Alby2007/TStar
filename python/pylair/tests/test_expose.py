@@ -20,11 +20,11 @@ def _with_clean_registry(fn):
 
 def test_expose_bare_registers_and_calls():
     @expose
-    def add(a: int, b: int) -> int:
+    def add_numbers(a: int, b: int) -> int:
         return a + b
 
-    assert add(2, 3) == 5
-    assert "add" in exposed_functions()
+    assert add_numbers(2, 3) == 5
+    assert "add_numbers" in exposed_functions()
 
 
 def test_expose_with_options():

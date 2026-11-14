@@ -22,6 +22,7 @@ import traceback
 
 from pylair import _json, _transport
 from pylair import _protocol as proto
+from pylair._expose import exposed_functions
 
 
 def _exit_with_parent() -> None:
@@ -122,24 +123,40 @@ def main() -> int:
     sys.stdout = sys.stderr
 
     try:
-        module = importlib.import_module(module_name)
-        fn = getattr(module, fn_name)
+        # Resolve through the registry this import populates — the
+        # function may live in any module the app imports and need not be
+        # re-exported by name from the app module.
+        importlib.import_module(module_name)
+        entry = exposed_functions().get(fn_name)
         raw = sys.stdin.buffer.read()
         input = _json.loads(raw) if raw else {}
-        result = fn(**_json.coerce_kwargs(fn, input))
-        if _json.exceeds_depth(result, _transport.MAX_DEPTH - 2):
-            # A result deeper than the host's parser limit would arrive
-            # as a malformed frame and kill the runtime — the parent maps
-            # `code` through, so fail this call with the typed error.
+        if entry is None:
             payload = {
                 "error": {
-                    "code": proto.LIMIT_EXCEEDED,
-                    "message": "result exceeds the depth cap",
-                    "data": {"limit": "max_depth", "max": _transport.MAX_DEPTH},
+                    "code": proto.FUNCTION_NOT_FOUND,
+                    "message": f"{fn_name!r} is not @expose'd in {module_name}",
+                    "data": {"type": "NotExposed"},
                 }
             }
         else:
-            payload = {"result": result}
+            fn = entry.fn
+            result = fn(**_json.coerce_kwargs(fn, input))
+            if _json.exceeds_depth(result, _transport.MAX_DEPTH - 2):
+                # A result deeper than the host's parser limit would arrive
+                # as a malformed frame and kill the runtime — the parent maps
+                # `code` through, so fail this call with the typed error.
+                payload = {
+                    "error": {
+                        "code": proto.LIMIT_EXCEEDED,
+                        "message": "result exceeds the depth cap",
+                        "data": {
+                            "limit": "max_depth",
+                            "max": _transport.MAX_DEPTH,
+                        },
+                    }
+                }
+            else:
+                payload = {"result": result}
     except _json.InvalidParams as e:
         # Caller sent values the signature can't hold — a params error,
         # not a worker failure; the parent maps `code` through.

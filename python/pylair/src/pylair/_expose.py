@@ -75,6 +75,21 @@ def expose(
         )
 
     def decorator(func: Callable[..., object]) -> Callable[..., object]:
+        # The name is the wire contract — a collision in another module
+        # would silently rebind it. Re-registering the SAME definition
+        # (same module + qualname: a reload or re-import) replaces
+        # silently so dev hot reload keeps working.
+        existing = _registry.get(func.__name__)
+        if existing is not None and (
+            existing.fn.__module__ != func.__module__
+            or existing.fn.__qualname__ != func.__qualname__
+        ):
+            raise ValueError(
+                f"exposed name {func.__name__!r} is already registered by "
+                f"{existing.fn.__module__}.{existing.fn.__qualname__}; cannot "
+                f"also register {func.__module__}.{func.__qualname__} — "
+                "names must be unique across modules"
+            )
         _registry[func.__name__] = ExposedFn(
             fn=func,
             kind=_kind_of(func, isolated),
