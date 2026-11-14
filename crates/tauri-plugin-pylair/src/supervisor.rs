@@ -124,6 +124,49 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// `PYLAIR_HELLO_TIMEOUT_MS` default and supported window. A cold
+/// interpreter boot is ~0.05–1.3s and the worst observed CI boot
+/// exceeded 10s under starvation; 30s is ~3x that worst case. Below 1s
+/// even a trivial hello can lose to a cold machine; above 10min a silent
+/// runtime is a hang, not a slow start.
+const HELLO_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+const HELLO_TIMEOUT_MIN_MS: u64 = 1_000;
+const HELLO_TIMEOUT_MAX_MS: u64 = 600_000;
+
+/// Parse the knob's raw value: a whole-millis count. Garbage falls back
+/// to the default with a warning — a malformed env var must not kill the
+/// supervisor's configuration.
+fn parse_hello_timeout_ms(v: Option<String>) -> (u64, Option<String>) {
+    match v {
+        None => (HELLO_TIMEOUT_DEFAULT_MS, None),
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(ms) => (ms, None),
+            Err(_) => (
+                HELLO_TIMEOUT_DEFAULT_MS,
+                Some(format!(
+                    "PYLAIR_HELLO_TIMEOUT_MS={s:?} is not a whole number of \
+                     milliseconds — ignored"
+                )),
+            ),
+        },
+    }
+}
+
+/// Clamp a millis value into the supported window; the warning names
+/// both the bad value and the range it was clamped into.
+fn clamp_hello_timeout_ms(ms: u64) -> (u64, Option<String>) {
+    if (HELLO_TIMEOUT_MIN_MS..=HELLO_TIMEOUT_MAX_MS).contains(&ms) {
+        (ms, None)
+    } else {
+        (
+            ms.clamp(HELLO_TIMEOUT_MIN_MS, HELLO_TIMEOUT_MAX_MS),
+            Some(format!(
+                "hello_timeout={ms}ms outside {HELLO_TIMEOUT_MIN_MS}..={HELLO_TIMEOUT_MAX_MS} — clamped"
+            )),
+        )
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -283,7 +326,9 @@ pub struct SupervisorConfig {
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
-            hello_timeout: Duration::from_secs(15),
+            hello_timeout: Duration::from_millis(
+                parse_hello_timeout_ms(std::env::var("PYLAIR_HELLO_TIMEOUT_MS").ok()).0,
+            ),
             ping_interval: Duration::from_secs(5),
             missed_pongs_to_kill: 3,
             backoff_base: Duration::from_millis(250),
@@ -866,6 +911,17 @@ pub fn spawn(
     for w in &warns {
         let _ = events.try_send(RuntimeEvent::Stderr(format!("pylair limits: {w}")));
     }
+    // hello_timeout: surface a malformed knob (the value was already
+    // resolved inside SupervisorConfig::default()) and clamp whatever
+    // source the millis came from — env, Builder, or a hand-built config.
+    if let (_, Some(w)) = parse_hello_timeout_ms(std::env::var("PYLAIR_HELLO_TIMEOUT_MS").ok()) {
+        let _ = events.try_send(RuntimeEvent::Stderr(format!("pylair config: {w}")));
+    }
+    let (hello_ms, warn) = clamp_hello_timeout_ms(config.hello_timeout.as_millis() as u64);
+    config.hello_timeout = Duration::from_millis(hello_ms);
+    if let Some(w) = warn {
+        let _ = events.try_send(RuntimeEvent::Stderr(format!("pylair config: {w}")));
+    }
     // An initial grant above the cap would violate the cap immediately.
     if config.initial_stream_credit > limits.max_stream_credit {
         let _ = events.try_send(RuntimeEvent::Stderr(format!(
@@ -1150,7 +1206,37 @@ impl Supervisor {
     /// One runtime lifecycle: handshake, then serve until exit/kill.
     async fn run_child(&mut self, mut io: ChildIo) -> ExitCause {
         // ---- handshake: hello within deadline ----
-        let hello = timeout(self.config.hello_timeout, io.msg_in.recv()).await;
+        // At half the deadline, emit a repeated `starting → starting`
+        // state event so UIs can show "still starting" — informational
+        // only, never a state write (set_state dedupes same-state), and
+        // at most once per spawn attempt. The timer dies with this
+        // select: it cannot fire after hello, EOF, or a shutdown-driven
+        // early return.
+        let hello = {
+            let mut deadline = Box::pin(tokio::time::sleep(self.config.hello_timeout));
+            let half_mark = Box::pin(tokio::time::sleep(self.config.hello_timeout / 2));
+            tokio::pin!(half_mark);
+            let mut slow_noted = false;
+            loop {
+                tokio::select! {
+                    m = io.msg_in.recv() => break Ok(m),
+                    _ = &mut half_mark, if !slow_noted => {
+                        slow_noted = true;
+                        let _ = self.events.try_send(RuntimeEvent::StateChanged {
+                            from: State::Starting,
+                            to: State::Starting,
+                            detail: format!(
+                                "still starting ({:?} elapsed; timeout at {:?}, \
+                                 see PYLAIR_HELLO_TIMEOUT_MS)",
+                                self.config.hello_timeout / 2,
+                                self.config.hello_timeout
+                            ),
+                        });
+                    }
+                    _ = &mut deadline => break Err(()),
+                }
+            }
+        };
         let hello = match hello {
             Ok(Some(Ok(InMsg::Notification { method, params }))) if method == "hello" => {
                 params.unwrap_or(Value::Null)
@@ -1166,7 +1252,10 @@ impl Supervisor {
             Ok(None) | Err(_) => {
                 kill_and_reap(&mut io).await;
                 return ExitCause::Crashed(format!(
-                    "no hello within {:?} (startup hang or early exit)",
+                    "runtime produced no hello within {:?} \
+                     (slow interpreter, first-run venv creation, or a wedged import). \
+                     Raise via PYLAIR_HELLO_TIMEOUT_MS or Builder::hello_timeout; \
+                     see protocol-v1 §4",
                     self.config.hello_timeout
                 ));
             }
@@ -2523,6 +2612,44 @@ fn assign_to_job_object(pid: Option<u32>) -> Option<JobHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F5: PYLAIR_HELLO_TIMEOUT_MS parsing — real values pass through,
+    /// garbage falls back to the default with a warning.
+    #[test]
+    fn hello_timeout_env_parses_or_defaults() {
+        assert_eq!(
+            parse_hello_timeout_ms(None),
+            (30_000, None),
+            "unset env must default to 30s"
+        );
+        assert_eq!(parse_hello_timeout_ms(Some("5000".into())).0, 5_000);
+        assert_eq!(parse_hello_timeout_ms(Some(" 45000 ".into())).0, 45_000);
+        // Garbage must not kill config: default + a warning to surface.
+        for bad in ["abc", "", "-5", "1.5", "0x10"] {
+            let (ms, warn) = parse_hello_timeout_ms(Some(bad.into()));
+            assert_eq!(ms, 30_000, "{bad:?} must fall back to default");
+            assert!(warn.is_some(), "{bad:?} must produce a warning");
+        }
+    }
+
+    /// F5: the supported window is 1s..=600s, clamped with a warning.
+    #[test]
+    fn hello_timeout_clamps_into_supported_range() {
+        assert_eq!(clamp_hello_timeout_ms(1_000).0, 1_000);
+        assert_eq!(clamp_hello_timeout_ms(600_000).0, 600_000);
+        assert_eq!(clamp_hello_timeout_ms(30_000).0, 30_000);
+        let (lo, w1) = clamp_hello_timeout_ms(0);
+        assert_eq!(lo, 1_000);
+        assert!(w1.is_some());
+        let (lo2, w2) = clamp_hello_timeout_ms(500);
+        assert_eq!(lo2, 1_000);
+        assert!(w2.is_some());
+        let (hi, w3) = clamp_hello_timeout_ms(999_999);
+        assert_eq!(hi, 600_000);
+        assert!(w3.is_some());
+        // In-range produces no warning.
+        assert!(clamp_hello_timeout_ms(30_000).1.is_none());
+    }
 
     #[test]
     fn stderr_lines_lossy_and_capped() {

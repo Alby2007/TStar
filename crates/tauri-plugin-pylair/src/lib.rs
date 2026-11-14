@@ -477,6 +477,21 @@ impl<R: Runtime> Builder<R> {
         self
     }
 
+    /// How long the supervisor waits for the runtime's `hello` before
+    /// declaring the spawn dead (protocol-v1 §4). Default
+    /// `PYLAIR_HELLO_TIMEOUT_MS` or 30s; every source — this setter, the
+    /// env var, a hand-built `SupervisorConfig` — is clamped to
+    /// 1s..=600s at spawn and the clamp is logged on `pylair://stderr`.
+    ///
+    /// At half the deadline the host emits a repeated
+    /// `starting → starting` `pylair://state` event whose `detail` says
+    /// how long it has waited — informational only: `detail` wording is
+    /// not protocol and clients must not depend on it.
+    pub fn hello_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.config.hello_timeout = timeout;
+        self
+    }
+
     pub fn build(self) -> tauri::plugin::TauriPlugin<R> {
         let mut plugin = tauri::plugin::Builder::<R>::new("pylair");
         // Installed-webview self-test: the client sees this flag and runs its
