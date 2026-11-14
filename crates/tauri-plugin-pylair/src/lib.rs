@@ -361,6 +361,22 @@ impl WindowRegistry {
         self.subscribed.iter().cloned().collect()
     }
 
+    /// Delivery targets for `pylair://stderr`: the app's allow-list
+    /// intersected with subscribers. Stderr carries application log lines
+    /// that a second window has no business reading — unlike state and
+    /// exposes it is opt-in per window, not broadcast.
+    fn stderr_targets(&self, delivery: &StderrDelivery) -> Vec<String> {
+        match delivery {
+            StderrDelivery::All => self.broadcast_targets(),
+            StderrDelivery::Only(labels) => self
+                .subscribed
+                .iter()
+                .filter(|l| labels.contains(l))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Forget dead windows (an emit_to that failed to deliver).
     fn drop_label(&mut self, label: &str) {
         self.subscribed.remove(label);
@@ -374,6 +390,25 @@ fn subscribed<R: Runtime>(window: &tauri::WebviewWindow<R>, reg: &Registry) {
     reg.lock().unwrap().subscribe(window.label());
 }
 
+/// Which webviews may receive `pylair://stderr`. Stderr carries the
+/// runtime's log lines — application output a second window has no
+/// business reading — so unlike `pylair://state`/`pylair://exposes` it is
+/// opt-in per window rather than broadcast to every subscriber.
+#[derive(Clone, Debug)]
+pub enum StderrDelivery {
+    /// Only these window labels receive stderr. Default: `["main"]`.
+    Only(Vec<String>),
+    /// Every subscribed window — the pre-restriction broadcast. An
+    /// explicit opt-out for apps that want all windows to see logs.
+    All,
+}
+
+impl Default for StderrDelivery {
+    fn default() -> Self {
+        Self::Only(vec!["main".into()])
+    }
+}
+
 /// Plugin builder — the app supplies where Python lives, eagerly or lazily.
 /// `new` takes a fixed spec; `new_with` defers it to setup time, which is how
 /// apps resolve the bundled interpreter under `resource_dir` at release while
@@ -385,6 +420,7 @@ pub struct Builder<R: Runtime = tauri::Wry> {
     spec: SpawnSpec,
     lazy: Option<SpecFn<R>>,
     config: SupervisorConfig,
+    stderr: StderrDelivery,
 }
 
 impl<R: Runtime> Builder<R> {
@@ -393,6 +429,7 @@ impl<R: Runtime> Builder<R> {
             spec,
             lazy: None,
             config: SupervisorConfig::default(),
+            stderr: StderrDelivery::default(),
         }
     }
 
@@ -406,11 +443,21 @@ impl<R: Runtime> Builder<R> {
             spec: SpawnSpec::default(),
             lazy: Some(Box::new(f)),
             config: SupervisorConfig::default(),
+            stderr: StderrDelivery::default(),
         }
     }
 
     pub fn config(mut self, config: SupervisorConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Which webviews receive `pylair://stderr` — default
+    /// `StderrDelivery::Only(["main"])`. Multi-window apps that show the
+    /// log in a non-main window must list that window's label;
+    /// `StderrDelivery::All` restores broadcast-to-every-subscriber.
+    pub fn stderr_delivery(mut self, delivery: StderrDelivery) -> Self {
+        self.stderr = delivery;
         self
     }
 
@@ -439,6 +486,7 @@ impl<R: Runtime> Builder<R> {
                 app.manage(Registry::new(Default::default()));
 
                 let app_handle = app.clone();
+                let stderr = self.stderr.clone();
                 tauri::async_runtime::spawn(async move {
                     while let Some(ev) = ev_rx.recv().await {
                         let payload = match ev {
@@ -451,8 +499,12 @@ impl<R: Runtime> Builder<R> {
                         };
                         let Some((event, payload)) = payload else { continue };
                         // Runtime-wide events go to subscribed webviews only.
+                        // Stderr is narrower: the app's allow-list.
                         let reg = app_handle.state::<Registry>();
-                        let labels = reg.lock().unwrap().broadcast_targets();
+                        let labels = match event {
+                            events::STDERR => reg.lock().unwrap().stderr_targets(&stderr),
+                            _ => reg.lock().unwrap().broadcast_targets(),
+                        };
                         for label in labels {
                             if app_handle.emit_to(&label, event, payload.clone()).is_err() {
                                 // Window is gone — stop addressing it.
@@ -894,6 +946,37 @@ mod tests {
         assert_eq!(reg.broadcast_targets().len(), 2);
         reg.drop_label("panel");
         assert_eq!(reg.broadcast_targets(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    fn stderr_targets_only_intersects_the_allow_list() {
+        let mut reg = WindowRegistry::default();
+        reg.subscribe("main");
+        reg.subscribe("win-b");
+        reg.subscribe("console");
+        // Default: main only — win-b and console are subscribed but get nothing.
+        assert_eq!(
+            reg.stderr_targets(&StderrDelivery::default()),
+            vec!["main".to_string()]
+        );
+        // Explicit list: intersection with subscribers — "console" is
+        // allowed and subscribed, "logs" is allowed but never invoked a
+        // command, "win-b" is subscribed but not allowed.
+        let d = StderrDelivery::Only(vec!["main".into(), "console".into(), "logs".into()]);
+        let mut got = reg.stderr_targets(&d);
+        got.sort();
+        assert_eq!(got, vec!["console".to_string(), "main".to_string()]);
+        // All: every subscriber, exactly the old broadcast.
+        let mut got = reg.stderr_targets(&StderrDelivery::All);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "console".to_string(),
+                "main".to_string(),
+                "win-b".to_string()
+            ]
+        );
     }
 
     #[test]

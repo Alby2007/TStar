@@ -29,9 +29,12 @@ The scaffolded `src-tauri/capabilities/default.json` grants
 `core:default` plus `pylair:default`, and additionally **denies**
 `core:event:deny-emit` / `core:event:deny-emit-to`. Stream/result
 delivery no longer uses events at all — each call binds a per-call IPC
-channel to its invoking webview — but `pylair://state`,
-`pylair://stderr` and `pylair://exposes` remain broadcast events a
-webview could otherwise forge into other windows. `@pylair/client` only
+channel to its invoking webview — but `pylair://state` and
+`pylair://exposes` remain broadcast events a webview could otherwise
+forge into other windows. `pylair://stderr` is opt-in per window:
+`Builder::stderr_delivery` defaults to `["main"]` — add another
+window's label or `StderrDelivery::All` if a second window should see
+the runtime's log lines. `@pylair/client` only
 listens, so a stock app loses nothing — but if your app needs JS-side
 `emit`, add `"core:event:allow-emit"` back in your own capability block
 (deny rules win, so remove the deny entries too). The template ships no

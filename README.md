@@ -59,8 +59,8 @@ integration → `M6` reference app + RC.
   from a dead runtime generation controls nothing, and closing the
   owner window cancels its tasks. Call/stream delivery is bound to the
   invoking webview via a per-call IPC channel; broadcast lifecycle
-  events (state/stderr/exposes) remain readable by any webview (see
-  Known limitations); invocation
+  events (state/exposes) remain readable by any webview, and stderr
+  delivery is opt-in per window (see Known limitations); invocation
   scoping beyond capabilities is planned with wrap mode. The exposure exists only if
   you widen a capability (more windows, `remote.urls`) or load untrusted
   content in a privileged window.
@@ -113,12 +113,16 @@ integration → `M6` reference app + RC.
   data is delivered on a per-call `tauri::ipc::Channel` bound to the
   invoking webview — it cannot be passively observed or forged by
   another window (the old `pylair://stream` bus is gone). But
-  `pylair://state`, `pylair://stderr` and `pylair://exposes` are still
-  broadcast events: `emit_to`-addressed yet receivable by any
-  `Any`-target listener, and `stderr` can contain application log
-  lines. The template's `deny-emit`/`deny-emit-to` entries block
-  forging those broadcasts. Task *control* (cancel, stream credit)
-  stays owner-scoped and is unaffected.
+  `pylair://state` and `pylair://exposes` are still broadcast events:
+  `emit_to`-addressed yet receivable by any `Any`-target listener.
+  `pylair://stderr` is opt-in per window (`Builder::stderr_delivery`,
+  default `["main"]`, `All` restores broadcast): a window outside the
+  list gets no stderr through a label-scoped listener, though a
+  deliberate `Any`-target `listen` still sees emitted lines — the
+  event bus offers no stronger boundary. The template's
+  `deny-emit`/`deny-emit-to` entries block forging those broadcasts.
+  Task *control* (cancel, stream credit) stays owner-scoped and is
+  unaffected.
 - **`cargo audit` flags `glib 0.18.5` (RUSTSEC-2024-0429, unsound).**
   It reaches Linux builds only, transitively through Tauri's GTK chain
   (`tauri → wry → webkit2gtk → gtk`); the advisory is tracked upstream

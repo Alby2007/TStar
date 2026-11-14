@@ -153,14 +153,28 @@ bare task id back (the old command ignored `onEvent`), which the client
 recognises, reports as an upgrade-required error, and cleans up by
 cancelling the orphaned task.
 
-What remains broadcast: `pylair://state`, `pylair://stderr` and
-`pylair://exposes` go to webviews that have invoked the bridge
-(`emit_to` per label) — but any `Any`-target listener still receives
-them regardless of the emit target (Tauri 2.12.5's
-`match_any_or_filter`), so treat these events as readable by every
-webview in the app. They carry lifecycle and log data, not call
-results — though `stderr` can contain application log lines, which is
-why per-window stderr opt-in is a documented follow-up. The template
+What remains broadcast: `pylair://state` and `pylair://exposes` go to
+webviews that have invoked the bridge (`emit_to` per label) — but any
+`Any`-target listener still receives them regardless of the emit
+target (Tauri 2.12.5's `match_any_or_filter`), so treat these events
+as readable by every webview in the app. They carry lifecycle data,
+not call results.
+
+`pylair://stderr` is narrower: stderr carries application log lines a
+second window has no business reading, so it is **opt-in per window**
+via the plugin builder — `Builder::stderr_delivery(StderrDelivery)`
+defaults to `Only(["main"])`, an explicit label list intersects it with
+subscribed windows, and `StderrDelivery::All` restores broadcast for
+apps that want every window to see logs. Two honest boundaries:
+label-scoped listeners are *not* delivered stderr outside the
+allow-list, but a deliberate `Any`-target `listen` on
+`pylair://stderr` still receives whatever is emitted — the same
+event-bus residual as state/exposes, not a sniffing boundary; and a
+listed label that never invoked the bridge receives nothing. The
+client's `listen` is webview-scoped, so a stock `@pylair/client`
+window honours the allow-list — multi-window apps that show the log
+in a non-`main` window must pass its label to `stderr_delivery`. The
+template
 still **denies** `core:event:deny-emit` and `core:event:deny-emit-to`.
 Deny rules are evaluated per *origin*, ignoring `windows:` scoping, and
 always win over allows — so the entries bar **every** local webview from

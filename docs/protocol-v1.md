@@ -273,11 +273,17 @@ Call data and lifecycle events use different mechanisms:
   document's tasks server-side at `on_page_load`/`PageLoadEvent::Started`
   (bounded by a task-id watermark — the new document's calls survive);
   the client's `pagehide` hook remains as best effort.
-- **Broadcast lifecycle stays broadcast.** `pylair://state`,
-  `pylair://stderr` and `pylair://exposes` are `emit_to`-addressed at
+- **Broadcast lifecycle stays broadcast — except stderr.**
+  `pylair://state` and `pylair://exposes` are `emit_to`-addressed at
   webviews that have invoked the bridge — routing, not a security
   boundary: any `Any`-target listener receives them regardless of the
-  emit target. A destroyed window is removed from the subscriber set.
+  emit target. `pylair://stderr` is opt-in per window instead: the
+  builder's `stderr_delivery` defaults to `Only(["main"])`, an explicit
+  label list intersects with the subscriber set, and
+  `StderrDelivery::All` restores broadcast. Deliberate `Any`-target
+  listeners still see emitted stderr lines (same residual as the other
+  broadcasts — delivery selection, not sniffing protection). A
+  destroyed window is removed from the subscriber set.
 
 - `cancel()` waits at most `cancel_timeout` (default 5s) for the runtime's
   acknowledgement and then fails with `RUNTIME_WEDGED`; a blocked runtime
