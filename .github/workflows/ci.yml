@@ -410,7 +410,7 @@ jobs:
           # library paths for the bundled WebKit (running the inner binary
           # directly fails to find WebKitNetworkProcess).
           docker run --rm -e APP_BIN="$APP_BIN" -v /tmp/approot:/r:ro -v /tmp/app.AppImage:/app.AppImage:ro ubuntu:22.04 bash -c '
-            set -e; export DEBIAN_FRONTEND=noninteractive
+            set -eo pipefail; export DEBIAN_FRONTEND=noninteractive
             for i in 1 2 3; do apt-get update -qq && break || sleep 10; done
             apt-get install -y -qq libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates xvfb libfuse2 >/dev/null
             echo "── deb layout (resource_dir path)"
@@ -423,9 +423,21 @@ jobs:
             # bridge (Tauri ACL, event routing): typed call, ordered stream,
             # cancellation. Exit code 0 only if all pass.
             echo "── webview self-test: deb"
-            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/$APP_BIN
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a /r/usr/bin/$APP_BIN | tee /tmp/wst-deb.log
             echo "── webview self-test: appimage"
-            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun
+            PYLAIR_SELF_TEST_WEBVIEW=1 timeout 120 xvfb-run -a ./squashfs-root/AppRun | tee /tmp/wst-appimage.log
+            # --local legs always resolve a crate with stderr scoping and
+            # the fixture is always appended above — a "skipped" verdict
+            # here means the probe silently stopped running. Skips are
+            # legitimate only on pack/registry legs (published crate).
+            for f in /tmp/wst-deb.log /tmp/wst-appimage.log; do
+              # No single quotes here — this whole block is inside the
+              # single-quoted bash -c docker script.
+              if grep -q "stderr-delivery.*skipped" "$f"; then
+                echo "stderr-delivery skipped on a --local leg — probe must run here" >&2
+                exit 1
+              fi
+            done
             # WindowDestroyed runs on the main thread — the rc.3 window-close
             # crash lived there; open+close under xvfb keeps it covered.
             echo "── window-close self-test"
@@ -438,7 +450,14 @@ jobs:
           env -i HOME="$HOME" PATH=/usr/bin:/bin "$APP/Contents/MacOS/$APP_BIN" --self-test
           env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_GUI=1 "$APP/Contents/MacOS/$APP_BIN"
           # Webview self-test through the real bridge, run from outside the checkout.
-          cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN"
+          cd /tmp && env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WEBVIEW=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN" | tee /tmp/wst.log
+          # --local always resolves a crate with stderr scoping — a
+          # "skipped" verdict here means the probe silently stopped
+          # running (legitimate only on pack/registry legs).
+          if grep -q '"stderr-delivery":"skipped' /tmp/wst.log; then
+            echo "stderr-delivery skipped on a --local leg — probe must run here" >&2
+            exit 1
+          fi
           # WindowDestroyed on the main thread — the rc.3 window-close panic.
           env -i HOME="$HOME" PATH=/usr/bin:/bin PYLAIR_SELF_TEST_WINDOW_CLOSE=1 "$GITHUB_WORKSPACE/$APP_DIR/$APP/Contents/MacOS/$APP_BIN"
       - name: Self-test installed app (Windows)
@@ -461,10 +480,24 @@ jobs:
           if (-not $st.WaitForExit(120000)) { $st.Kill(); Write-Error 'self-test timed out'; exit 1 }
           if ($st.ExitCode -ne 0) { Write-Error "self-test exit $($st.ExitCode)"; exit 1 }
           # Webview self-test through the real bridge (ACL, events, cancel).
+          # stdout/stderr redirected so the verdict JSON lands in the log
+          # and the stderr-delivery skip-check can read it (a GUI exe's
+          # output otherwise never reaches the runner log).
           $env:PYLAIR_SELF_TEST_WEBVIEW = '1'
-          $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:TEMP -PassThru
+          $out = Join-Path $env:TEMP 'wst-out.txt'
+          $err = Join-Path $env:TEMP 'wst-err.txt'
+          $p = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:TEMP `
+                -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
           if (-not $p.WaitForExit(120000)) { $p.Kill(); Write-Error 'webview self-test timed out'; exit 1 }
+          Get-Content $out,$err -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0) { Write-Error "webview self-test exit $($p.ExitCode)"; exit 1 }
+          # --local always resolves a crate with stderr scoping — a
+          # "skipped" verdict here means the probe silently stopped
+          # running (legitimate only on pack/registry legs).
+          if (Select-String -Path $out -Pattern '"stderr-delivery":"skipped' -Quiet -ErrorAction SilentlyContinue) {
+            Write-Error 'stderr-delivery skipped on a --local leg — probe must run here'
+            exit 1
+          }
           # WindowDestroyed on the main thread — the rc.3 window-close panic
           # was found by manual dogfood; cover it in CI on every leg.
           $env:PYLAIR_SELF_TEST_WEBVIEW = $null
