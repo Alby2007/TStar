@@ -957,7 +957,7 @@ struct ChildIo {
     /// Control frames (cancel / credit / shutdown) — a separate bounded
     /// lane the writer task always drains first, so a data flood cannot
     /// starve or silently drop control (RC.6B).
-    ctrl_out: mpsc::Sender<Vec<u8>>,
+    ctrl_out: mpsc::Sender<Ctrl>,
     /// Received decoded incoming messages / transport errors.
     msg_in: mpsc::Receiver<Result<InMsg, ChildReadErr>>,
     /// Exit status of the child process.
@@ -1575,7 +1575,11 @@ impl Supervisor {
                             self.shutdown_acks.push(ack);
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
-                            let _ = send_ctrl(&io, &body, self.config.max_frame);
+                            // Flush ordering: calls committed to the data
+                            // lane before this shutdown must be written
+                            // first, so the drain can return their real
+                            // terminal instead of a generic unavailable.
+                            let _ = send_ctrl_flushed(&io, &body, self.config.max_frame);
                             // Graceful exit within the grace window consumes
                             // `exited`; on timeout it is still pollable, so
                             // kill the tree and wait for the reap. Report
@@ -1710,9 +1714,32 @@ fn send_frame(io: &ChildIo, body: &Value, max_frame: usize) -> Result<(), SendFa
 /// no path can ever write a frame the peer would reject.
 fn send_ctrl(io: &ChildIo, body: &Value, max_frame: usize) -> bool {
     match serde_json::to_vec(body) {
-        Ok(bytes) if bytes.len() <= max_frame => io.ctrl_out.try_send(bytes).is_ok(),
+        Ok(bytes) if bytes.len() <= max_frame => io.ctrl_out.try_send(Ctrl::Now(bytes)).is_ok(),
         _ => false,
     }
+}
+
+/// Control lane with data-lane flush ordering: the writer first writes
+/// every data frame committed before this one. Used for `shutdown` — a
+/// call the host already accepted must reach the runtime ahead of the
+/// shutdown, or the task never registers and the caller hears a generic
+/// 'unavailable' instead of the drain's real terminal (rc.15: the
+/// ctrl-lane initial grant made this reordering deterministic on
+/// Windows).
+fn send_ctrl_flushed(io: &ChildIo, body: &Value, max_frame: usize) -> bool {
+    match serde_json::to_vec(body) {
+        Ok(bytes) if bytes.len() <= max_frame => {
+            io.ctrl_out.try_send(Ctrl::FlushDataThen(bytes)).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// One control-lane frame. Most control traffic overtakes queued data;
+/// `FlushDataThen` additionally flushes committed data frames first.
+enum Ctrl {
+    Now(Vec<u8>),
+    FlushDataThen(Vec<u8>),
 }
 
 /// May `caller` control a task recorded with `owner`? Unowned tasks
@@ -2026,7 +2053,7 @@ async fn spawn_child(
     // credit). A stream flood can fill the data lane; it cannot starve or
     // silently drop a control frame (RC.6B).
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(16);
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut w = stdin;
@@ -2036,7 +2063,25 @@ async fn spawn_child(
                 // Ctrl always wins when both lanes have a frame; a closed
                 // ctrl channel falls through to the data lane.
                 c = ctrl_rx.recv() => match c {
-                    Some(b) => b,
+                    Some(Ctrl::Now(b)) => b,
+                    Some(Ctrl::FlushDataThen(b)) => {
+                        // Shutdown ordering: write every data frame that
+                        // was committed before this control frame — a call
+                        // accepted before shutdown must reach the runtime
+                        // or its caller hears 'unavailable' instead of the
+                        // drain's real terminal.
+                        while let Ok(d) = frame_rx.try_recv() {
+                            if w.write_all(&(d.len() as u32).to_be_bytes())
+                                .await
+                                .is_err()
+                                || w.write_all(&d).await.is_err()
+                                || w.flush().await.is_err()
+                            {
+                                return; // child stdin gone
+                            }
+                        }
+                        b
+                    }
                     None => match frame_rx.recv().await {
                         Some(b) => b,
                         None => return,
@@ -2045,7 +2090,8 @@ async fn spawn_child(
                 d = frame_rx.recv() => match d {
                     Some(b) => b,
                     None => match ctrl_rx.recv().await {
-                        Some(b) => b,
+                        Some(Ctrl::Now(b)) => b,
+                        Some(Ctrl::FlushDataThen(b)) => b, // data lane already empty
                         None => return,
                     },
                 },
