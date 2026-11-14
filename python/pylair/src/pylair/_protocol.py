@@ -40,7 +40,6 @@ _NAMES = {
 
 # Defaults — override via env at the host layer.
 INITIAL_STREAM_CREDIT = 64
-MAX_STREAM_BUFFER = 8 * 1024 * 1024
 
 
 def code_name(code: int) -> str:

@@ -377,9 +377,25 @@ impl WindowRegistry {
         }
     }
 
-    /// Forget dead windows (an emit_to that failed to deliver).
+    /// Forget dead windows (an emit_to that failed to deliver, or an
+    /// explicit WindowEvent::Destroyed).
     fn drop_label(&mut self, label: &str) {
         self.subscribed.remove(label);
+    }
+}
+
+/// F4 (rc.15): an emit_to failure only means "the window is gone" when the
+/// window actually no longer exists. A transient failure on a live window —
+/// IPC hiccup, delivery racing a reload — must not silently unsubscribe it:
+/// the window was never told it lost events, so it would miss state/exposes/
+/// stderr until its next plugin command resubscribed it.
+fn handle_emit_failure<R: Runtime>(app: &tauri::AppHandle<R>, reg: &Registry, label: &str) {
+    if app.get_webview_window(label).is_some() {
+        if cfg!(debug_assertions) {
+            eprintln!("pylair: emit_to({label}) failed on a live window; keeping subscription");
+        }
+    } else {
+        reg.lock().unwrap().drop_label(label);
     }
 }
 
@@ -507,8 +523,7 @@ impl<R: Runtime> Builder<R> {
                         };
                         for label in labels {
                             if app_handle.emit_to(&label, event, payload.clone()).is_err() {
-                                // Window is gone — stop addressing it.
-                                reg.lock().unwrap().drop_label(&label);
+                                handle_emit_failure(&app_handle, &reg, &label);
                             }
                         }
                     }
@@ -946,6 +961,55 @@ mod tests {
         assert_eq!(reg.broadcast_targets().len(), 2);
         reg.drop_label("panel");
         assert_eq!(reg.broadcast_targets(), vec!["main".to_string()]);
+    }
+
+    /// F4 (rc.15): a failed emit_to evicts the label only when the window
+    /// is actually gone — a transient failure on a live window must keep
+    /// the subscription. get_webview_window is the oracle: a destroyed
+    /// window is removed from the manager and hits the same absent-label
+    /// path the "ghost" case covers (MockRuntime can't move a live window
+    /// to destroyed — its destroy() never runs the event loop's removal).
+    /// Same webview-link constraint as plugin_setup.rs — not on Windows.
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_emit_evicts_only_gone_windows() {
+        use tauri::test::{mock_context, noop_assets};
+        use tauri::{WebviewUrl, WebviewWindowBuilder};
+        let app = tauri::test::mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock app builds");
+        let reg = Registry::default();
+        {
+            let mut r = reg.lock().unwrap();
+            r.subscribe("w1");
+            r.subscribe("ghost");
+        }
+        let w1 = WebviewWindowBuilder::new(&app, "w1", WebviewUrl::default())
+            .build()
+            .unwrap();
+
+        // A live window survives a transient emit failure.
+        handle_emit_failure(app.handle(), &reg, "w1");
+        assert!(
+            reg.lock()
+                .unwrap()
+                .broadcast_targets()
+                .contains(&"w1".to_string()),
+            "live window lost its subscription on a transient emit failure"
+        );
+
+        // A label with no window is evicted, exactly as before — this is
+        // the path a destroyed window takes (the manager drops it from
+        // webview_windows() when WindowEvent::Destroyed is processed).
+        handle_emit_failure(app.handle(), &reg, "ghost");
+        assert!(
+            !reg.lock()
+                .unwrap()
+                .broadcast_targets()
+                .contains(&"ghost".to_string()),
+            "emit failure on a missing window must still evict it"
+        );
+        let _ = w1; // live-window guard above keeps it; nothing else needed
     }
 
     #[test]

@@ -905,6 +905,8 @@ pub fn spawn(
         ready_since: None,
         shutdown_acks: Vec::new(),
         shutdown_outcome: None,
+        #[cfg(target_os = "linux")]
+        pdeath_anchor: None,
     }
     .run();
     (
@@ -939,6 +941,13 @@ struct Supervisor {
     shutdown_acks: Vec<oneshot::Sender<ShutdownOutcome>>,
     /// What the most recent shutdown actually achieved (RC.6C).
     shutdown_outcome: Option<ShutdownOutcome>,
+    /// Linux only: the one long-lived pdeathsig anchor thread every spawn
+    /// in this supervisor's lifetime goes through (created lazily).
+    /// Dropping it at actor exit closes the job channel; the thread then
+    /// exits — its parked children were already reaped, and any that were
+    /// not get their SIGKILL from the anchor's death either way.
+    #[cfg(target_os = "linux")]
+    pdeath_anchor: Option<PdeathAnchor>,
 }
 
 /// Per-child IO plumbing, owned by the per-spawn scope.
@@ -948,7 +957,7 @@ struct ChildIo {
     /// Control frames (cancel / credit / shutdown) — a separate bounded
     /// lane the writer task always drains first, so a data flood cannot
     /// starve or silently drop control (RC.6B).
-    ctrl_out: mpsc::Sender<Vec<u8>>,
+    ctrl_out: mpsc::Sender<Ctrl>,
     /// Received decoded incoming messages / transport errors.
     msg_in: mpsc::Receiver<Result<InMsg, ChildReadErr>>,
     /// Exit status of the child process.
@@ -1036,7 +1045,17 @@ impl Supervisor {
                 State::Starting,
                 format!("spawning (gen {})", self.generation),
             );
-            let cause = match spawn_child(&self.spec, &self.config, &self.events).await {
+            #[cfg(target_os = "linux")]
+            let spawned = spawn_child(
+                &self.spec,
+                &self.config,
+                &self.events,
+                &mut self.pdeath_anchor,
+            )
+            .await;
+            #[cfg(not(target_os = "linux"))]
+            let spawned = spawn_child(&self.spec, &self.config, &self.events).await;
+            let cause = match spawned {
                 Ok(io) => self.run_child(io).await,
                 Err(e) => ExitCause::Crashed(format!("spawn failed: {e}")),
             };
@@ -1249,11 +1268,28 @@ impl Supervisor {
                                     let task = p["task"].as_u64().unwrap_or(0);
                                     let seq = p["seq"].as_u64().unwrap_or(0);
                                     let value = p["value"].clone();
+                                    // A chunk with no outstanding credit is
+                                    // a protocol violation (protocol-v1 §3.1):
+                                    // a runtime that cannot count credit
+                                    // cannot be trusted to honour a per-task
+                                    // abort either — same treatment as a
+                                    // malformed frame. Chunks for a task the
+                                    // generation no longer knows are still
+                                    // ignored: they are a plausible race with
+                                    // the producer draining after a finish.
+                                    if tasks.get(&task).is_some_and(|m| m.credit == 0) {
+                                        fail_all(&mut pending,
+                                            proto::PROTOCOL_VIOLATION,
+                                            "runtime sent stream.chunk with no outstanding credit").await;
+                                        kill_and_reap(&mut io).await;
+                                        return ExitCause::Crashed(
+                                            format!("protocol violation: task {task} sent an uncredited stream.chunk"));
+                                    }
                                     let mut abandoned = None;
                                     if let Some(meta) = tasks.get_mut(&task) {
                                         // Each delivered chunk consumed one
                                         // credit (RC.8A accounting).
-                                        meta.credit = meta.credit.saturating_sub(1);
+                                        meta.credit -= 1;
                                         if let Some(PendingKind::Stream(sink)) = pending.get(&meta.call_id) {
                                             if let Err(why) = sink.chunk(seq, value) {
                                                 abandoned = Some((meta.call_id, why));
@@ -1394,10 +1430,22 @@ impl Supervisor {
                                 serde_json::json!({"fn": fn_name, "task": task, "input": input}));
                             let credit = proto::notification("stream.credit",
                                 serde_json::json!({"task": task, "n": self.config.initial_stream_credit}));
+                            // The initial grant is control traffic and goes
+                            // FIRST: the runtime buffers credit for a task it
+                            // has not registered yet (pending credit), so the
+                            // grant cannot be starved or reordered behind
+                            // data-lane traffic — and a failed send fails the
+                            // stream BEFORE the call is committed instead of
+                            // leaving it uncredited forever.
+                            if !send_ctrl(&io, &credit, self.config.max_frame) {
+                                reject_stream(items, task_out, limit_err(
+                                    "ctrl_queue", 16,
+                                    "control queue full — credit not delivered"));
+                                continue;
+                            }
                             match send_frame(&io, &body, self.config.max_frame) {
                                 Ok(()) => {
                                     let _ = task_out.send(Ok(task));
-                                    let _ = send_frame(&io, &credit, self.config.max_frame);
                                     pending.insert(id, PendingKind::Stream(items));
                                     task_of_call.insert(id, task);
                                     tasks.insert(task, TaskMeta {
@@ -1406,6 +1454,13 @@ impl Supervisor {
                                     });
                                 }
                                 Err(e) => {
+                                    // The grant was delivered but the call was
+                                    // not — best-effort cancel drops the
+                                    // stranded pending credit (bounded anyway).
+                                    let cid = self.next_id.fetch_add(1, Ordering::Relaxed);
+                                    let _ = send_ctrl(&io, &proto::request(cid, "cancel",
+                                        serde_json::json!({"task": task})),
+                                        self.config.max_frame);
                                     let max = self.config.max_frame as u64;
                                     reject_stream(items, task_out, match e {
                                         SendFail::Oversize(n) => limit_err("max_frame", max,
@@ -1520,7 +1575,11 @@ impl Supervisor {
                             self.shutdown_acks.push(ack);
                             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                             let body = proto::request(id, "shutdown", Value::Null);
-                            let _ = send_ctrl(&io, &body, self.config.max_frame);
+                            // Flush ordering: calls committed to the data
+                            // lane before this shutdown must be written
+                            // first, so the drain can return their real
+                            // terminal instead of a generic unavailable.
+                            let _ = send_ctrl_flushed(&io, &body, self.config.max_frame);
                             // Graceful exit within the grace window consumes
                             // `exited`; on timeout it is still pollable, so
                             // kill the tree and wait for the reap. Report
@@ -1655,9 +1714,32 @@ fn send_frame(io: &ChildIo, body: &Value, max_frame: usize) -> Result<(), SendFa
 /// no path can ever write a frame the peer would reject.
 fn send_ctrl(io: &ChildIo, body: &Value, max_frame: usize) -> bool {
     match serde_json::to_vec(body) {
-        Ok(bytes) if bytes.len() <= max_frame => io.ctrl_out.try_send(bytes).is_ok(),
+        Ok(bytes) if bytes.len() <= max_frame => io.ctrl_out.try_send(Ctrl::Now(bytes)).is_ok(),
         _ => false,
     }
+}
+
+/// Control lane with data-lane flush ordering: the writer first writes
+/// every data frame committed before this one. Used for `shutdown` — a
+/// call the host already accepted must reach the runtime ahead of the
+/// shutdown, or the task never registers and the caller hears a generic
+/// 'unavailable' instead of the drain's real terminal (rc.15: the
+/// ctrl-lane initial grant made this reordering deterministic on
+/// Windows).
+fn send_ctrl_flushed(io: &ChildIo, body: &Value, max_frame: usize) -> bool {
+    match serde_json::to_vec(body) {
+        Ok(bytes) if bytes.len() <= max_frame => {
+            io.ctrl_out.try_send(Ctrl::FlushDataThen(bytes)).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// One control-lane frame. Most control traffic overtakes queued data;
+/// `FlushDataThen` additionally flushes committed data frames first.
+enum Ctrl {
+    Now(Vec<u8>),
+    FlushDataThen(Vec<u8>),
 }
 
 /// May `caller` control a task recorded with `owner`? Unowned tasks
@@ -1781,18 +1863,71 @@ fn jitter(d: Duration) -> Duration {
 
 // ---- process spawning & kill plumbing ----
 
-/// Linux: spawn the child FROM a dedicated thread that then parks for the
-/// process's lifetime. PR_SET_PDEATHSIG is bound to the *thread* that
-/// forked the child — not the process — so spawning on a transient
-/// executor thread (e.g. a spawn_blocking worker at its ~10s keepalive)
-/// would SIGKILL a perfectly healthy runtime. The anchor can only die
-/// with the whole process, so the signal means exactly "the host is gone".
+/// Linux: spawn the child FROM a dedicated long-lived thread that parks
+/// for the host process's lifetime. PR_SET_PDEATHSIG is bound to the
+/// *thread* that forked the child — not the process — so spawning on a
+/// transient executor thread (e.g. a spawn_blocking worker at its ~10s
+/// keepalive) would SIGKILL a perfectly healthy runtime. The anchor can
+/// only die with the whole process, so the signal means exactly "the
+/// host is gone".
 ///
-/// The fork itself must happen on the anchor thread, so the runtime
-/// handle is carried in and entered there — `Command::spawn` is a plain
-/// synchronous call that only needs the context to register the child.
+/// One anchor serves every spawn a supervisor ever makes: the pre-rc.15
+/// shape parked a fresh thread per spawn, so crash/retry respawns stacked
+/// anchor threads (~8 MiB of reserved stack each) that never unwound.
+/// The fork itself still happens on the anchor thread — the runtime
+/// handle and the fully-configured `Command` are carried over a job
+/// channel and executed there.
 #[cfg(target_os = "linux")]
-fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
+type AnchorJob = (
+    tokio::runtime::Handle,
+    tokio::process::Command,
+    std::sync::mpsc::Sender<io::Result<Child>>,
+);
+
+#[cfg(target_os = "linux")]
+struct PdeathAnchor(std::sync::mpsc::Sender<AnchorJob>);
+
+/// Live anchor threads — test-only visibility that respawns reuse one
+/// anchor instead of stacking them.
+#[cfg(target_os = "linux")]
+static ANCHOR_THREADS: AtomicU64 = AtomicU64::new(0);
+
+/// Live `pylair-pdeath-anchor` threads in this process (test hook).
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn pdeath_anchor_threads() -> usize {
+    ANCHOR_THREADS.load(Ordering::SeqCst) as usize
+}
+
+#[cfg(target_os = "linux")]
+impl PdeathAnchor {
+    fn new() -> io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<AnchorJob>();
+        std::thread::Builder::new()
+            .name("pylair-pdeath-anchor".into())
+            .spawn(move || {
+                ANCHOR_THREADS.fetch_add(1, Ordering::SeqCst);
+                // Jobs until every sender is gone — a sender lives in the
+                // supervisor actor, so the anchor outlives every spawn it
+                // served and exits when the supervisor does.
+                while let Ok((rt, mut cmd, reply)) = rx.recv() {
+                    let res = {
+                        let _guard = rt.enter();
+                        cmd.spawn()
+                    };
+                    let _ = reply.send(res);
+                }
+                ANCHOR_THREADS.fetch_sub(1, Ordering::SeqCst);
+            })
+            .map(|_| Self(tx))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_via_pdeathsig_anchor(
+    spec: &SpawnSpec,
+    anchor: &mut Option<PdeathAnchor>,
+) -> io::Result<Child> {
     use std::os::unix::process::CommandExt;
     let rt = tokio::runtime::Handle::try_current()
         .map_err(|e| io::Error::other(format!("no runtime for spawn: {e}")))?;
@@ -1827,19 +1962,15 @@ fn spawn_via_pdeathsig_anchor(spec: &SpawnSpec) -> io::Result<Child> {
             Ok(())
         });
     }
+    let anchor = match anchor {
+        Some(a) => a,
+        None => anchor.insert(PdeathAnchor::new()?),
+    };
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Child>>();
-    std::thread::Builder::new()
-        .name("pylair-pdeath-anchor".into())
-        .spawn(move || {
-            // Enter the runtime so the child's registration resolves, then
-            // fork HERE — the JoinHandle detaches on return and this thread
-            // lives until the process does.
-            let _guard = rt.enter();
-            let _ = tx.send(cmd.spawn());
-            loop {
-                std::thread::park();
-            }
-        })?;
+    anchor
+        .0
+        .send((rt, cmd, tx))
+        .map_err(|_| io::Error::other("pdeathsig anchor is gone"))?;
     rx.recv()
         .map_err(|_| io::Error::other("pdeathsig anchor died before spawn"))?
 }
@@ -1848,6 +1979,7 @@ async fn spawn_child(
     spec: &SpawnSpec,
     config: &SupervisorConfig,
     events: &mpsc::Sender<RuntimeEvent>,
+    #[cfg(target_os = "linux")] pdeath_anchor: &mut Option<PdeathAnchor>,
 ) -> io::Result<ChildIo> {
     // Simplify a canonicalized (Windows \\?\-prefixed) program path so the
     // child sees a plain sys.executable — dev-mode callers may pass one too.
@@ -1887,7 +2019,7 @@ async fn spawn_child(
         cmd.spawn()?
     };
     #[cfg(target_os = "linux")]
-    let mut child = spawn_via_pdeathsig_anchor(spec)?;
+    let mut child = spawn_via_pdeathsig_anchor(spec, pdeath_anchor)?;
     #[cfg(windows)]
     let pid = child.id();
     let stdin = child.stdin.take().expect("piped");
@@ -1921,7 +2053,7 @@ async fn spawn_child(
     // credit). A stream flood can fill the data lane; it cannot starve or
     // silently drop a control frame (RC.6B).
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
-    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Ctrl>(16);
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut w = stdin;
@@ -1931,7 +2063,25 @@ async fn spawn_child(
                 // Ctrl always wins when both lanes have a frame; a closed
                 // ctrl channel falls through to the data lane.
                 c = ctrl_rx.recv() => match c {
-                    Some(b) => b,
+                    Some(Ctrl::Now(b)) => b,
+                    Some(Ctrl::FlushDataThen(b)) => {
+                        // Shutdown ordering: write every data frame that
+                        // was committed before this control frame — a call
+                        // accepted before shutdown must reach the runtime
+                        // or its caller hears 'unavailable' instead of the
+                        // drain's real terminal.
+                        while let Ok(d) = frame_rx.try_recv() {
+                            if w.write_all(&(d.len() as u32).to_be_bytes())
+                                .await
+                                .is_err()
+                                || w.write_all(&d).await.is_err()
+                                || w.flush().await.is_err()
+                            {
+                                return; // child stdin gone
+                            }
+                        }
+                        b
+                    }
                     None => match frame_rx.recv().await {
                         Some(b) => b,
                         None => return,
@@ -1940,7 +2090,8 @@ async fn spawn_child(
                 d = frame_rx.recv() => match d {
                     Some(b) => b,
                     None => match ctrl_rx.recv().await {
-                        Some(b) => b,
+                        Some(Ctrl::Now(b)) => b,
+                        Some(Ctrl::FlushDataThen(b)) => b, // data lane already empty
                         None => return,
                     },
                 },

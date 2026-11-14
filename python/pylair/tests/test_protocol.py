@@ -452,7 +452,7 @@ def test_oversized_frame_rejected():
     )
     (hello_len,) = struct.unpack(">I", proc.stdout.read(4))
     proc.stdout.read(hello_len)
-    proc.stdin.write(_LEN.pack(proto.MAX_STREAM_BUFFER * 8))  # huge len, no body
+    proc.stdin.write(_LEN.pack(64 * 1024 * 1024))  # oversize len, no body
     proc.stdin.flush()
     proc.stdin.close()
     # runtime should exit (violation -> EOF path), not hang waiting for 64 MiB
