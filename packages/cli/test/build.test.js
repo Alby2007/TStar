@@ -179,6 +179,34 @@ describe("download", () => {
     rmSync(dir, { recursive: true });
   });
 
+  test("a failed download never poisons the next open file", async () => {
+    // The fd closed during cleanup must never be closed twice — a stale
+    // async close lands on whatever file reuses the number (fd reuse).
+    const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
+    for (let i = 0; i < 25; i++) {
+      const to = join(dir, `a${i}.tar.gz`);
+      const dropped = Readable.from(
+        (async function* () {
+          yield Buffer.from("first-half");
+          throw new Error("connection reset");
+        })(),
+      );
+      dropped.statusCode = 200;
+      dropped.headers = { "content-length": "32" };
+      await assert.rejects(
+        download("https://x/asset", to, {
+          get: fakeGet((u, cb) => cb(dropped)),
+        }),
+      );
+      const to2 = join(dir, `b${i}.tar.gz`);
+      await download("https://x/asset", to2, {
+        get: fakeGet((u, cb) => cb(response([Buffer.from("ok")]))),
+      });
+      assert.equal(readFileSync(to2, "utf-8"), "ok");
+    }
+    rmSync(dir, { recursive: true });
+  });
+
   test("a stalled server hits the idle timeout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pylair-dl-"));
     const to = join(dir, "asset.tar.gz");

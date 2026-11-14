@@ -87,22 +87,21 @@ export function download(
   return new Promise((res, rej) => {
     let settled = false;
     let fd: number | undefined;
-    let out: ReturnType<typeof createWriteStream> | undefined;
     const closeFd = () => {
       if (fd !== undefined) {
         const f = fd;
         fd = undefined;
-        try {
-          closeSync(f);
-        } catch {
-          // EBADF — the stream's own destroy path already closed it.
-        }
+        closeSync(f);
       }
     };
     const fail = (e: Error) => {
       if (settled) return;
       settled = true;
-      out?.destroy();
+      // The fd is ours (opened synchronously, autoClose: false) — close it
+      // here, once, synchronously. Do NOT destroy() the stream: its
+      // _destroy issues a second fs.close on the same fd asynchronously,
+      // and if that lands after the fd number was reused by another open,
+      // the stale close kills someone else's file.
       closeFd();
       rmSync(part, { force: true });
       rej(e);
@@ -147,10 +146,10 @@ export function download(
             });
             // Open eagerly — with autoClose off, <part>'s lifetime is
             // synchronous: no deferred fs.open can land after fail()'s
-            // rmSync and recreate the file.
+            // rmSync and recreate the file. The fd is never destroyed
+            // through the stream (see fail()).
             fd = openSync(part, "w");
             const stream = createWriteStream(part, { fd, autoClose: false });
-            out = stream;
             r.pipe(stream);
             stream.on("finish", () => {
               if (settled) return;
