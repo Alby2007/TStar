@@ -452,22 +452,53 @@ fn alive_since(pid: u32, start: &str) -> bool {
     }
 }
 
+/// Windows liveness via the process object's signaled state, not tasklist
+/// presence. tasklist (and Get-CimInstance) still list a process that is
+/// mid-termination or dead-but-referenced — on a loaded runner the object
+/// can outlive TerminateProcess/job-close by seconds, which reads as a
+/// survivor that isn't (the rc.15 CI flake). HasExited checks the signaled
+/// state, which is what "alive" actually means. One powershell call also
+/// returns the start-time token, so a recycled pid reads as not-ours.
 #[cfg(windows)]
-fn alive(pid: u32) -> bool {
-    // tasklist CSV rows quote every field — the pid is the second column.
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+fn alive_since(pid: u32, start: &str) -> bool {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+                 if ($null -eq $p -or $p.HasExited) {{ 'gone' }} \
+                 else {{ 'alive:' + $p.StartTime.Ticks }}"
+            ),
+        ])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .any(|l| l.split("\",\"").nth(1).and_then(|f| f.parse::<u32>().ok()) == Some(pid))
+    String::from_utf8_lossy(&out.stdout).trim() == format!("alive:{start}")
+}
+
+/// Failure-path diagnostics: what each survivor actually is and who
+/// spawned it, so the next occurrence names itself instead of a bare pid.
+#[cfg(not(windows))]
+fn describe_survivor(pid: u32, _start: &str) -> String {
+    format!("pid {pid} still alive — check /proc/{pid} or ps")
 }
 
 #[cfg(windows)]
-fn alive_since(pid: u32, start: &str) -> bool {
-    alive(pid) && token(pid) == start
+fn describe_survivor(pid: u32, start: &str) -> String {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$p = Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; \
+                 if ($null -eq $p) {{ 'pid {pid}: gone (was a lingering object, or exited since the poll)' }} \
+                 else {{ $par = Get-CimInstance Win32_Process -Filter \"ProcessId=$($p.ParentProcessId)\"; \
+                    \"pid $($p.ProcessId) name=$($p.Name) start_ticks={start} parent=$($p.ParentProcessId)($($par.Name)) cmd=$($p.CommandLine)\" }}"
+            ),
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Abrupt host kill — SIGKILL on unix, taskkill /F on Windows. Deliberately
@@ -554,10 +585,15 @@ async fn host_sigkill_does_not_orphan_wedged_runtime() {
     // PDEATHSIG / Job Object cleanup is immediate — a tight bound is honest.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while watched.iter().any(|(p, s)| alive_since(*p, s)) {
+        let survivors: Vec<String> = watched
+            .iter()
+            .filter(|(p, s)| alive_since(*p, s))
+            .map(|(p, s)| describe_survivor(*p, s))
+            .collect();
         assert!(
             std::time::Instant::now() < deadline,
-            "runtime children {kids:?} survived the host's abrupt kill — \
-             PDEATHSIG/Job Object absent"
+            "runtime children survived the host's abrupt kill — \
+             PDEATHSIG/Job Object absent: {survivors:?}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -606,9 +642,14 @@ async fn host_sigkill_healthy_runtime_exits_on_eof() {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while watched.iter().any(|(p, s)| alive_since(*p, s)) {
+        let survivors: Vec<String> = watched
+            .iter()
+            .filter(|(p, s)| alive_since(*p, s))
+            .map(|(p, s)| describe_survivor(*p, s))
+            .collect();
         assert!(
             std::time::Instant::now() < deadline,
-            "healthy runtime children {kids:?} survived the host's abrupt kill"
+            "healthy runtime children survived the host's abrupt kill: {survivors:?}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
