@@ -141,6 +141,30 @@ test("docs become jsdoc, manifest errors throw", () => {
   assert.throws(() => emit({ version: 1, error: "boom" }, "m"), /boom/);
 });
 
+test("a docstring containing */ cannot break the generated file", async () => {
+  const ts = emit(
+    M([FN({ doc: "does x */ evil(); return 0" })]),
+    "m",
+  );
+  // The emitted file must still parse — an unescaped */ would end the
+  // doc comment early and leave code + a stray */ behind.
+  const { createSourceFile, ScriptTarget } = await import("typescript");
+  const sf = createSourceFile("gen.ts", ts, ScriptTarget.Latest, true);
+  assert.equal(sf.parseDiagnostics.length, 0, `unparseable output:\n${ts}`);
+  // no unescaped */ survives inside the emitted doc line
+  const docLine = ts.split("\n").find((l) => l.includes("evil"));
+  assert.ok(docLine, "doc text should still be present");
+  assert.doesNotMatch(docLine, /\*\/[^/]*evil/, "unescaped */ ends the comment");
+});
+
+test("control characters and a trailing backslash stay inert", () => {
+  const ts = emit(M([FN({ doc: "tab\vhere\\\rmore" })]), "m");
+  for (const l of ts.split("\n")) {
+    if (l.includes("evil")) continue;
+    assert.doesNotMatch(l, /[\x00-\x08\x0b-\x1f\u2028\u2029]/);
+  }
+});
+
 test("snake_case names stay the wire name", () => {
   const ts = emit(M([FN({ name: "make_thing" })]), "m");
   assert.match(ts, /export function makeThing\(/);

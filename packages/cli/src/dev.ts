@@ -23,9 +23,19 @@ export function venvPython(appDir: string): string {
   return p;
 }
 
-function runCodegen(appDir: string, cfgModule: string, out: string): boolean {
+/** Env for `python -m pylair.codegen`: the app module imports from the
+ * source dir's import root, same rule as PYLAIR_PYTHONPATH below and the
+ * build-time staged-import check. Exported for tests. */
+export function codegenEnv(appDir: string, source: string): Record<string, string> {
+  return {
+    ...process.env,
+    PYTHONPATH: importRoot(appDir, source),
+  } as Record<string, string>;
+}
+
+function runCodegen(appDir: string, cfgModule: string, out: string, source: string): boolean {
   const python = venvPython(appDir);
-  const env = { ...process.env, PYTHONPATH: join(appDir, "backend") };
+  const env = codegenEnv(appDir, source);
   try {
     const manifest = loadManifest({ python, module: cfgModule, env });
     const ts = emit(manifest, cfgModule);
@@ -60,7 +70,7 @@ export async function dev(opts: { appDir: string }): Promise<number> {
 
   const stubs = join(appDir, "src", "api.generated.ts");
   mkdirSync(join(appDir, "src"), { recursive: true });
-  runCodegen(appDir, cfg.appModule, stubs);
+  runCodegen(appDir, cfg.appModule, stubs, cfg.source);
 
   // Watch python source; debounce bursts (saves, formatter runs).
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -73,7 +83,7 @@ export async function dev(opts: { appDir: string }): Promise<number> {
       if (!changed) return;
       changed = false;
       writeFileSync(trigger, String(Date.now()));
-      runCodegen(appDir, cfg.appModule, stubs);
+      runCodegen(appDir, cfg.appModule, stubs, cfg.source);
     }, 150);
   });
 

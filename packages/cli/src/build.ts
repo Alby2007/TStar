@@ -17,12 +17,13 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { get } from "node:https";
 import { arch, platform, tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importRoot, loadConfig, loadTauriConfig, tauriCliEntry } from "./config.js";
 import { matchGlob } from "./glob.js";
@@ -65,20 +66,148 @@ export function hostTriple(): string {
   return t;
 }
 
-function download(url: string, to: string): Promise<void> {
+const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000;
+const MAX_REDIRECTS = 5;
+
+/** Download `url` to `to`, following up to `maxRedirects` redirects and
+ * failing after `timeoutMs` with no bytes. The body lands in `to.part`
+ * and is renamed into place only once it is complete — a dropped
+ * connection must never leave a partial file at the cache path (the
+ * SHA check would then refuse every later build until it is deleted by
+ * hand). `get` is injectable so tests need no network. */
+export function download(
+  url: string,
+  to: string,
+  opts?: { get?: typeof get; timeoutMs?: number; maxRedirects?: number },
+): Promise<void> {
+  const getImpl = opts?.get ?? get;
+  const timeoutMs = opts?.timeoutMs ?? DOWNLOAD_IDLE_TIMEOUT_MS;
+  const maxRedirects = opts?.maxRedirects ?? MAX_REDIRECTS;
+  const part = `${to}.part`;
   return new Promise((res, rej) => {
-    const follow = (u: string) =>
-      get(u, (r) => {
-        if (r.statusCode! >= 300 && r.statusCode! < 400 && r.headers.location)
-          return follow(r.headers.location);
-        if (r.statusCode !== 200) return rej(new Error(`GET ${u} -> ${r.statusCode}`));
-        const out = createWriteStream(to);
-        r.pipe(out);
-        out.on("finish", () => out.close(() => res()));
-        out.on("error", rej);
-      }).on("error", rej);
-    follow(url);
+    let settled = false;
+    let out: ReturnType<typeof createWriteStream> | undefined;
+    const fail = (e: Error) => {
+      if (settled) return;
+      settled = true;
+      out?.destroy();
+      rmSync(part, { force: true });
+      rej(e);
+    };
+    const onErr = (e: unknown) =>
+      fail(e instanceof Error ? e : new Error(String(e)));
+    const follow = (u: string, redirects: number): void => {
+      try {
+        if (redirects > maxRedirects)
+          return fail(
+            new Error(`GET ${url}: too many redirects (cap ${maxRedirects})`),
+          );
+        const req = getImpl(u, (r) => {
+          try {
+            if (r.statusCode! >= 300 && r.statusCode! < 400 && r.headers.location) {
+              // Location may be relative, and only https targets are
+              // fetchable — resolve first, refuse anything else.
+              const target = new URL(r.headers.location, u);
+              if (target.protocol !== "https:")
+                return fail(
+                  new Error(
+                    `GET ${u}: refusing non-https redirect to ${target.origin}`,
+                  ),
+                );
+              return follow(target.href, redirects + 1);
+            }
+            if (r.statusCode !== 200)
+              return fail(new Error(`GET ${u} -> ${r.statusCode}`));
+            const want = Number(r.headers["content-length"]);
+            let got = 0;
+            let ended = false;
+            r.on("data", (c: Buffer) => {
+              got += c.length;
+            });
+            r.on("end", () => {
+              ended = true;
+            });
+            r.on("error", fail);
+            r.on("close", () => {
+              if (!ended)
+                fail(new Error(`GET ${u}: connection dropped mid-body`));
+            });
+            const stream = createWriteStream(part);
+            out = stream;
+            r.pipe(stream);
+            stream.on("finish", () =>
+              stream.close(() => {
+                if (settled) return;
+                if (!Number.isNaN(want) && got !== want)
+                  return fail(
+                    new Error(
+                      `GET ${u}: incomplete body — ${got} of ${want} bytes`,
+                    ),
+                  );
+                settled = true;
+                renameSync(part, to);
+                res();
+              }),
+            );
+            stream.on("error", fail);
+          } catch (e) {
+            onErr(e);
+          }
+        });
+        req.setTimeout(timeoutMs, () =>
+          req.destroy(
+            new Error(`GET ${u}: timed out — no data for ${timeoutMs / 1000}s`),
+          ),
+        );
+        req.on("error", fail);
+      } catch (e) {
+        onErr(e);
+      }
+    };
+    follow(url, 0);
   });
+}
+
+const sha256File = (p: string) =>
+  createHash("sha256").update(readFileSync(p)).digest("hex");
+
+/** Cache + integrity for a downloaded asset: a cached file that fails
+ * its SHA is deleted and re-downloaded ONCE — a second mismatch still
+ * refuses, naming the cache so it is fixable by hand. `dl` injectable
+ * for tests. */
+export async function ensureTarball(
+  url: string,
+  tarball: string,
+  want: string,
+  dl: (u: string, to: string) => Promise<void> = download,
+): Promise<void> {
+  const cached = existsSync(tarball);
+  if (!cached) {
+    console.log(`fetching ${basename(tarball)}`);
+    await dl(url, tarball);
+  } else {
+    console.log(`using cached ${basename(tarball)}`);
+  }
+  if (sha256File(tarball) === want) return;
+  if (!cached)
+    throw new Error(
+      `SHA256 mismatch for ${basename(tarball)}: got ${sha256File(tarball)}, ` +
+        `want ${want} — refusing to bundle`,
+    );
+  // A cached-but-corrupt file is the dropped-partial failure mode: one
+  // retry, then refuse.
+  console.warn(
+    `cached ${basename(tarball)} failed its SHA256 — ` +
+      `deleting ${tarball} and re-downloading once`,
+  );
+  rmSync(tarball, { force: true });
+  await dl(url, tarball);
+  const got = sha256File(tarball);
+  if (got !== want)
+    throw new Error(
+      `SHA256 mismatch for ${basename(tarball)} after re-download: got ${got}, ` +
+        `want ${want} — refusing to bundle (cache file: ${tarball})`,
+    );
 }
 
 async function fetchPython(
@@ -98,20 +227,11 @@ async function fetchPython(
   mkdirSync(cacheDir, { recursive: true });
   const tarball = join(cacheDir, asset);
 
-  if (!existsSync(tarball)) {
-    console.log(`fetching ${asset}`);
-    await download(`${base}/${asset}`, tarball);
-  } else {
-    console.log(`using cached ${asset}`);
-  }
-
   // The interpreter ships to end users — verify against hashes committed
   // in-repo (see PBS_SHA256), not a checksum file from the same release.
   const want = PBS_SHA256[`${ver}-${triple}`];
   if (!want) throw new Error(`no committed SHA256 for ${ver}/${triple}`);
-  const got = createHash("sha256").update(readFileSync(tarball)).digest("hex");
-  if (got !== want)
-    throw new Error(`SHA256 mismatch for ${asset}: got ${got}, want ${want} — refusing to bundle`);
+  await ensureTarball(`${base}/${asset}`, tarball, want);
 
   const dest = join(resources, "python");
   rmSync(dest, { recursive: true, force: true });
